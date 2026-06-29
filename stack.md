@@ -1,6 +1,14 @@
-Так, це **реально зробити на Python**. Найкращий шлях: не писати власний симулятор, а взяти **SUMO** як транспортний движок, а Python використати як “мозок”, який читає стан руху й керує світлофорами.
 
 ## Базовий стек для FlowMind Rivne
+
+Python: 3.12.x
+SUMO: 1.27.1
+Simulation control: TraCI 1.27.1
+Data processing: NumPy 2.5.0, Pandas 3.0.3
+Graph model: NetworkX 3.6.1
+XML processing: lxml 6.1.1
+Dashboard: Streamlit 1.58.0
+Visualization: Plotly 6.8.0, Folium 0.20.0, PyDeck 0.9.2
 
 ### 1. Симулятор
 
