@@ -190,37 +190,15 @@ Metrics + Dashboard
 ## Структура проєкту
 
 ```text
-flowmind-rivne/
-├── data/
-│   ├── rivne.osm.xml
-│   ├── area.net.xml
-│   ├── routes.rou.xml
-│   └── detectors.add.xml
-│
-├── simulation/
-│   ├── fixed.sumocfg
-│   ├── local_adaptive.sumocfg
-│   ├── flowmind.sumocfg
-│   └── scenarios/
-│
-├── flowmind/
-│   ├── controller.py
-│   ├── area_model.py
-│   ├── traffic_state.py
-│   ├── signal_policy.py
-│   ├── metrics.py
-│   └── priority_flow.py
-│
-├── dashboard/
-│   └── app.py
-│
-├── experiments/
-│   ├── run_fixed.py
-│   ├── run_local_adaptive.py
-│   └── run_flowmind.py
-│
+FlowMind/
+├── simulation/rivne_area/      # SUMO-мапа, маршрути й конфігурація
+├── flowmind/                   # модель зони, контролер, policy та метрики
+├── experiments/                # CLI одного режиму й повного порівняння
+├── dashboard/app.py            # Streamlit-дашборд
+├── tests/                      # unit-тести policy та метрик
+├── architecture.md
 ├── requirements.txt
-└── README.md
+└── Readme.md
 ```
 
 ---
@@ -296,6 +274,10 @@ FlowMind бачить, що центр області заблокований, 
 
 ## Встановлення
 
+Повна покрокова інструкція для Windows:
+
+[docs/WINDOWS_SETUP.md](docs/WINDOWS_SETUP.md)
+
 ### 1. Клонування репозиторію
 
 ```bash
@@ -352,7 +334,34 @@ sumo-gui --version
 
 ---
 
-## Запуск симуляції
+## Запуск pre-MVP
+
+Усі режими використовують однаковий seed, маршрутний файл і автоматично
+вибрану зону з 6 світлофорів. За замовчуванням використовується реальна
+центральна зона вздовж Соборної та вулиці В'ячеслава Чорновола, а
+сфокусований трафік проходить через 2–4 її перехрестя. Результати
+зберігаються в `results/`.
+
+Повторна генерація сфокусованого сценарію:
+
+```bash
+python tools/generate_focused_traffic.py
+```
+
+Швидка перевірка на 180 секундах:
+
+```bash
+python experiments/run_comparison.py --duration 180
+```
+
+Повне порівняння:
+
+```bash
+python experiments/run_comparison.py --duration 900
+```
+
+Іншу конфігурацію зони можна передати через `--zone path/to/zone.json`, а
+конкретні світлофори — через `--tls ID1 ID2 ...`.
 
 ### Fixed Mode
 
@@ -370,6 +379,15 @@ python experiments/run_local_adaptive.py
 
 ```bash
 python experiments/run_flowmind.py
+```
+
+### Priority Flow
+
+Пріоритет працює поверх адаптивного режиму для ID авто, яке вже є у
+сценарії:
+
+```bash
+python experiments/run_flowmind.py --priority-vehicle veh100 --gui
 ```
 
 ### Запуск дашборду
@@ -459,7 +477,12 @@ FlowMind порівнюється з двома базовими підхода�
 
 ## Статус
 
-Проєкт перебуває на стадії MVP.
+Проєкт перебуває на стадії pre-MVP.
+
+Уже реалізовано три режими, автоматичний вибір світлофорної зони, TraCI
+керування, збір KPI, Priority Flow hook та дашборд. Наступний етап — вирізати
+окрему транспортну область, сфокусувати на ній генерацію попиту й провести
+довші калібровані експерименти.
 
 Поточна ціль:
 
