@@ -318,6 +318,42 @@ streamlit run dashboard\app.py
 Ctrl+C
 ```
 
+## 13.1 Повна демонстрація зі швидкою
+
+Одна команда:
+
+```powershell
+python experiments\run_demo.py
+```
+
+Вона:
+
+1. відкриває SUMO GUI;
+2. запускає наявний сфокусований трафік;
+3. на 180-й секунді автоматично додає швидку;
+4. будує маршрут до лікарні;
+5. вимірює departure, arrival та Emergency ETA;
+6. після завершення SUMO запускає Streamlit;
+7. відкриває статистику в браузері.
+
+Для швидшої перевірки:
+
+```powershell
+python experiments\run_demo.py --duration 450 --emergency-depart 60
+```
+
+Змінити швидкість відображення SUMO GUI:
+
+```powershell
+python experiments\run_demo.py --gui-delay 100
+```
+
+Зупинити Streamlit після перегляду:
+
+```text
+Ctrl+C
+```
+
 ## 14. Повторний запуск наступного дня
 
 Повторно встановлювати залежності не потрібно. Відкрити PowerShell і

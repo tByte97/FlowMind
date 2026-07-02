@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pandas as pd
@@ -8,7 +9,9 @@ import streamlit as st
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-RESULTS_DIR = PROJECT_ROOT / "results"
+RESULTS_DIR = Path(
+    os.environ.get("FLOWMIND_RESULTS_DIR", str(PROJECT_ROOT / "results"))
+)
 MODE_LABELS = {
     "fixed": "Fixed",
     "local": "Local Adaptive",
@@ -29,6 +32,30 @@ if not summary_path.exists():
 
 summary = pd.read_csv(summary_path)
 summary["label"] = summary["mode"].map(MODE_LABELS).fillna(summary["mode"])
+
+if "emergency_eta" in summary.columns:
+    emergency_eta = pd.to_numeric(summary["emergency_eta"], errors="coerce")
+    emergency_rows = summary[emergency_eta.notna() & (emergency_eta > 0)]
+    if not emergency_rows.empty:
+        emergency = emergency_rows.iloc[-1]
+        st.subheader("🚑 Автоматична швидка")
+        emergency_columns = st.columns(4)
+        emergency_columns[0].metric(
+            "Emergency ETA", f"{float(emergency['emergency_eta']):.1f} с"
+        )
+        emergency_columns[1].metric(
+            "Виїзд",
+            f"{float(emergency['emergency_departure_time']):.0f} с",
+        )
+        emergency_columns[2].metric(
+            "Прибуття",
+            f"{float(emergency['emergency_arrival_time']):.0f} с",
+        )
+        route_edges = emergency.get("emergency_route_edge_count", 0)
+        emergency_columns[3].metric("Ребер маршруту", f"{int(route_edges)}")
+        start = emergency.get("emergency_start", "Старт")
+        destination = emergency.get("emergency_destination", "Лікарня")
+        st.caption(f"{start} → {destination}")
 
 metrics = [
     ("average_travel_time", "Середній час поїздки, с", "min"),

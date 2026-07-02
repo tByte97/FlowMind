@@ -1,0 +1,25 @@
+{
+  "vehicle_id": "flowmind_ambulance",
+  "route_id": "flowmind_emergency_route",
+  "vehicle_type_id": "flowmind_emergency",
+  "base_vehicle_type_id": "zone_passenger",
+  "depart_time": 180.0,
+  "start": {
+    "name": "Обласний центр екстреної медичної допомоги",
+    "edge_id": "1125430670#2",
+    "latitude": 50.6339825,
+    "longitude": 26.2490348
+  },
+  "destination": {
+    "name": "Рівненська центральна міська лікарня",
+    "edge_id": "144533164#0",
+    "latitude": 50.6045505,
+    "longitude": 26.2661718
+  },
+  "color": [255, 35, 35, 255],
+  "max_speed": 25.0,
+  "speed_factor": 1.15,
+  "accel": 3.0,
+  "decel": 6.0,
+  "emergency_decel": 9.0
+}

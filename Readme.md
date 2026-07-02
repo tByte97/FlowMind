@@ -278,6 +278,18 @@ FlowMind бачить, що центр області заблокований, 
 
 [docs/WINDOWS_SETUP.md](docs/WINDOWS_SETUP.md)
 
+Створення нової SUMO-карти з OpenStreetMap:
+
+[docs/NEW_OSM_MAP_GUIDE.md](docs/NEW_OSM_MAP_GUIDE.md)
+
+Актуальний стан реалізації:
+
+[docs/PROJECT_STATUS.md](docs/PROJECT_STATUS.md)
+
+План подальшої розробки до повного MVP:
+
+[docs/NEXT_STEPS_TO_MVP.md](docs/NEXT_STEPS_TO_MVP.md)
+
 ### 1. Клонування репозиторію
 
 ```bash
@@ -383,8 +395,34 @@ python experiments/run_flowmind.py
 
 ### Priority Flow
 
-Пріоритет працює поверх адаптивного режиму для ID авто, яке вже є у
-сценарії:
+Автоматично створити швидку, відкрити SUMO GUI, виконати симуляцію та
+після її завершення запустити Streamlit зі статистикою:
+
+```bash
+python experiments/run_demo.py
+```
+
+За замовчуванням швидка виїжджає від Обласного центру екстреної
+медичної допомоги до Рівненської центральної міської лікарні.
+
+Окремий запуск без автоматичного дашборду:
+
+```bash
+python experiments/run_flowmind.py --emergency --gui --duration 600
+```
+
+Час виїзду, стартове ребро та лікарню можна перевизначити:
+
+```bash
+python experiments/run_flowmind.py \
+  --emergency \
+  --emergency-depart 120 \
+  --emergency-from-edge "START_EDGE" \
+  --emergency-to-edge "HOSPITAL_EDGE" \
+  --gui
+```
+
+Також збережена підтримка пріоритету для ID авто, яке вже є у сценарії:
 
 ```bash
 python experiments/run_flowmind.py --priority-vehicle veh100 --gui
@@ -479,10 +517,10 @@ FlowMind порівнюється з двома базовими підхода�
 
 Проєкт перебуває на стадії pre-MVP.
 
-Уже реалізовано три режими, автоматичний вибір світлофорної зони, TraCI
-керування, збір KPI, Priority Flow hook та дашборд. Наступний етап — вирізати
-окрему транспортну область, сфокусувати на ній генерацію попиту й провести
-довші калібровані експерименти.
+Уже реалізовано три режими, центральну світлофорну зону, сфокусований
+трафік, TraCI-керування, автоматичну швидку з маршрутом до лікарні,
+вимірювання Emergency ETA, збір KPI та дашборд. Наступний етап —
+Emergency Router із декількома маршрутами та повний Corridor Manager.
 
 Поточна ціль:
 

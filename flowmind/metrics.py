@@ -41,6 +41,7 @@ class MetricsCollector:
         self._throughput = 0
         self._stops = 0
         self._priority_departed: float | None = None
+        self._priority_arrived: float | None = None
         self._priority_eta: float | None = None
         self.samples: list[MetricSample] = []
 
@@ -60,6 +61,7 @@ class MetricsCollector:
                 self._travel_times.append(duration)
                 if vehicle_id == self._priority_vehicle:
                     self._priority_eta = duration
+                    self._priority_arrived = simulation_time
 
         if int(simulation_time) % self._control.decision_interval:
             return
@@ -157,6 +159,8 @@ class MetricsCollector:
             )
             if self.samples
             else 0.0,
+            "emergency_departure_time": self._priority_departed,
+            "emergency_arrival_time": self._priority_arrived,
             "emergency_eta": self._priority_eta,
         }
 

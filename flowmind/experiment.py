@@ -8,6 +8,7 @@ import traci
 from .area_model import AreaModel, discover_area, load_zone_tls_ids
 from .config import RunConfig
 from .controller import AreaSignalController
+from .emergency_vehicle import EmergencyVehicleManager
 from .metrics import MetricsCollector
 
 
@@ -16,7 +17,7 @@ def _sumo_command(config: RunConfig) -> list[str]:
     binary = sumolib.checkBinary("sumo-gui" if config.gui else "sumo")
     raw_dir = config.results_dir.resolve() / "raw"
     raw_dir.mkdir(parents=True, exist_ok=True)
-    return [
+    command = [
         binary,
         "-c",
         str(config.config_path.resolve()),
@@ -39,6 +40,9 @@ def _sumo_command(config: RunConfig) -> list[str]:
         "--quit-on-end",
         "true",
     ]
+    if config.gui:
+        command.extend(["--delay", str(config.gui_delay_ms), "--start"])
+    return command
 
 
 def load_area(config: RunConfig) -> AreaModel:
@@ -53,19 +57,32 @@ def run_experiment(config: RunConfig) -> dict[str, object]:
     try:
         traci.start(_sumo_command(config))
         connection = traci.getConnection()
+        emergency_manager = (
+            EmergencyVehicleManager(connection, config.emergency)
+            if config.emergency is not None
+            else None
+        )
+        emergency_details = (
+            emergency_manager.install() if emergency_manager is not None else None
+        )
+        priority_vehicle = (
+            config.emergency.vehicle_id
+            if config.emergency is not None
+            else config.priority_vehicle
+        )
         controller = (
             AreaSignalController(
                 connection,
                 area,
                 config.mode,
                 config.control,
-                config.priority_vehicle,
+                priority_vehicle,
             )
             if config.mode != "fixed"
             else None
         )
         metrics = MetricsCollector(
-            connection, area, config.control, config.priority_vehicle
+            connection, area, config.control, priority_vehicle
         )
 
         simulated_time = 0.0
@@ -80,6 +97,8 @@ def run_experiment(config: RunConfig) -> dict[str, object]:
             metrics.collect(simulated_time)
 
         summary = metrics.summary(config.mode, simulated_time)
+        if emergency_details is not None:
+            summary.update(emergency_details.as_summary())
         if controller is not None:
             summary.update(
                 {

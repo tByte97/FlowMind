@@ -48,7 +48,10 @@ class MetricsCollectorTest(unittest.TestCase):
     def test_lifecycle_events_are_counted_between_metric_samples(self) -> None:
         traci = FakeTraci()
         collector = MetricsCollector(
-            traci, AreaModel(()), ControlConfig(decision_interval=5)
+            traci,
+            AreaModel(()),
+            ControlConfig(decision_interval=5),
+            priority_vehicle="veh1",
         )
 
         traci.simulation.departed = ("veh1",)
@@ -62,6 +65,9 @@ class MetricsCollectorTest(unittest.TestCase):
         summary = collector.summary("fixed", 5.0)
         self.assertEqual(summary["throughput"], 1)
         self.assertEqual(summary["average_travel_time"], 2.0)
+        self.assertEqual(summary["emergency_departure_time"], 1.0)
+        self.assertEqual(summary["emergency_arrival_time"], 3.0)
+        self.assertEqual(summary["emergency_eta"], 2.0)
         self.assertEqual(len(collector.samples), 1)
 
 

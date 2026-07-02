@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .emergency_vehicle import EmergencyVehicleConfig
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -25,6 +27,7 @@ class RunConfig:
     seed: int = 42
     zone_size: int = 6
     gui: bool = False
+    gui_delay_ms: int = 50
     config_path: Path = (
         PROJECT_ROOT / "simulation" / "rivne_area" / "focused.sumocfg"
     )
@@ -34,6 +37,7 @@ class RunConfig:
     results_dir: Path = PROJECT_ROOT / "results"
     tls_ids: tuple[str, ...] = field(default_factory=tuple)
     priority_vehicle: str | None = None
+    emergency: EmergencyVehicleConfig | None = None
     control: ControlConfig = field(default_factory=ControlConfig)
 
     def __post_init__(self) -> None:
@@ -43,3 +47,7 @@ class RunConfig:
             raise ValueError("duration must be positive")
         if not 1 <= self.zone_size <= 20:
             raise ValueError("zone_size must be between 1 and 20")
+        if self.gui_delay_ms < 0:
+            raise ValueError("gui_delay_ms cannot be negative")
+        if self.emergency is not None and self.emergency.depart_time >= self.duration:
+            raise ValueError("Emergency must depart before the simulation ends")

@@ -8,6 +8,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from flowmind.config import PROJECT_ROOT, RunConfig
+from flowmind.emergency_vehicle import load_emergency_config
 from flowmind.experiment import run_experiment
 
 
@@ -20,7 +21,26 @@ def build_parser(default_mode: str | None = None) -> argparse.ArgumentParser:
     parser.add_argument("--zone-size", type=int, default=6)
     parser.add_argument("--tls", nargs="*", default=())
     parser.add_argument("--priority-vehicle")
+    parser.add_argument(
+        "--emergency",
+        action="store_true",
+        help="Automatically create and prioritize an ambulance",
+    )
+    parser.add_argument(
+        "--emergency-config",
+        type=Path,
+        default=PROJECT_ROOT / "simulation" / "rivne_area" / "emergency.json",
+    )
+    parser.add_argument("--emergency-depart", type=float)
+    parser.add_argument("--emergency-from-edge")
+    parser.add_argument("--emergency-to-edge")
     parser.add_argument("--gui", action="store_true")
+    parser.add_argument(
+        "--gui-delay",
+        type=int,
+        default=50,
+        help="Delay between GUI simulation steps in milliseconds",
+    )
     parser.add_argument(
         "--config",
         type=Path,
@@ -39,6 +59,13 @@ def build_parser(default_mode: str | None = None) -> argparse.ArgumentParser:
 def main(default_mode: str | None = None) -> None:
     args = build_parser(default_mode).parse_args()
     mode = default_mode or args.mode
+    emergency = None
+    if args.emergency:
+        emergency = load_emergency_config(args.emergency_config).with_overrides(
+            depart_time=args.emergency_depart,
+            start_edge=args.emergency_from_edge,
+            destination_edge=args.emergency_to_edge,
+        )
     summary = run_experiment(
         RunConfig(
             mode=mode,
@@ -46,11 +73,13 @@ def main(default_mode: str | None = None) -> None:
             seed=args.seed,
             zone_size=args.zone_size,
             gui=args.gui,
+            gui_delay_ms=args.gui_delay,
             config_path=args.config,
             zone_path=args.zone,
             results_dir=args.results_dir,
             tls_ids=tuple(args.tls),
             priority_vehicle=args.priority_vehicle,
+            emergency=emergency,
         )
     )
     print(json.dumps(summary, ensure_ascii=False, indent=2))
