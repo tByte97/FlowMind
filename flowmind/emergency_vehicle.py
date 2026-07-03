@@ -137,7 +137,7 @@ class EmergencyVehicleManager:
         self.config = config
         self.details: EmergencyRouteDetails | None = None
 
-    def install(self) -> EmergencyRouteDetails:
+    def install(self, precalculated_edges: tuple[str, ...] | None = None) -> EmergencyRouteDetails:
         config = self.config
         type_ids = set(self._traci.vehicletype.getIDList())
         if config.base_vehicle_type_id not in type_ids:
@@ -168,13 +168,18 @@ class EmergencyVehicleManager:
             config.vehicle_type_id, config.emergency_decel
         )
 
-        stage = self._traci.simulation.findRoute(
-            config.start.edge_id,
-            config.destination.edge_id,
-            config.vehicle_type_id,
-            config.depart_time,
-        )
-        edges = tuple(stage.edges)
+        if precalculated_edges is not None:
+            edges = precalculated_edges
+            stage = None
+        else:
+            stage = self._traci.simulation.findRoute(
+                config.start.edge_id,
+                config.destination.edge_id,
+                config.vehicle_type_id,
+                config.depart_time,
+            )
+            edges = tuple(stage.edges)
+
         if len(edges) < 2:
             raise RuntimeError(
                 "SUMO could not build an emergency route from "
@@ -206,7 +211,7 @@ class EmergencyVehicleManager:
             destination_edge=config.destination.edge_id,
             scheduled_departure=config.depart_time,
             route_edge_count=len(edges),
-            route_length=float(stage.length),
-            expected_travel_time=float(stage.travelTime),
+            route_length=float(stage.length) if stage else 0.0,
+            expected_travel_time=float(stage.travelTime) if stage else 0.0,
         )
         return self.details

@@ -8,6 +8,8 @@ import traci
 from .area_model import AreaModel, discover_area, load_zone_tls_ids
 from .config import RunConfig
 from .controller import AreaSignalController
+from .corridor_manager import CorridorManager
+from .emergency_router import EmergencyRouter
 from .emergency_vehicle import EmergencyVehicleManager
 from .metrics import MetricsCollector
 
@@ -57,14 +59,24 @@ def run_experiment(config: RunConfig) -> dict[str, object]:
     try:
         traci.start(_sumo_command(config))
         connection = traci.getConnection()
-        emergency_manager = (
-            EmergencyVehicleManager(connection, config.emergency)
-            if config.emergency is not None
-            else None
-        )
-        emergency_details = (
-            emergency_manager.install() if emergency_manager is not None else None
-        )
+        emergency_details = None
+        corridor_manager = None
+        alternatives_log = []
+
+        if config.emergency is not None:
+            router = EmergencyRouter(connection, area)
+            best_route, alternatives_log = router.find_alternatives(
+                config.emergency.start.edge_id,
+                config.emergency.destination.edge_id,
+                config.emergency.base_vehicle_type_id,
+                config.emergency.depart_time,
+            )
+            edges = best_route.edge_ids if best_route else None
+            
+            emergency_manager = EmergencyVehicleManager(connection, config.emergency)
+            emergency_details = emergency_manager.install(precalculated_edges=edges)
+            
+            corridor_manager = CorridorManager(config.emergency.vehicle_id)
         priority_vehicle = (
             config.emergency.vehicle_id
             if config.emergency is not None
@@ -81,6 +93,8 @@ def run_experiment(config: RunConfig) -> dict[str, object]:
             if config.mode != "fixed"
             else None
         )
+        if controller is not None and corridor_manager is not None:
+            controller.set_corridor_manager(corridor_manager)
         metrics = MetricsCollector(
             connection, area, config.control, priority_vehicle
         )
@@ -92,6 +106,17 @@ def run_experiment(config: RunConfig) -> dict[str, object]:
         ):
             connection.simulationStep()
             simulated_time = float(connection.simulation.getTime())
+            
+            if corridor_manager is not None:
+                veh_id = corridor_manager.vehicle_id
+                in_network = veh_id in connection.vehicle.getIDList()
+                next_tls_info = None
+                if in_network:
+                    next_tls_list = connection.vehicle.getNextTLS(veh_id)
+                    if next_tls_list:
+                        next_tls_info = (str(next_tls_list[0][0]), int(next_tls_list[0][1]), float(next_tls_list[0][2]))
+                corridor_manager.step(simulated_time, in_network, next_tls_info)
+
             if controller is not None:
                 controller.step(simulated_time)
             metrics.collect(simulated_time)
@@ -99,6 +124,7 @@ def run_experiment(config: RunConfig) -> dict[str, object]:
         summary = metrics.summary(config.mode, simulated_time)
         if emergency_details is not None:
             summary.update(emergency_details.as_summary())
+            summary["emergency_alternatives"] = alternatives_log
         if controller is not None:
             summary.update(
                 {

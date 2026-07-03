@@ -39,17 +39,24 @@ class AreaSignalController:
         self._mode = mode
         self._config = config
         self._priority_vehicle = priority_vehicle
+        self._corridor_manager = None
         self._reader = TrafficStateReader(traci_connection, area)
         self.stats = ControllerStats()
+
+    def set_corridor_manager(self, manager: object) -> None:
+        self._corridor_manager = manager
 
     def step(self, simulation_time: float) -> None:
         if int(simulation_time) % self._config.decision_interval:
             return
 
         traffic = self._reader.read()
-        overrides = priority_links(
-            self._traci, self._priority_vehicle, self._config
-        )
+        if self._corridor_manager is not None:
+            overrides = self._corridor_manager.get_priority_overrides()
+        else:
+            overrides = priority_links(
+                self._traci, self._priority_vehicle, self._config
+            )
         for intersection in self._area.intersections:
             tls_id = intersection.tls_id
             current_phase = int(self._traci.trafficlight.getPhase(tls_id))
