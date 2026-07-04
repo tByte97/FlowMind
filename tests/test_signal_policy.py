@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import unittest
 
-from flowmind.area_model import ControlledLink, Intersection
+from flowmind.area_model import AreaModel, ControlledLink, Intersection
 from flowmind.config import ControlConfig
-from flowmind.signal_policy import choose_phase, score_phases
+from flowmind.signal_policy import (
+    area_pressure_by_incoming_lane,
+    choose_phase,
+    score_phases,
+)
 from flowmind.traffic_state import LaneState, TrafficState
 
 
@@ -64,6 +68,35 @@ class SignalPolicyTest(unittest.TestCase):
         )
         self.assertIsNotNone(best)
         self.assertEqual(best.phase_index, 2)
+
+    def test_flowmind_can_use_area_pressure_bias(self) -> None:
+        state = TrafficState(
+            {
+                "north": LaneState(4, 12, 0.9, 0.0, 2.0),
+                "south": LaneState(0, 0, 0.1, 10.0, 15.0),
+                "east": LaneState(5, 5, 0.3, 0.0, 8.0),
+                "west": LaneState(0, 0, 0.8, 1.0, 2.0),
+            }
+        )
+        area_pressure = area_pressure_by_incoming_lane(
+            AreaModel((self.intersection,)),
+            state,
+            self.config,
+        )
+
+        best = choose_phase(
+            score_phases(
+                self.intersection,
+                state,
+                "flowmind",
+                self.config,
+                area_pressure=area_pressure,
+            )
+        )
+
+        self.assertIsNotNone(best)
+        self.assertIn("north", area_pressure)
+        self.assertEqual(best.phase_index, 0)
 
 
 if __name__ == "__main__":

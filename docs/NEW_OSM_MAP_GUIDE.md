@@ -1,5 +1,9 @@
 # Створення нової SUMO-карти з OpenStreetMap
 
+Для вже доданого файлу `simulation/new_area/map.osm` є коротка
+практична інструкція:
+[simulation/new_area/README.md](../simulation/new_area/README.md).
+
 Інструкція описує актуальний процес для FlowMind Rivne та SUMO 1.27.1:
 
 1. автоматично через OSM Web Wizard;
@@ -9,6 +13,19 @@
 4. ручне редагування мережі в `netedit`;
 5. підключення нової карти до FlowMind;
 6. налаштування центральної зони та швидкої.
+
+Найкоротший автоматичний варіант для локального `.osm`:
+
+```bash
+python tools/build_sumo_map.py map.osm \
+  --output-dir simulation/new_area \
+  --duration 1800 \
+  --insertion-rate 1200
+```
+
+Скрипт автоматично створює SUMO network, polygons, випадковий трафік,
+`osm.sumocfg` і `osm.build.json`. Якщо вихідні файли вже існують, для
+їх свідомого перезапису потрібно додати `--force`.
 
 Офіційна документація:
 
@@ -391,7 +408,7 @@ curl -L "https://api.openstreetmap.org/api/0.6/map?bbox=$BBOX" \
 #### Windows PowerShell
 
 ```powershell
-netconvert `m_base Dispatcher_Client::request_read_and_idx::timeout. The server is probably too busy to handle your request. 
+netconvert `
   --osm-files osm_bbox.osm.xml `
   --output-file osm.net.xml.gz `
   --type-files "$env:SUMO_HOME\data\typemap\osmNetconvert.typ.xml,$env:SUMO_HOME\data\typemap\osmNetconvertUrbanDe.typ.xml" `

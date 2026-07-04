@@ -60,9 +60,11 @@ class EmergencyRouteDetails:
     destination_name: str
     destination_edge: str
     scheduled_departure: float
+    route_edges: tuple[str, ...]
     route_edge_count: int
     route_length: float
     expected_travel_time: float
+    predicted_eta: float
 
     def as_summary(self) -> dict[str, object]:
         return {
@@ -72,11 +74,13 @@ class EmergencyRouteDetails:
             "emergency_destination": self.destination_name,
             "emergency_destination_edge": self.destination_edge,
             "emergency_scheduled_departure": self.scheduled_departure,
+            "emergency_route_edges": " ".join(self.route_edges),
             "emergency_route_edge_count": self.route_edge_count,
             "emergency_route_length": round(self.route_length, 2),
             "emergency_expected_travel_time": round(
                 self.expected_travel_time, 2
             ),
+            "emergency_predicted_eta": round(self.predicted_eta, 2),
         }
 
 
@@ -137,12 +141,33 @@ class EmergencyVehicleManager:
         self.config = config
         self.details: EmergencyRouteDetails | None = None
 
-    def install(self, precalculated_edges: tuple[str, ...] | None = None) -> EmergencyRouteDetails:
+    def install(
+        self,
+        precalculated_edges: tuple[str, ...] | None = None,
+        route_length: float | None = None,
+        expected_travel_time: float | None = None,
+        predicted_eta: float | None = None,
+    ) -> EmergencyRouteDetails:
         config = self.config
         type_ids = set(self._traci.vehicletype.getIDList())
         if config.base_vehicle_type_id not in type_ids:
             raise ValueError(
                 f"Unknown base vehicle type: {config.base_vehicle_type_id}"
+            )
+        edge_ids = set(self._traci.edge.getIDList())
+        unknown_edges = [
+            edge_id
+            for edge_id in (
+                config.start.edge_id,
+                config.destination.edge_id,
+            )
+            if edge_id not in edge_ids
+        ]
+        if unknown_edges:
+            raise ValueError(
+                "Emergency edge IDs are absent from the current SUMO map: "
+                + ", ".join(unknown_edges)
+                + ". Update the selected emergency config for this map."
             )
         if config.vehicle_type_id not in type_ids:
             self._traci.vehicletype.copy(
@@ -203,6 +228,8 @@ class EmergencyVehicleManager:
             arrivalLane="current",
             arrivalPos="max",
         )
+        self._set_vehicle_appearance()
+        self._draw_route_overlay(edges)
         self.details = EmergencyRouteDetails(
             vehicle_id=config.vehicle_id,
             start_name=config.start.name,
@@ -210,8 +237,118 @@ class EmergencyVehicleManager:
             destination_name=config.destination.name,
             destination_edge=config.destination.edge_id,
             scheduled_departure=config.depart_time,
+            route_edges=edges,
             route_edge_count=len(edges),
-            route_length=float(stage.length) if stage else 0.0,
-            expected_travel_time=float(stage.travelTime) if stage else 0.0,
+            route_length=(
+                float(stage.length)
+                if stage
+                else float(route_length or 0.0)
+            ),
+            expected_travel_time=(
+                float(stage.travelTime)
+                if stage
+                else float(expected_travel_time or 0.0)
+            ),
+            predicted_eta=(
+                float(stage.travelTime)
+                if stage
+                else float(predicted_eta or expected_travel_time or 0.0)
+            ),
         )
         return self.details
+
+    def _set_vehicle_appearance(self) -> None:
+        """Make the ambulance visually distinct in SUMO GUI when available."""
+
+        config = self.config
+        try:
+            self._traci.vehicle.setColor(config.vehicle_id, config.color)
+        except Exception:
+            pass
+        try:
+            self._traci.vehicle.highlight(
+                config.vehicle_id,
+                color=config.color,
+                size=35,
+                alphaMax=255,
+                duration=-1,
+            )
+        except Exception:
+            pass
+
+    def _draw_route_overlay(self, edges: tuple[str, ...]) -> None:
+        """Draw the selected emergency route as a red line in SUMO GUI."""
+
+        if not hasattr(self._traci, "lane") or not hasattr(self._traci, "polygon"):
+            return
+        try:
+            lane_by_edge = {
+                self._traci.lane.getEdgeID(lane_id): lane_id
+                for lane_id in self._traci.lane.getIDList()
+            }
+        except Exception:
+            return
+
+        first_shape: tuple[tuple[float, float], ...] | None = None
+        last_shape: tuple[tuple[float, float], ...] | None = None
+        for index, edge_id in enumerate(edges):
+            lane_id = lane_by_edge.get(edge_id)
+            if lane_id is None:
+                continue
+            try:
+                shape = tuple(self._traci.lane.getShape(lane_id))
+            except Exception:
+                continue
+            if len(shape) < 2:
+                continue
+            if first_shape is None:
+                first_shape = shape
+            last_shape = shape
+            polygon_id = f"{self.config.route_id}_overlay_{index:03d}"
+            try:
+                if polygon_id in self._traci.polygon.getIDList():
+                    self._traci.polygon.remove(polygon_id)
+            except Exception:
+                pass
+            try:
+                self._traci.polygon.add(
+                    polygon_id,
+                    shape,
+                    (255, 35, 35, 180),
+                    fill=False,
+                    polygonType="emergency_route",
+                    layer=100,
+                    lineWidth=4,
+                )
+            except Exception:
+                pass
+
+        self._draw_route_marker("start", first_shape[0] if first_shape else None)
+        self._draw_route_marker(
+            "destination", last_shape[-1] if last_shape else None
+        )
+
+    def _draw_route_marker(
+        self, suffix: str, position: tuple[float, float] | None
+    ) -> None:
+        if position is None or not hasattr(self._traci, "poi"):
+            return
+        marker_id = f"{self.config.route_id}_{suffix}"
+        try:
+            if marker_id in self._traci.poi.getIDList():
+                self._traci.poi.remove(marker_id)
+        except Exception:
+            pass
+        try:
+            self._traci.poi.add(
+                marker_id,
+                position[0],
+                position[1],
+                self.config.color,
+                poiType=f"emergency_{suffix}",
+                layer=120,
+                width=18,
+                height=18,
+            )
+        except Exception:
+            pass

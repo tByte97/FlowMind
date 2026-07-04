@@ -246,8 +246,10 @@ def write_sumo_config(output_path: Path, duration: int) -> None:
     ET.SubElement(processing, "time-to-teleport", {"value": "300"})
     report = ET.SubElement(root, "report")
     ET.SubElement(report, "no-step-log", {"value": "true"})
-    gui = ET.SubElement(root, "gui_only")
-    ET.SubElement(gui, "gui-settings-file", {"value": "osm.view.xml"})
+    view_path = output_path.parent / "osm.view.xml"
+    if view_path.exists():
+        gui = ET.SubElement(root, "gui_only")
+        ET.SubElement(gui, "gui-settings-file", {"value": view_path.name})
     ET.indent(root, space="    ")
     ET.ElementTree(root).write(output_path, encoding="utf-8", xml_declaration=True)
 

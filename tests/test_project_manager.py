@@ -4,6 +4,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import socket
 from pathlib import Path
 
 import project_manager
@@ -49,6 +50,57 @@ class ProjectManagerTests(unittest.TestCase):
             project_manager.command_text(command),
             subprocess.list2cmdline(command),
         )
+
+    def test_scenario_profile_prefers_focused_scenario_files(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            scenario = Path(directory) / "new_area"
+            scenario.mkdir()
+            for name in (
+                "osm.sumocfg",
+                "focused.sumocfg",
+                "central_zone.json",
+                "emergency.json",
+                "osm.net.xml.gz",
+            ):
+                (scenario / name).touch()
+
+            profile = project_manager.scenario_profile_from_directory(scenario)
+
+        self.assertEqual(profile.name, "new_area")
+        self.assertEqual(profile.config_path.name, "focused.sumocfg")
+        self.assertEqual(profile.zone_path.name, "central_zone.json")
+        self.assertEqual(profile.emergency_path.name, "emergency.json")
+        self.assertEqual(profile.net_path.name, "osm.net.xml.gz")
+
+    def test_discover_scenarios_orders_default_first(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            simulation = Path(directory)
+            default = simulation / "rivne_area"
+            custom = simulation / "new_area"
+            for scenario in (custom, default):
+                scenario.mkdir()
+                (scenario / "focused.sumocfg").touch()
+                (scenario / "central_zone.json").touch()
+                (scenario / "osm.net.xml.gz").touch()
+
+            profiles = project_manager.discover_scenarios(simulation)
+
+        self.assertEqual([profile.name for profile in profiles], ["rivne_area", "new_area"])
+
+    def test_find_free_port_skips_busy_port(self) -> None:
+        try:
+            busy = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        except PermissionError as error:
+            self.skipTest(f"sockets are unavailable in this environment: {error}")
+        with busy:
+            busy.bind(("127.0.0.1", 0))
+            busy.listen(1)
+            occupied = busy.getsockname()[1]
+
+            free_port = project_manager.find_free_port(occupied, attempts=5)
+
+        self.assertNotEqual(free_port, occupied)
+        self.assertGreater(free_port, occupied)
 
 
 if __name__ == "__main__":

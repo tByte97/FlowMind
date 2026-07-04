@@ -1,0 +1,43 @@
+{
+  "created_at": "2026-07-03T14:03:15.279915+00:00",
+  "source_osm": "/home/tbyte/Документи/github/FlowMind/simulation/new_area/map.osm",
+  "source_sha256": "25bba6764c8bf3b255106de327ab28dd09f4c0d3940642f5851fffd6977e1eed",
+  "sumo_version": "Eclipse SUMO sumo 1.27.1",
+  "parameters": {
+    "prefix": "osm",
+    "duration": 1800,
+    "insertion_rate": 1200,
+    "seed": 42,
+    "min_distance": 300.0,
+    "fringe_factor": 5.0,
+    "polygons": true,
+    "traffic": true
+  },
+  "network": {
+    "nodes": 2765,
+    "edges": 5803,
+    "traffic_lights": 45
+  },
+  "generated_files": [
+    {
+      "name": "osm.net.xml.gz",
+      "size_bytes": 1450756
+    },
+    {
+      "name": "osm.sumocfg",
+      "size_bytes": 701
+    },
+    {
+      "name": "osm.poly.xml.gz",
+      "size_bytes": 439279
+    },
+    {
+      "name": "osm.passenger.trips.xml",
+      "size_bytes": 76787
+    },
+    {
+      "name": "osm.passenger.rou.xml",
+      "size_bytes": 330891
+    }
+  ]
+}

@@ -23,6 +23,21 @@ class MetricSample:
     gridlock_risk: float
 
 
+@dataclass(frozen=True)
+class EmergencyTraceSample:
+    time: float
+    vehicle_id: str
+    edge_id: str
+    lane_id: str
+    route_index: int
+    route_edge_count: int
+    remaining_edges: int
+    speed: float
+    lane_position: float
+    x: float
+    y: float
+
+
 class MetricsCollector:
     def __init__(
         self,
@@ -43,10 +58,14 @@ class MetricsCollector:
         self._priority_departed: float | None = None
         self._priority_arrived: float | None = None
         self._priority_eta: float | None = None
+        self._departed_count = 0
+        self._peak_active_vehicles = 0
         self.samples: list[MetricSample] = []
+        self.emergency_trace: list[EmergencyTraceSample] = []
 
     def collect(self, simulation_time: float) -> None:
         departed = self._traci.simulation.getDepartedIDList()
+        self._departed_count += len(departed)
         for vehicle_id in departed:
             self._departed_at[vehicle_id] = simulation_time
             if vehicle_id == self._priority_vehicle:
@@ -54,6 +73,10 @@ class MetricsCollector:
 
         arrived = self._traci.simulation.getArrivedIDList()
         self._throughput += len(arrived)
+        self._peak_active_vehicles = max(
+            self._peak_active_vehicles,
+            len(self._departed_at),
+        )
         for vehicle_id in arrived:
             departed_at = self._departed_at.pop(vehicle_id, None)
             if departed_at is not None:
@@ -62,6 +85,8 @@ class MetricsCollector:
                 if vehicle_id == self._priority_vehicle:
                     self._priority_eta = duration
                     self._priority_arrived = simulation_time
+
+        self._collect_priority_trace(simulation_time)
 
         if int(simulation_time) % self._control.decision_interval:
             return
@@ -153,6 +178,8 @@ class MetricsCollector:
                 (sample.max_queue_length for sample in self.samples), default=0
             ),
             "throughput": self._throughput,
+            "departed_vehicles": self._departed_count,
+            "peak_active_vehicles": self._peak_active_vehicles,
             "stops_count": self._stops,
             "gridlock_risk": round(
                 fmean(sample.gridlock_risk for sample in self.samples), 4
@@ -162,7 +189,47 @@ class MetricsCollector:
             "emergency_departure_time": self._priority_departed,
             "emergency_arrival_time": self._priority_arrived,
             "emergency_eta": self._priority_eta,
+            "emergency_trace_samples": len(self.emergency_trace),
         }
+
+    def _collect_priority_trace(self, simulation_time: float) -> None:
+        if self._priority_vehicle is None:
+            return
+        active = set(self._traci.vehicle.getIDList())
+        if self._priority_vehicle not in active:
+            return
+
+        route = tuple(self._traci.vehicle.getRoute(self._priority_vehicle))
+        route_index = int(self._traci.vehicle.getRouteIndex(self._priority_vehicle))
+        position = self._traci.vehicle.getPosition(self._priority_vehicle)
+        self.emergency_trace.append(
+            EmergencyTraceSample(
+                time=simulation_time,
+                vehicle_id=self._priority_vehicle,
+                edge_id=str(self._traci.vehicle.getRoadID(self._priority_vehicle)),
+                lane_id=str(self._traci.vehicle.getLaneID(self._priority_vehicle)),
+                route_index=route_index,
+                route_edge_count=len(route),
+                remaining_edges=max(len(route) - route_index - 1, 0),
+                speed=round(
+                    max(float(self._traci.vehicle.getSpeed(self._priority_vehicle)), 0.0),
+                    3,
+                ),
+                lane_position=round(
+                    max(
+                        float(
+                            self._traci.vehicle.getLanePosition(
+                                self._priority_vehicle
+                            )
+                        ),
+                        0.0,
+                    ),
+                    3,
+                ),
+                x=round(float(position[0]), 3),
+                y=round(float(position[1]), 3),
+            )
+        )
 
     def write(self, results_dir: Path, summary: dict[str, object]) -> None:
         results_dir.mkdir(parents=True, exist_ok=True)
@@ -174,6 +241,14 @@ class MetricsCollector:
             if fieldnames:
                 writer.writeheader()
                 writer.writerows(asdict(sample) for sample in self.samples)
+
+        if self.emergency_trace:
+            trace_path = results_dir / f"{mode}_emergency_trace.csv"
+            with trace_path.open("w", newline="", encoding="utf-8") as handle:
+                fieldnames = list(asdict(self.emergency_trace[0]).keys())
+                writer = csv.DictWriter(handle, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(asdict(sample) for sample in self.emergency_trace)
 
         with (results_dir / f"{mode}_summary.json").open(
             "w", encoding="utf-8"

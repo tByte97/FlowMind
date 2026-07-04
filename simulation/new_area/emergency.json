@@ -1,0 +1,25 @@
+{
+  "vehicle_id": "flowmind_ambulance",
+  "route_id": "flowmind_emergency_route",
+  "vehicle_type_id": "flowmind_emergency",
+  "base_vehicle_type_id": "zone_passenger",
+  "depart_time": 180.0,
+  "start": {
+    "name": "Поліклініка міська №2",
+    "edge_id": "-110281352#3",
+    "latitude": 50.6155987,
+    "longitude": 26.2525735
+  },
+  "destination": {
+    "name": "Oxford Medical, вул. Академіка Грушевського",
+    "edge_id": "148132825",
+    "latitude": 50.623292,
+    "longitude": 26.2717374
+  },
+  "color": [255, 35, 35, 255],
+  "max_speed": 25.0,
+  "speed_factor": 1.15,
+  "accel": 3.0,
+  "decel": 6.0,
+  "emergency_decel": 9.0
+}

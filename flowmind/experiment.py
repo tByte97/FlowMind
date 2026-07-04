@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import sumolib
@@ -12,6 +13,22 @@ from .corridor_manager import CorridorManager
 from .emergency_router import EmergencyRouter
 from .emergency_vehicle import EmergencyVehicleManager
 from .metrics import MetricsCollector
+from .ml_dataset import MLDatasetCollector, MLDatasetConfig
+
+
+def configure_projection_data() -> Path | None:
+    """Point packaged SUMO binaries at their bundled PROJ database."""
+
+    try:
+        import sumo
+    except ImportError:
+        return None
+    projection_dir = Path(sumo.SUMO_HOME) / "data" / "proj"
+    if not (projection_dir / "proj.db").is_file():
+        return None
+    os.environ.setdefault("PROJ_DATA", str(projection_dir))
+    os.environ.setdefault("PROJ_LIB", str(projection_dir))
+    return projection_dir
 
 
 def _sumo_command(config: RunConfig) -> list[str]:
@@ -55,27 +72,55 @@ def load_area(config: RunConfig) -> AreaModel:
 
 def run_experiment(config: RunConfig) -> dict[str, object]:
     area = load_area(config)
+    net_path = config.config_path.resolve().parent / "osm.net.xml.gz"
     connection = None
     try:
+        configure_projection_data()
         traci.start(_sumo_command(config))
         connection = traci.getConnection()
         emergency_details = None
         corridor_manager = None
         alternatives_log = []
+        emergency_route_tls: tuple[str, ...] = ()
+        emergency_controlled_tls: tuple[str, ...] = ()
+        dataset_collector = None
 
         if config.emergency is not None:
-            router = EmergencyRouter(connection, area)
+            router = EmergencyRouter(
+                connection,
+                area,
+                net_path,
+            )
             best_route, alternatives_log = router.find_alternatives(
                 config.emergency.start.edge_id,
                 config.emergency.destination.edge_id,
                 config.emergency.base_vehicle_type_id,
                 config.emergency.depart_time,
+                num_alternatives=5,
             )
             edges = best_route.edge_ids if best_route else None
-            
+            emergency_route_tls = best_route.tls_sequence if best_route else ()
+            if emergency_route_tls:
+                requested_tls = _merge_tls_ids(area.tls_ids, emergency_route_tls)
+                area = discover_area(
+                    net_path,
+                    requested_tls=requested_tls,
+                    strict_requested=False,
+                )
+                emergency_controlled_tls = tuple(
+                    tls_id for tls_id in emergency_route_tls if tls_id in area.tls_ids
+                )
+
             emergency_manager = EmergencyVehicleManager(connection, config.emergency)
-            emergency_details = emergency_manager.install(precalculated_edges=edges)
-            
+            emergency_details = emergency_manager.install(
+                precalculated_edges=edges,
+                route_length=best_route.length if best_route else None,
+                expected_travel_time=(
+                    best_route.base_travel_time if best_route else None
+                ),
+                predicted_eta=best_route.predicted_eta if best_route else None,
+            )
+
             corridor_manager = CorridorManager(config.emergency.vehicle_id)
         priority_vehicle = (
             config.emergency.vehicle_id
@@ -98,6 +143,25 @@ def run_experiment(config: RunConfig) -> dict[str, object]:
         metrics = MetricsCollector(
             connection, area, config.control, priority_vehicle
         )
+        if config.dataset_dir is not None:
+            dataset_collector = MLDatasetCollector(
+                connection,
+                area,
+                config.control,
+                MLDatasetConfig(
+                    output_dir=config.dataset_dir,
+                    run_id=(
+                        config.dataset_run_id
+                        or f"{config.dataset_scenario}_{config.mode}_{config.seed}"
+                    ),
+                    scenario=config.dataset_scenario,
+                    mode=config.mode,
+                    seed=config.seed,
+                    duration=config.duration,
+                    sample_interval=config.dataset_sample_interval,
+                    target_horizons=config.dataset_target_horizons,
+                ),
+            )
 
         simulated_time = 0.0
         while (
@@ -114,17 +178,26 @@ def run_experiment(config: RunConfig) -> dict[str, object]:
                 if in_network:
                     next_tls_list = connection.vehicle.getNextTLS(veh_id)
                     if next_tls_list:
-                        next_tls_info = (str(next_tls_list[0][0]), int(next_tls_list[0][1]), float(next_tls_list[0][2]))
+                        next_tls_info = [
+                            (str(tls_id), int(link_index), float(distance))
+                            for tls_id, link_index, distance, *_state in next_tls_list
+                        ]
                 corridor_manager.step(simulated_time, in_network, next_tls_info)
 
             if controller is not None:
                 controller.step(simulated_time)
             metrics.collect(simulated_time)
+            if dataset_collector is not None:
+                dataset_collector.collect(simulated_time)
 
         summary = metrics.summary(config.mode, simulated_time)
         if emergency_details is not None:
             summary.update(emergency_details.as_summary())
             summary["emergency_alternatives"] = alternatives_log
+            summary["emergency_route_tls"] = emergency_route_tls
+            summary["emergency_controlled_tls"] = emergency_controlled_tls
+            if corridor_manager is not None:
+                summary.update(corridor_manager.as_summary())
         if controller is not None:
             summary.update(
                 {
@@ -143,8 +216,21 @@ def run_experiment(config: RunConfig) -> dict[str, object]:
                     "priority_decisions": 0,
                 }
             )
+        if dataset_collector is not None:
+            summary.update(dataset_collector.write())
         metrics.write(config.results_dir, summary)
         return summary
     finally:
         if connection is not None:
             connection.close()
+
+
+def _merge_tls_ids(
+    base_tls: tuple[str, ...],
+    route_tls: tuple[str, ...],
+) -> tuple[str, ...]:
+    merged = list(base_tls)
+    for tls_id in route_tls:
+        if tls_id not in merged:
+            merged.append(tls_id)
+    return tuple(merged)

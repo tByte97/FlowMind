@@ -5,17 +5,19 @@ import os
 import queue
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import threading
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-SCENARIO_DIR = PROJECT_ROOT / "simulation" / "rivne_area"
-DEFAULT_CONFIG = SCENARIO_DIR / "focused.sumocfg"
-DEFAULT_ZONE = SCENARIO_DIR / "central_zone.json"
+SIMULATION_ROOT = PROJECT_ROOT / "simulation"
+DEFAULT_SCENARIO_NAME = "rivne_area"
+SCENARIO_DIR = SIMULATION_ROOT / DEFAULT_SCENARIO_NAME
 DEFAULT_RESULTS = PROJECT_ROOT / "results"
 
 MODE_SCRIPTS = {
@@ -23,6 +25,121 @@ MODE_SCRIPTS = {
     "Local Adaptive": PROJECT_ROOT / "experiments" / "run_local_adaptive.py",
     "FlowMind": PROJECT_ROOT / "experiments" / "run_flowmind.py",
 }
+
+
+@dataclass(frozen=True)
+class ScenarioProfile:
+    name: str
+    directory: Path
+    config_path: Path
+    zone_path: Path
+    emergency_path: Path
+    net_path: Path
+    results_path: Path
+
+    @property
+    def label(self) -> str:
+        return f"{self.name} — {display_path(self.directory)}"
+
+    @property
+    def is_ready(self) -> bool:
+        return (
+            self.directory.is_dir()
+            and self.config_path.is_file()
+            and self.zone_path.is_file()
+            and self.net_path.is_file()
+        )
+
+
+def display_path(path: Path) -> str:
+    try:
+        return str(path.resolve().relative_to(PROJECT_ROOT))
+    except ValueError:
+        return str(path.resolve())
+
+
+def _first_existing(paths: Sequence[Path]) -> Path:
+    for path in paths:
+        if path.exists():
+            return path
+    return paths[0]
+
+
+def scenario_profile_from_directory(directory: Path) -> ScenarioProfile:
+    directory = directory.expanduser().resolve()
+    name = directory.name
+    config_path = _first_existing(
+        (
+            directory / "focused.sumocfg",
+            directory / "osm.sumocfg",
+            *sorted(directory.glob("*.sumocfg")),
+        )
+    )
+    return ScenarioProfile(
+        name=name,
+        directory=directory,
+        config_path=config_path,
+        zone_path=_first_existing(
+            (
+                directory / "central_zone.json",
+                directory / "zone.json",
+                *sorted(directory.glob("*zone*.json")),
+            )
+        ),
+        emergency_path=_first_existing(
+            (
+                directory / "emergency.json",
+                *sorted(directory.glob("*emergency*.json")),
+            )
+        ),
+        net_path=_first_existing(
+            (
+                directory / "osm.net.xml.gz",
+                directory / "osm.net.xml",
+                *sorted(directory.glob("*.net.xml.gz")),
+                *sorted(directory.glob("*.net.xml")),
+            )
+        ),
+        results_path=DEFAULT_RESULTS / name,
+    )
+
+
+def discover_scenarios(
+    simulation_root: Path = SIMULATION_ROOT,
+) -> tuple[ScenarioProfile, ...]:
+    if not simulation_root.exists():
+        return ()
+    profiles = [
+        scenario_profile_from_directory(path)
+        for path in sorted(simulation_root.iterdir(), key=lambda item: item.name)
+        if path.is_dir()
+        and any(
+            candidate.exists()
+            for candidate in (
+                path / "focused.sumocfg",
+                path / "osm.sumocfg",
+                path / "osm.net.xml.gz",
+                path / "osm.net.xml",
+            )
+        )
+    ]
+    return tuple(
+        sorted(
+            profiles,
+            key=lambda item: (
+                item.name != DEFAULT_SCENARIO_NAME,
+                not item.is_ready,
+                item.name,
+            ),
+        )
+    )
+
+
+def default_scenario() -> ScenarioProfile:
+    discovered = discover_scenarios()
+    if discovered:
+        return discovered[0]
+    return scenario_profile_from_directory(SCENARIO_DIR)
 
 
 def project_python(project_root: Path = PROJECT_ROOT) -> Path:
@@ -74,16 +191,18 @@ def project_environment(python: Path) -> dict[str, str]:
 
 def diagnose(python: Path | None = None) -> int:
     python = python or project_python()
+    scenario = default_scenario()
     print(f"Project: {PROJECT_ROOT}")
     print(f"Python:  {python}")
+    print(f"Scenario: {scenario.name} ({scenario.directory})")
 
     missing_files = [
         path
         for path in (
             PROJECT_ROOT / "requirements.txt",
-            DEFAULT_CONFIG,
-            DEFAULT_ZONE,
-            SCENARIO_DIR / "osm.net.xml.gz",
+            scenario.config_path,
+            scenario.zone_path,
+            scenario.net_path,
         )
         if not path.exists()
     ]
@@ -151,6 +270,21 @@ def positive_int(value: str, field: str, minimum: int = 1) -> int:
     return result
 
 
+def find_free_port(preferred: int, attempts: int = 50) -> int:
+    for port in range(preferred, preferred + attempts):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                probe.bind(("127.0.0.1", port))
+            except OSError:
+                continue
+            return port
+    raise ValueError(
+        f"Не знайдено вільний порт у діапазоні "
+        f"{preferred}–{preferred + attempts - 1}."
+    )
+
+
 def run_gui() -> bool:
     import tkinter as tk
     from tkinter import filedialog, messagebox, ttk
@@ -166,12 +300,15 @@ def run_gui() -> bool:
             self.stopping = False
             self.cancel_start = False
             self.after_success: tuple[list[str], str, dict[str, str]] | None = None
+            self.scenarios = discover_scenarios()
+            self.current_scenario = default_scenario()
 
             self.root.title("FlowMind — керування проєктом")
             self.root.geometry("1040x760")
             self.root.minsize(850, 650)
             self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
+            self.scenario_choice = tk.StringVar(value=self.current_scenario.label)
             self.mode = tk.StringVar(value="FlowMind")
             self.duration = tk.StringVar(value="900")
             self.seed = tk.StringVar(value="42")
@@ -181,9 +318,12 @@ def run_gui() -> bool:
             self.emergency_depart = tk.StringVar(value="180")
             self.gui_delay = tk.StringVar(value="75")
             self.dashboard_port = tk.StringVar(value="8501")
-            self.config_path = tk.StringVar(value=str(DEFAULT_CONFIG))
-            self.zone_path = tk.StringVar(value=str(DEFAULT_ZONE))
-            self.results_path = tk.StringVar(value=str(DEFAULT_RESULTS))
+            self.config_path = tk.StringVar(value=str(self.current_scenario.config_path))
+            self.zone_path = tk.StringVar(value=str(self.current_scenario.zone_path))
+            self.emergency_config_path = tk.StringVar(
+                value=str(self.current_scenario.emergency_path)
+            )
+            self.results_path = tk.StringVar(value=str(self.current_scenario.results_path))
 
             self.traffic_duration = tk.StringVar(value="1800")
             self.vehicles_per_hour = tk.StringVar(value="2400")
@@ -263,42 +403,74 @@ def run_gui() -> bool:
             for column in range(6):
                 parent.columnconfigure(column, weight=1 if column in (1, 3, 5) else 0)
 
-            ttk.Label(parent, text="Режим").grid(row=0, column=0, sticky="w")
+            ttk.Label(parent, text="Карта / сценарій").grid(row=0, column=0, sticky="w")
+            self.scenario_combobox = ttk.Combobox(
+                parent,
+                textvariable=self.scenario_choice,
+                values=self._scenario_labels(),
+                state="readonly",
+            )
+            self.scenario_combobox.grid(
+                row=0,
+                column=1,
+                columnspan=3,
+                sticky="ew",
+                padx=(6, 14),
+                pady=4,
+            )
+            self.scenario_combobox.bind(
+                "<<ComboboxSelected>>", lambda _event: self.select_scenario()
+            )
+            scenario_buttons = ttk.Frame(parent)
+            scenario_buttons.grid(row=0, column=4, columnspan=2, sticky="ew")
+            ttk.Button(
+                scenario_buttons, text="Оновити", command=self.refresh_scenarios
+            ).pack(side="left", padx=(0, 6))
+            ttk.Button(
+                scenario_buttons,
+                text="Обрати папку…",
+                command=self.choose_scenario_directory,
+            ).pack(side="left")
+
+            ttk.Label(parent, text="Режим").grid(row=1, column=0, sticky="w")
             ttk.Combobox(
                 parent,
                 textvariable=self.mode,
                 values=tuple(MODE_SCRIPTS),
                 state="readonly",
                 width=20,
-            ).grid(row=0, column=1, sticky="ew", padx=(6, 14))
-            self._entry(parent, "Тривалість, с", self.duration, 0, 2)
-            self._entry(parent, "Seed", self.seed, 0, 4)
+            ).grid(row=1, column=1, sticky="ew", padx=(6, 14))
+            self._entry(parent, "Тривалість, с", self.duration, 1, 2)
+            self._entry(parent, "Seed", self.seed, 1, 4)
 
-            self._entry(parent, "Розмір зони", self.zone_size, 1, 0)
-            self._entry(parent, "GUI delay, мс", self.gui_delay, 1, 2)
-            self._entry(parent, "Порт dashboard", self.dashboard_port, 1, 4)
+            self._entry(parent, "Розмір зони", self.zone_size, 2, 0)
+            self._entry(parent, "GUI delay, мс", self.gui_delay, 2, 2)
+            self._entry(parent, "Порт dashboard", self.dashboard_port, 2, 4)
 
             ttk.Checkbutton(
                 parent, text="Відкрити SUMO GUI", variable=self.gui_enabled
-            ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 0))
+            ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(8, 0))
             ttk.Checkbutton(
                 parent,
                 text="Створити швидку",
                 variable=self.emergency_enabled,
-            ).grid(row=2, column=2, sticky="w", pady=(8, 0))
+            ).grid(row=3, column=2, sticky="w", pady=(8, 0))
             ttk.Label(parent, text="Виїзд швидкої, с").grid(
-                row=2, column=3, sticky="e", pady=(8, 0)
+                row=3, column=3, sticky="e", pady=(8, 0)
             )
             ttk.Entry(parent, textvariable=self.emergency_depart, width=10).grid(
-                row=2, column=4, sticky="ew", padx=(6, 14), pady=(8, 0)
+                row=3, column=4, sticky="ew", padx=(6, 14), pady=(8, 0)
             )
 
-            self._path_row(parent, "SUMO config", self.config_path, 3, "file")
-            self._path_row(parent, "Конфігурація зони", self.zone_path, 4, "file")
-            self._path_row(parent, "Результати", self.results_path, 5, "directory")
+            self._path_row(parent, "SUMO config", self.config_path, 4, "file")
+            self._path_row(parent, "Конфігурація зони", self.zone_path, 5, "file")
+            self._path_row(
+                parent, "Швидка / emergency", self.emergency_config_path, 6, "file"
+            )
+            self._path_row(parent, "Результати", self.results_path, 7, "directory")
 
             actions = ttk.Frame(parent)
-            actions.grid(row=6, column=0, columnspan=6, sticky="ew", pady=(12, 0))
+            actions.grid(row=8, column=0, columnspan=6, sticky="ew", pady=(12, 0))
             ttk.Button(
                 actions, text="Запустити режим", command=self.run_experiment
             ).pack(side="left", padx=(0, 7))
@@ -334,6 +506,11 @@ def run_gui() -> bool:
                 text="Відкрити сценарій у SUMO",
                 command=self.open_sumo,
             ).pack(side="left", padx=7)
+            ttk.Button(
+                scenario_actions,
+                text="Інфо по карті",
+                command=self.show_scenario_info,
+            ).pack(side="left", padx=7)
 
             ttk.Separator(parent).grid(
                 row=2, column=0, columnspan=6, sticky="ew", pady=(0, 14)
@@ -358,12 +535,125 @@ def run_gui() -> bool:
                 parent,
                 text=(
                     "Тула запускає наявні скрипти окремими процесами. "
-                    "Вона не імпортується модулями FlowMind і не бере участі "
-                    "в симуляції або роботі контролера."
+                    "Для нової карти достатньо вибрати її папку або покласти її "
+                    "в simulation/<назва>; manager підхопить SUMO config, "
+                    "central_zone.json, emergency.json і папку результатів."
                 ),
                 foreground="#555555",
                 wraplength=820,
             ).grid(row=4, column=0, columnspan=6, sticky="w", pady=(18, 0))
+
+        def _scenario_labels(self) -> tuple[str, ...]:
+            return tuple(profile.label for profile in self.scenarios)
+
+        def _profile_by_label(self, label: str) -> ScenarioProfile | None:
+            for profile in self.scenarios:
+                if profile.label == label:
+                    return profile
+            return None
+
+        def _apply_scenario(self, profile: ScenarioProfile) -> None:
+            self.current_scenario = profile
+            self.scenario_choice.set(profile.label)
+            self.config_path.set(str(profile.config_path))
+            self.zone_path.set(str(profile.zone_path))
+            self.emergency_config_path.set(str(profile.emergency_path))
+            self.results_path.set(str(profile.results_path))
+            if not profile.is_ready:
+                self._append_log(
+                    "\n[manager] Увага: сценарій ще не повний. "
+                    "Потрібні SUMO config, central_zone.json і net-файл.\n"
+                )
+
+        def select_scenario(self) -> None:
+            profile = self._profile_by_label(self.scenario_choice.get())
+            if profile is not None:
+                self._apply_scenario(profile)
+
+        def refresh_scenarios(self) -> None:
+            selected_directory = self.current_scenario.directory
+            self.scenarios = discover_scenarios()
+            if hasattr(self, "scenario_combobox"):
+                self.scenario_combobox.configure(values=self._scenario_labels())
+            selected = next(
+                (
+                    profile
+                    for profile in self.scenarios
+                    if profile.directory == selected_directory
+                ),
+                self.scenarios[0] if self.scenarios else default_scenario(),
+            )
+            self._apply_scenario(selected)
+            self._append_log("\n[manager] Список карт оновлено.\n")
+
+        def choose_scenario_directory(self) -> None:
+            selected = filedialog.askdirectory(initialdir=SIMULATION_ROOT)
+            if not selected:
+                return
+            profile = scenario_profile_from_directory(Path(selected))
+            known = [item for item in self.scenarios if item.directory != profile.directory]
+            self.scenarios = tuple(sorted([*known, profile], key=lambda item: item.name))
+            self.scenario_combobox.configure(values=self._scenario_labels())
+            self._apply_scenario(profile)
+            self._append_log(
+                f"\n[manager] Обрано карту: {profile.directory}\n"
+            )
+
+        @staticmethod
+        def _scenario_directory_from_config(config: Path) -> Path:
+            return config.expanduser().resolve().parent
+
+        def _scenario_net_path(self) -> Path:
+            directory = self._scenario_directory_from_config(Path(self.config_path.get()))
+            return scenario_profile_from_directory(directory).net_path
+
+        def _scenario_output_dir(self) -> Path:
+            return self._scenario_directory_from_config(Path(self.config_path.get()))
+
+        def _traffic_generation_paths(self) -> tuple[Path, Path, Path]:
+            net_path = self._scenario_net_path()
+            zone_path = Path(self.zone_path.get()).expanduser()
+            output_dir = self._scenario_output_dir()
+            if not net_path.is_file():
+                raise ValueError(f"Не знайдено SUMO net-файл: {net_path}")
+            if not zone_path.is_file():
+                raise ValueError(f"Не знайдено конфігурацію зони: {zone_path}")
+            return net_path, zone_path, output_dir
+
+        def _validate_emergency_config(self) -> Path:
+            emergency_path = Path(self.emergency_config_path.get()).expanduser()
+            if not emergency_path.is_file():
+                raise ValueError(f"Не знайдено emergency config: {emergency_path}")
+            return emergency_path
+
+        @staticmethod
+        def _describe_profile(profile: ScenarioProfile) -> str:
+            parts = [
+                f"Папка: {display_path(profile.directory)}",
+                f"SUMO: {display_path(profile.config_path)}",
+                f"Зона: {display_path(profile.zone_path)}",
+                f"Net: {display_path(profile.net_path)}",
+                f"Швидка: {display_path(profile.emergency_path)}",
+            ]
+            missing = [
+                label
+                for label, path in (
+                    ("SUMO config", profile.config_path),
+                    ("central_zone.json", profile.zone_path),
+                    ("net-file", profile.net_path),
+                    ("emergency.json", profile.emergency_path),
+                )
+                if not path.exists()
+            ]
+            if missing:
+                parts.append("Ще треба: " + ", ".join(missing))
+            return "\n".join(parts)
+
+        def show_scenario_info(self) -> None:
+            profile = scenario_profile_from_directory(
+                self._scenario_directory_from_config(Path(self.config_path.get()))
+            )
+            messagebox.showinfo("Поточна карта", self._describe_profile(profile))
 
         @staticmethod
         def _entry(
@@ -465,7 +755,15 @@ def run_gui() -> bool:
                         raise ValueError(
                             "Швидка повинна виїхати до завершення симуляції."
                         )
-                    command.extend(["--emergency", "--emergency-depart", str(depart)])
+                    command.extend(
+                        [
+                            "--emergency",
+                            "--emergency-config",
+                            str(self._validate_emergency_config()),
+                            "--emergency-depart",
+                            str(depart),
+                        ]
+                    )
                 self.start_process(command, f"Режим {self.mode.get()}")
             except ValueError as error:
                 messagebox.showerror("Некоректні параметри", str(error))
@@ -483,6 +781,7 @@ def run_gui() -> bool:
                     str(seed),
                     "--zone-size",
                     str(zone_size),
+                    *self._experiment_paths(),
                 ]
                 self.start_process(command, "Порівняння режимів")
             except ValueError as error:
@@ -511,11 +810,23 @@ def run_gui() -> bool:
                     "--dashboard-port",
                     str(port),
                     "--no-dashboard",
+                    "--emergency-config",
+                    str(self._validate_emergency_config()),
                     *self._experiment_paths(),
                 ]
                 if not self.gui_enabled.get():
                     command.append("--headless")
-                dashboard_command, dashboard_environment = self._dashboard_spec(port)
+                (
+                    dashboard_command,
+                    dashboard_environment,
+                    actual_port,
+                ) = self._dashboard_spec(port)
+                if actual_port != port:
+                    self.dashboard_port.set(str(actual_port))
+                    self._append_log(
+                        f"\n[manager] Порт {port} зайнятий, "
+                        f"після demo відкрию dashboard на {actual_port}.\n"
+                    )
                 self.start_process(
                     command,
                     "Demo зі швидкою",
@@ -528,7 +839,8 @@ def run_gui() -> bool:
             except ValueError as error:
                 messagebox.showerror("Некоректні параметри", str(error))
 
-        def _dashboard_spec(self, port: int) -> tuple[list[str], dict[str, str]]:
+        def _dashboard_spec(self, port: int) -> tuple[list[str], dict[str, str], int]:
+            actual_port = find_free_port(port)
             environment = {
                 "FLOWMIND_RESULTS_DIR": str(
                     Path(self.results_path.get()).expanduser().resolve()
@@ -542,14 +854,20 @@ def run_gui() -> bool:
                 "run",
                 str(PROJECT_ROOT / "dashboard" / "app.py"),
                 "--server.port",
-                str(port),
+                str(actual_port),
             ]
-            return command, environment
+            return command, environment, actual_port
 
         def run_dashboard(self) -> None:
             try:
                 port = positive_int(self.dashboard_port.get(), "Порт dashboard")
-                command, environment = self._dashboard_spec(port)
+                command, environment, actual_port = self._dashboard_spec(port)
+                if actual_port != port:
+                    self.dashboard_port.set(str(actual_port))
+                    self._append_log(
+                        f"\n[manager] Порт {port} зайнятий, "
+                        f"використовую {actual_port}.\n"
+                    )
                 self.start_process(command, "Dashboard", environment)
             except ValueError as error:
                 messagebox.showerror("Некоректні параметри", str(error))
@@ -561,10 +879,17 @@ def run_gui() -> bool:
                 )
                 vehicles = positive_int(self.vehicles_per_hour.get(), "Авто/год")
                 routes = positive_int(self.route_count.get(), "Кількість маршрутів", 2)
+                net_path, zone_path, output_dir = self._traffic_generation_paths()
                 command = [
                     str(self.python),
                     "-u",
                     str(PROJECT_ROOT / "tools" / "generate_focused_traffic.py"),
+                    "--net",
+                    str(net_path),
+                    "--zone",
+                    str(zone_path),
+                    "--output-dir",
+                    str(output_dir),
                     "--duration",
                     str(duration),
                     "--vehicles-per-hour",

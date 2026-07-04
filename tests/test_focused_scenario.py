@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import tempfile
 import unittest
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
 from flowmind.area_model import load_zone_tls_ids
 from flowmind.config import PROJECT_ROOT, RunConfig
+from tools.generate_focused_traffic import write_sumo_config
 
 
 SCENARIO_DIR = PROJECT_ROOT / "simulation" / "rivne_area"
@@ -59,6 +61,22 @@ class FocusedScenarioTest(unittest.TestCase):
             {flow.attrib["route"] for flow in flows},
             {route.attrib["id"] for route in routes},
         )
+
+    def test_generated_config_only_references_an_existing_gui_view(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir)
+            config_path = output_dir / "focused.sumocfg"
+
+            write_sumo_config(config_path, 600)
+            root = ET.parse(config_path).getroot()
+            self.assertIsNone(root.find("./gui_only/gui-settings-file"))
+
+            (output_dir / "osm.view.xml").touch()
+            write_sumo_config(config_path, 600)
+            root = ET.parse(config_path).getroot()
+            view = root.find("./gui_only/gui-settings-file")
+            self.assertIsNotNone(view)
+            self.assertEqual(view.attrib["value"], "osm.view.xml")
 
 
 if __name__ == "__main__":

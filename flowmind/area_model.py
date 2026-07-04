@@ -111,6 +111,7 @@ def discover_area(
     net_path: str | Path,
     zone_size: int = 6,
     requested_tls: tuple[str, ...] = (),
+    strict_requested: bool = True,
 ) -> AreaModel:
     """Load a reproducible, compact traffic-light area from a SUMO network.
 
@@ -134,9 +135,11 @@ def discover_area(
     by_id = {item.tls_id: item for item in candidates}
     if requested_tls:
         missing = sorted(set(requested_tls) - set(by_id))
-        if missing:
+        if missing and strict_requested:
             raise ValueError(f"Unknown or unsupported traffic lights: {', '.join(missing)}")
-        selected = [by_id[tls_id] for tls_id in requested_tls]
+        selected = [by_id[tls_id] for tls_id in requested_tls if tls_id in by_id]
+        if not selected:
+            raise RuntimeError("No requested controllable traffic lights found")
     else:
         centre = (
             median(item.position[0] for item in candidates),

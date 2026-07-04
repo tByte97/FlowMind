@@ -1,6 +1,6 @@
 # Поточний статус FlowMind Rivne
 
-Актуально станом на 30 червня 2026 року.
+Актуально станом на 3 липня 2026 року.
 
 ## Загальний стан
 
@@ -250,6 +250,31 @@ python experiments/run_demo.py
 streamlit run dashboard/app.py
 ```
 
+Запустити графічний менеджер проєкту:
+
+```bash
+python project_manager.py
+```
+
+Перевірити середовище без відкриття GUI:
+
+```bash
+python project_manager.py --diagnose
+```
+
+## Нова OSM-карта
+
+У `simulation/new_area` додано сирий `map.osm` і згенеровану
+`osm.net.xml.gz`. Конвертація та короткий SUMO-прогін перевірені.
+
+Для повного підключення ще потрібно створити polygons, скопіювати або
+описати контрольовану зону, згенерувати focused-сценарій і вибрати нові
+валідні точки швидкої. Покрокова інструкція знаходиться у:
+
+```text
+simulation/new_area/README.md
+```
+
 ## Документація
 
 У репозиторії вже є:
@@ -259,12 +284,18 @@ streamlit run dashboard/app.py
 - `setup.md` — базова інформація про SUMO-сценарій;
 - `stack.md` — обраний технологічний стек;
 - `docs/WINDOWS_SETUP.md` — повне встановлення на Windows з нуля;
+- `docs/NEW_OSM_MAP_GUIDE.md` — створення нової карти з OpenStreetMap;
+- `simulation/new_area/README.md` — підключення поточного `map.osm`;
+- `tools/build_sumo_map.py` — автоматична збірка SUMO-карти з локального
+  `.osm`;
 - `docs/AI_AND_PRESENTATION_ROADMAP.md` — план підключення AI, зеленого
-  коридору та підготовки презентації.
+  коридору та підготовки презентації;
+- `docs/CURRENT_STATUS_AND_TEAM_TASKS.md` — актуальні задачі кожного
+  учасника.
 
 ## Перевірки
 
-Реалізовано 9 автоматичних тестів для:
+Реалізовано 22 автоматичних тести для:
 
 - Local Adaptive policy;
 - FlowMind policy;
@@ -273,12 +304,15 @@ streamlit run dashboard/app.py
 - правильного підрахунку lifecycle-метрик;
 - структури сфокусованого сценарію;
 - покриття і зв’язності шестисвітлофорної зони;
-- конфігурації, маршруту та запланованого додавання швидкої.
+- конфігурації, маршруту та запланованого додавання швидкої;
+- графічного менеджера проєкту;
+- генерації SUMO-конфігурації з опціональним GUI view;
+- автоматичного OSM → SUMO builder та його захисту від перезапису.
 
 Остання перевірка:
 
 ```text
-9 tests passed
+22 tests passed
 dashboard rendered without exceptions
 ```
 
@@ -300,10 +334,10 @@ priority-рішення.
 feature/pre-mvp
 ```
 
-Коміт pre-MVP:
+Останній коміт у робочій гілці:
 
 ```text
-1e0cbee Build focused FlowMind pre-MVP
+d147c10 new features
 ```
 
 Draft Pull Request:

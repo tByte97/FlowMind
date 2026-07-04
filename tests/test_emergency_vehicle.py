@@ -50,6 +50,7 @@ class FakeVehicle:
     def __init__(self) -> None:
         self.added: tuple[object, ...] | None = None
         self.kwargs: dict[str, object] = {}
+        self.calls: list[tuple[object, ...]] = []
 
     def getLoadedIDList(self) -> tuple[str, ...]:
         return ()
@@ -58,18 +59,63 @@ class FakeVehicle:
         self.added = args
         self.kwargs = kwargs
 
+    def __getattr__(self, name: str):
+        def record(*args: object, **kwargs: object) -> None:
+            self.calls.append((name, *args, kwargs))
+
+        return record
+
+
+class FakeLane:
+    def getIDList(self) -> tuple[str, ...]:
+        return ("start_0", "middle_0", "hospital_0")
+
+    def getEdgeID(self, lane_id: str) -> str:
+        return lane_id.removesuffix("_0")
+
+    def getShape(self, lane_id: str) -> tuple[tuple[float, float], ...]:
+        index = {"start_0": 0, "middle_0": 1, "hospital_0": 2}[lane_id]
+        return ((float(index), 0.0), (float(index + 1), 0.0))
+
+
+class FakePolygon:
+    def __init__(self) -> None:
+        self.added: list[tuple[object, ...]] = []
+
+    def getIDList(self) -> tuple[str, ...]:
+        return ()
+
+    def add(self, *args: object, **_kwargs: object) -> None:
+        self.added.append(args)
+
+
+class FakePoi(FakePolygon):
+    pass
+
 
 class FakeSimulation:
     def findRoute(self, *_args: object) -> FakeStage:
         return FakeStage()
 
 
+class FakeEdge:
+    def __init__(self, ids: tuple[str, ...] = ("start", "middle", "hospital")):
+        self.ids = ids
+
+    def getIDList(self) -> tuple[str, ...]:
+        return self.ids
+
+
 class FakeTraci:
     def __init__(self) -> None:
         self.vehicletype = FakeVehicleType()
+        self.edge = FakeEdge()
         self.route = FakeRoute()
         self.vehicle = FakeVehicle()
         self.simulation = FakeSimulation()
+        self.lane = FakeLane()
+        self.polygon = FakePolygon()
+        self.poi = FakePoi()
 
 
 class EmergencyVehicleTest(unittest.TestCase):
@@ -114,8 +160,39 @@ class EmergencyVehicleTest(unittest.TestCase):
             ("ambulance", "ambulance_route"),
         )
         self.assertEqual(traci.vehicle.kwargs["depart"], "180.0")
+        self.assertEqual(len(traci.polygon.added), 3)
+        self.assertEqual(len(traci.poi.added), 2)
         self.assertEqual(details.route_edge_count, 3)
+        self.assertEqual(details.route_edges, ("start", "middle", "hospital"))
         self.assertEqual(details.expected_travel_time, 180.0)
+        self.assertEqual(details.predicted_eta, 180.0)
+
+    def test_manager_preserves_preselected_route_metrics(self) -> None:
+        traci = FakeTraci()
+        details = EmergencyVehicleManager(traci, self._config()).install(
+            precalculated_edges=("start", "alt", "hospital"),
+            route_length=1_500.0,
+            expected_travel_time=120.0,
+            predicted_eta=150.0,
+        )
+
+        self.assertEqual(
+            traci.route.added,
+            ("ambulance_route", ("start", "alt", "hospital")),
+        )
+        self.assertEqual(details.route_length, 1_500.0)
+        self.assertEqual(details.expected_travel_time, 120.0)
+        self.assertEqual(details.predicted_eta, 150.0)
+
+    def test_manager_reports_edges_from_another_map(self) -> None:
+        traci = FakeTraci()
+        traci.edge = FakeEdge(("other_edge",))
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "absent from the current SUMO map.*start.*hospital",
+        ):
+            EmergencyVehicleManager(traci, self._config()).install()
 
 
 if __name__ == "__main__":

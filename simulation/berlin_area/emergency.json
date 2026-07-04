@@ -1,0 +1,21 @@
+{
+  "vehicle_id": "flowmind_ambulance",
+  "route_id": "flowmind_emergency_route",
+  "vehicle_type_id": "flowmind_emergency",
+  "base_vehicle_type_id": "zone_passenger",
+  "depart_time": 180.0,
+  "start": {
+    "name": "Berlin ambulance start",
+    "edge_id": "1344867380"
+  },
+  "destination": {
+    "name": "Berlin hospital / destination",
+    "edge_id": "48859719#1"
+  },
+  "color": [255, 35, 35, 255],
+  "max_speed": 25.0,
+  "speed_factor": 1.15,
+  "accel": 3.0,
+  "decel": 6.0,
+  "emergency_decel": 9.0
+}

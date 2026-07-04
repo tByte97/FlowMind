@@ -282,6 +282,14 @@ FlowMind бачить, що центр області заблокований, 
 
 [docs/NEW_OSM_MAP_GUIDE.md](docs/NEW_OSM_MAP_GUIDE.md)
 
+Підключення вже доданого `simulation/new_area/map.osm`:
+
+[simulation/new_area/README.md](simulation/new_area/README.md)
+
+Поточний статус і задачі учасників:
+
+[docs/CURRENT_STATUS_AND_TEAM_TASKS.md](docs/CURRENT_STATUS_AND_TEAM_TASKS.md)
+
 Актуальний стан реалізації:
 
 [docs/PROJECT_STATUS.md](docs/PROJECT_STATUS.md)
@@ -358,6 +366,12 @@ sumo-gui --version
 
 ```bash
 python tools/generate_focused_traffic.py
+```
+
+Автоматично створити нову SUMO-карту з локального `.osm`:
+
+```bash
+python tools/build_sumo_map.py map.osm --output-dir simulation/new_area
 ```
 
 Швидка перевірка на 180 секундах:

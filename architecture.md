@@ -58,6 +58,7 @@ EmergencyVehicleManager
 | `flowmind/emergency_vehicle.py` | Створює швидку, маршрут і планує її виїзд |
 | `dashboard/app.py` | Порівнює режими за збереженими результатами |
 | `tools/generate_focused_traffic.py` | Знаходить наскрізні маршрути, перевіряє зв’язність зони та генерує попит |
+| `tools/build_sumo_map.py` | Автоматично конвертує локальний OSM-файл у SUMO network, polygons, маршрути, config і manifest |
 
 ## Центральна зона
 

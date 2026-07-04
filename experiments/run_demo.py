@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import socket
 import subprocess
 import sys
 from pathlib import Path
@@ -14,7 +15,23 @@ from flowmind.emergency_vehicle import load_emergency_config
 from flowmind.experiment import run_experiment
 
 
-def launch_dashboard(results_dir: Path, port: int) -> subprocess.Popen[bytes]:
+def find_free_port(preferred: int, attempts: int = 50) -> int:
+    for port in range(preferred, preferred + attempts):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                probe.bind(("127.0.0.1", port))
+            except OSError:
+                continue
+            return port
+    raise RuntimeError(
+        f"Could not find a free dashboard port from {preferred} "
+        f"to {preferred + attempts - 1}"
+    )
+
+
+def launch_dashboard(results_dir: Path, port: int) -> tuple[subprocess.Popen[bytes], int]:
+    actual_port = find_free_port(port)
     environment = os.environ.copy()
     environment["FLOWMIND_RESULTS_DIR"] = str(results_dir.resolve())
     command = [
@@ -24,11 +41,11 @@ def launch_dashboard(results_dir: Path, port: int) -> subprocess.Popen[bytes]:
         "run",
         str(PROJECT_ROOT / "dashboard" / "app.py"),
         "--server.port",
-        str(port),
+        str(actual_port),
         "--server.headless",
         "false",
     ]
-    return subprocess.Popen(command, env=environment)
+    return subprocess.Popen(command, env=environment), actual_port
 
 
 def main() -> None:
@@ -88,10 +105,10 @@ def main() -> None:
     print(json.dumps(summary, ensure_ascii=False, indent=2))
 
     if not args.no_dashboard:
-        process = launch_dashboard(results_dir, args.dashboard_port)
+        process, port = launch_dashboard(results_dir, args.dashboard_port)
         print(
             f"Streamlit started with PID {process.pid}: "
-            f"http://localhost:{args.dashboard_port}"
+            f"http://localhost:{port}"
         )
 
 
