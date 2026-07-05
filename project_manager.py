@@ -147,10 +147,12 @@ def project_python(project_root: Path = PROJECT_ROOT) -> Path:
     candidates = (
         project_root / ".venv" / "Scripts" / "python.exe",
         project_root / ".venv" / "bin" / "python",
+        project_root / "venv" / "Scripts" / "python.exe",
+        project_root / "venv" / "bin" / "python",
     )
     for candidate in candidates:
         if candidate.is_file():
-            # Do not resolve this symlink: the .venv path is how Python detects
+            # Do not resolve this symlink: the venv path is how Python detects
             # and activates the virtual environment.
             return candidate.absolute()
     return Path(sys.executable).resolve()

@@ -5,9 +5,11 @@ import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from statistics import fmean
+from typing import Any
 
 from .area_model import AreaModel
 from .config import ControlConfig
+from .live_transport import LiveTelemetryPublisher
 
 
 @dataclass(frozen=True)
@@ -62,6 +64,8 @@ class MetricsCollector:
         self._peak_active_vehicles = 0
         self.samples: list[MetricSample] = []
         self.emergency_trace: list[EmergencyTraceSample] = []
+        self._last_live_status: dict[str, Any] | None = None
+        self._publisher: LiveTelemetryPublisher | None = None
 
     def collect(self, simulation_time: float) -> None:
         departed = self._traci.simulation.getDepartedIDList()
@@ -230,6 +234,35 @@ class MetricsCollector:
                 y=round(float(position[1]), 3),
             )
         )
+
+    def set_live_publisher(self, publisher: LiveTelemetryPublisher | None) -> None:
+        self._publisher = publisher
+
+    def write_live_status(
+        self,
+        results_dir: Path,
+        mode: str,
+        simulation_time: float,
+    ) -> Path:
+        results_dir.mkdir(parents=True, exist_ok=True)
+        summary = self.summary(mode, simulation_time)
+        latest_sample = asdict(self.samples[-1]) if self.samples else None
+        payload = {
+            "mode": mode,
+            "simulated_time": round(float(simulation_time), 3),
+            "summary": summary,
+            "latest_sample": latest_sample,
+            "emergency_trace": [
+                asdict(item) for item in self.emergency_trace[-20:]
+            ],
+        }
+        output_path = results_dir / "live_status.json"
+        with output_path.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+        self._last_live_status = payload
+        if self._publisher is not None:
+            self._publisher.publish(payload)
+        return output_path
 
     def write(self, results_dir: Path, summary: dict[str, object]) -> None:
         results_dir.mkdir(parents=True, exist_ok=True)

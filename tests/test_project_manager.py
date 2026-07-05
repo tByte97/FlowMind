@@ -29,6 +29,15 @@ class ProjectManagerTests(unittest.TestCase):
 
             self.assertEqual(project_manager.project_python(root), executable.absolute())
 
+    def test_project_python_prefers_repo_venv_folder(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            executable = root / "venv" / "Scripts" / "python.exe"
+            executable.parent.mkdir(parents=True)
+            executable.touch()
+
+            self.assertEqual(project_manager.project_python(root), executable.absolute())
+
     def test_project_python_falls_back_to_current_interpreter(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             self.assertEqual(

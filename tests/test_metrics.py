@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from flowmind.area_model import AreaModel
 from flowmind.config import ControlConfig
@@ -100,6 +103,27 @@ class MetricsCollectorTest(unittest.TestCase):
         self.assertEqual(collector.emergency_trace[0].edge_id, "middle")
         self.assertEqual(collector.emergency_trace[0].remaining_edges, 1)
         self.assertEqual(len(collector.samples), 1)
+
+    def test_live_status_snapshot_is_written(self) -> None:
+        traci = FakeTraci()
+        collector = MetricsCollector(
+            traci,
+            AreaModel(()),
+            ControlConfig(decision_interval=3),
+            priority_vehicle=None,
+        )
+
+        collector.collect(3.0)
+
+        with TemporaryDirectory() as temp_dir:
+            output_path = collector.write_live_status(Path(temp_dir), "flowmind", 3.0)
+            self.assertEqual(output_path, Path(temp_dir) / "live_status.json")
+            self.assertTrue(output_path.exists())
+            payload = json.loads(output_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["mode"], "flowmind")
+            self.assertEqual(payload["simulated_time"], 3.0)
+            self.assertEqual(payload["latest_sample"]["time"], 3.0)
+            self.assertEqual(payload["summary"]["throughput"], 0)
 
 
 if __name__ == "__main__":

@@ -6,12 +6,25 @@ from pathlib import Path
 import sumolib
 import traci
 
+
+def start_sumo(command: list[str]) -> None:
+    """Start SUMO with a bounded retry count to avoid hanging indefinitely."""
+    try:
+        traci.start(
+            command,
+            numRetries=1,
+            verbose=False,
+        )
+    except traci.TraCIException as error:
+        raise RuntimeError(f"SUMO failed to start: {error}") from error
+
 from .area_model import AreaModel, discover_area, load_zone_tls_ids
 from .config import RunConfig
 from .controller import AreaSignalController
 from .corridor_manager import CorridorManager
 from .emergency_router import EmergencyRouter
 from .emergency_vehicle import EmergencyVehicleManager
+from .live_transport import LiveTelemetryPublisher
 from .metrics import MetricsCollector
 from .ml_dataset import MLDatasetCollector, MLDatasetConfig
 
@@ -76,7 +89,7 @@ def run_experiment(config: RunConfig) -> dict[str, object]:
     connection = None
     try:
         configure_projection_data()
-        traci.start(_sumo_command(config))
+        start_sumo(_sumo_command(config))
         connection = traci.getConnection()
         emergency_details = None
         corridor_manager = None
@@ -140,9 +153,12 @@ def run_experiment(config: RunConfig) -> dict[str, object]:
         )
         if controller is not None and corridor_manager is not None:
             controller.set_corridor_manager(corridor_manager)
+        publisher = LiveTelemetryPublisher(host="127.0.0.1", port=8765)
+        publisher.start()
         metrics = MetricsCollector(
             connection, area, config.control, priority_vehicle
         )
+        metrics.set_live_publisher(publisher)
         if config.dataset_dir is not None:
             dataset_collector = MLDatasetCollector(
                 connection,
@@ -187,6 +203,7 @@ def run_experiment(config: RunConfig) -> dict[str, object]:
             if controller is not None:
                 controller.step(simulated_time)
             metrics.collect(simulated_time)
+            metrics.write_live_status(config.results_dir, config.mode, simulated_time)
             if dataset_collector is not None:
                 dataset_collector.collect(simulated_time)
 
@@ -223,6 +240,8 @@ def run_experiment(config: RunConfig) -> dict[str, object]:
     finally:
         if connection is not None:
             connection.close()
+        if "publisher" in locals():
+            publisher.stop()
 
 
 def _merge_tls_ids(

@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+import json
 import os
+import threading
+import time
 from pathlib import Path
 from typing import Iterable
 
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+
+from flowmind.live_transport import LiveTelemetryClient
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -72,20 +77,41 @@ def display_path(path: Path) -> str:
 
 
 def discover_result_sets(base_dir: Path) -> list[Path]:
-    candidates = []
-    if (base_dir / "summary.csv").exists():
-        candidates.append(base_dir)
+    candidates: list[Path] = []
+    seen: set[Path] = set()
+
+    def add_candidate(path: Path) -> None:
+        resolved = path.resolve()
+        if resolved in seen:
+            return
+        seen.add(resolved)
+        candidates.append(resolved)
+
+    if base_dir.exists() and (base_dir / "summary.csv").exists():
+        add_candidate(base_dir)
+
     if base_dir.exists():
-        candidates.extend(
-            path.parent
-            for path in sorted(base_dir.glob("**/summary.csv"))
-            if path.parent not in candidates
-        )
+        for path in sorted(base_dir.glob("**/summary.csv")):
+            add_candidate(path.parent)
+        for path in sorted(base_dir.glob("**/live_status.json")):
+            add_candidate(path.parent)
+
     return candidates
 
 
+@st.cache_data(show_spinner=False)
+def _cached_result_sets(base_dir: Path) -> list[Path]:
+    return discover_result_sets(base_dir)
+
+
 def load_summary(result_dir: Path) -> pd.DataFrame:
-    summary = pd.read_csv(result_dir / "summary.csv")
+    path = result_dir / "summary.csv"
+    if not path.exists():
+        return pd.DataFrame(columns=["mode"])
+    try:
+        summary = pd.read_csv(path)
+    except (OSError, ValueError, pd.errors.EmptyDataError):
+        return pd.DataFrame(columns=["mode"])
     summary["mode"] = summary["mode"].astype(str)
     summary["label"] = summary["mode"].map(MODE_LABELS).fillna(summary["mode"])
     summary["mode_order"] = summary["mode"].map(MODE_ORDER).fillna(99)
@@ -238,15 +264,55 @@ def load_all_emergency_runs(result_sets: Iterable[Path]) -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 
+def load_live_status(result_dir: Path) -> dict[str, object] | None:
+    path = result_dir / "live_status.json"
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+class LiveSocketClient:
+    def __init__(self, url: str) -> None:
+        self._client = LiveTelemetryClient(url)
+        self._messages: list[dict[str, object]] = []
+        self._lock = threading.Lock()
+
+    def start(self) -> None:
+        self._client.start()
+
+    def latest(self) -> dict[str, object] | None:
+        try:
+            payload = self._client.wait_for_update(timeout=0.0)
+        except TimeoutError:
+            return None
+        with self._lock:
+            self._messages.append(payload)
+        with self._lock:
+            if not self._messages:
+                return None
+            return self._messages.pop()
+
+    def stop(self) -> None:
+        self._client.stop()
+
+
 st.title("🚦 FlowMind Dashboard")
 st.caption(
     "Розширена статистика зонального керування світлофорами, "
     "порівняння режимів і контроль швидкої допомоги."
 )
 
-result_sets = discover_result_sets(RESULTS_DIR)
+try:
+    st.autorefresh(interval=2000, limit=None)
+except Exception:
+    pass
+
+result_sets = _cached_result_sets(RESULTS_DIR)
 if not result_sets and RESULTS_DIR != PROJECT_RESULTS_DIR:
-    result_sets = discover_result_sets(PROJECT_RESULTS_DIR)
+    result_sets = _cached_result_sets(PROJECT_RESULTS_DIR)
 
 if not result_sets:
     st.info(
@@ -274,8 +340,59 @@ with st.sidebar:
     st.caption(f"Папка: `{display_path(result_dir)}`")
 
 summary = load_summary(result_dir)
+live_status = load_live_status(result_dir)
 
-st.subheader("1. Стан симуляції")
+if "live_socket_client" not in st.session_state:
+    st.session_state.live_socket_client = LiveSocketClient(
+        os.environ.get("FLOWMIND_LIVE_WS", "ws://127.0.0.1:8765")
+    )
+    st.session_state.live_socket_client.start()
+
+socket_message = st.session_state.live_socket_client.latest()
+if isinstance(socket_message, dict) and socket_message:
+    live_status = socket_message
+
+if live_status is not None:
+    st.subheader("1. 📡 Live SUMO feed")
+    live_summary = dict(live_status.get("summary", {}))
+    live_cols = st.columns(5)
+    live_cols[0].metric(
+        "Час симуляції",
+        format_number(live_status.get("simulated_time"), " с", 0),
+    )
+    live_cols[1].metric(
+        "Активних авто",
+        format_number(live_summary.get("peak_active_vehicles"), "", 0),
+    )
+    live_cols[2].metric(
+        "Черга",
+        format_number(live_summary.get("average_queue_length"), "", 1),
+    )
+    live_cols[3].metric(
+        "Очікування",
+        format_number(live_summary.get("average_waiting_time"), " с", 1),
+    )
+    live_cols[4].metric(
+        "Throughput",
+        format_number(live_summary.get("throughput"), "", 0),
+    )
+    latest_sample = live_status.get("latest_sample")
+    if isinstance(latest_sample, dict) and latest_sample:
+        st.dataframe(pd.DataFrame([latest_sample]), width="stretch", hide_index=True)
+    emergency_trace = live_status.get("emergency_trace")
+    if isinstance(emergency_trace, list) and emergency_trace:
+        trace_frame = pd.DataFrame(emergency_trace)
+        if not trace_frame.empty:
+            st.caption("Останні точки треку швидкої")
+            st.dataframe(
+                trace_frame[["time", "edge_id", "speed", "remaining_edges"]],
+                width="stretch",
+                hide_index=True,
+            )
+else:
+    st.info("Поки що немає live-даних. Запустіть симуляцію SUMO, і dashboard автоматично підхопить live_status.json.")
+
+st.subheader("2. Стан симуляції")
 status_columns = st.columns(5)
 duration = summary["simulated_duration"].max() if "simulated_duration" in summary else None
 tls_count = summary["controlled_tls"].max() if "controlled_tls" in summary else None
