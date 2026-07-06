@@ -22,6 +22,7 @@ class Intersection:
     position: tuple[float, float]
     phases: tuple[str, ...]
     links: tuple[ControlledLink, ...]
+    phase_durations: tuple[float, ...] = ()
 
     @property
     def green_phase_indices(self) -> tuple[int, ...]:
@@ -30,6 +31,13 @@ class Intersection:
             for index, state in enumerate(self.phases)
             if "y" not in state.lower() and any(signal in "Gg" for signal in state)
         )
+
+    def default_phase_duration(self, phase_index: int) -> float | None:
+        if 0 <= phase_index < len(self.phase_durations):
+            duration = float(self.phase_durations[phase_index])
+            if duration > 0:
+                return duration
+        return None
 
 
 @dataclass(frozen=True)
@@ -82,6 +90,7 @@ def _intersection_from_tls(tls: object) -> Intersection | None:
 
     program = next(iter(programs.values()))
     phases = tuple(phase.state for phase in program.getPhases())
+    phase_durations = tuple(float(phase.duration) for phase in program.getPhases())
     links = tuple(
         ControlledLink(
             incoming_lane=connection[0].getID(),
@@ -104,7 +113,7 @@ def _intersection_from_tls(tls: object) -> Intersection | None:
         sum(point[0] for point in edge_centres) / len(edge_centres),
         sum(point[1] for point in edge_centres) / len(edge_centres),
     )
-    return Intersection(str(tls.getID()), position, phases, links)
+    return Intersection(str(tls.getID()), position, phases, links, phase_durations)
 
 
 def discover_area(

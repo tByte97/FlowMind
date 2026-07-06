@@ -11,6 +11,7 @@ from typing import Any
 from .area_model import AreaModel
 from .config import ControlConfig
 from .live_transport import LiveTelemetryPublisher
+from .traffic_state import TrafficStateReader
 
 
 @dataclass(frozen=True)
@@ -57,6 +58,11 @@ class MetricsCollector:
         self._area = area
         self._control = control
         self._priority_vehicle = priority_vehicle
+        self._reader = TrafficStateReader(
+            traci_connection,
+            area,
+            control.sensor_range_meters,
+        )
         self._previously_stopped: set[str] = set()
         self._departed_at: dict[str, float] = {}
         self._travel_times: list[float] = []
@@ -100,25 +106,16 @@ class MetricsCollector:
         if int(simulation_time) % self._control.decision_interval:
             return
 
+        traffic = self._reader.read()
         lane_ids = set(self._area.incoming_lanes) | set(self._area.outgoing_lanes)
-        queues = [
-            int(self._traci.lane.getLastStepHaltingNumber(lane_id))
-            for lane_id in lane_ids
-        ]
+        queues = [traffic.lane(lane_id).queue for lane_id in lane_ids]
         outgoing_occupancies = [
-            min(
-                max(
-                    float(self._traci.lane.getLastStepOccupancy(lane_id)) / 100.0,
-                    0.0,
-                ),
-                1.0,
-            )
-            for lane_id in self._area.outgoing_lanes
+            traffic.lane(lane_id).occupancy for lane_id in self._area.outgoing_lanes
         ]
         zone_vehicles = {
             vehicle_id
             for lane_id in lane_ids
-            for vehicle_id in self._traci.lane.getLastStepVehicleIDs(lane_id)
+            for vehicle_id in traffic.lane(lane_id).vehicle_ids
         }
         speeds = {
             vehicle_id: max(
@@ -215,6 +212,10 @@ class MetricsCollector:
             "emergency_arrival_time": self._priority_arrived,
             "emergency_eta": self._priority_eta,
             "emergency_trace_samples": len(self.emergency_trace),
+            "sensor_range_meters": self._control.sensor_range_meters,
+            "sensor_lanes": len(
+                set(self._area.incoming_lanes) | set(self._area.outgoing_lanes)
+            ),
         }
 
     def _collect_priority_trace(self, simulation_time: float) -> None:
@@ -305,6 +306,13 @@ class MetricsCollector:
                     else 0.0
                 ),
             },
+            "sensor_model": {
+                "type": "intersection_camera_detector",
+                "coverage": "controlled_intersections_only",
+                "range_meters": self._control.sensor_range_meters,
+                "incoming_lanes": len(self._area.incoming_lanes),
+                "outgoing_lanes": len(self._area.outgoing_lanes),
+            },
             "lanes": lane_status,
             "intersections": intersection_status,
             "vehicles": vehicles,
@@ -336,8 +344,10 @@ class MetricsCollector:
     def _lane_status(self) -> list[dict[str, Any]]:
         incoming = set(self._area.incoming_lanes)
         outgoing = set(self._area.outgoing_lanes)
+        traffic = self._reader.read()
         rows: list[dict[str, Any]] = []
         for lane_id in sorted(incoming | outgoing):
+            lane = traffic.lane(lane_id)
             rows.append(
                 {
                     "lane_id": lane_id,
@@ -348,58 +358,11 @@ class MetricsCollector:
                         if lane_id in incoming
                         else "outgoing"
                     ),
-                    "vehicle_count": int(
-                        self._safe_call(
-                            getattr(self._traci.lane, "getLastStepVehicleNumber", None),
-                            0,
-                            lane_id,
-                        )
-                    ),
-                    "queue": int(
-                        self._safe_call(
-                            getattr(self._traci.lane, "getLastStepHaltingNumber", None),
-                            0,
-                            lane_id,
-                        )
-                    ),
-                    "occupancy": round(
-                        min(
-                            max(
-                                float(
-                                    self._safe_call(
-                                        getattr(
-                                            self._traci.lane,
-                                            "getLastStepOccupancy",
-                                            None,
-                                        ),
-                                        0.0,
-                                        lane_id,
-                                    )
-                                )
-                                / 100.0,
-                                0.0,
-                            ),
-                            1.0,
-                        ),
-                        4,
-                    ),
-                    "mean_speed": round(
-                        max(
-                            float(
-                                self._safe_call(
-                                    getattr(
-                                        self._traci.lane,
-                                        "getLastStepMeanSpeed",
-                                        None,
-                                    ),
-                                    0.0,
-                                    lane_id,
-                                )
-                            ),
-                            0.0,
-                        ),
-                        3,
-                    ),
+                    "sensor_range_meters": self._control.sensor_range_meters,
+                    "vehicle_count": lane.vehicle_count,
+                    "queue": lane.queue,
+                    "occupancy": round(lane.occupancy, 4),
+                    "mean_speed": round(lane.mean_speed, 3),
                 }
             )
         return rows
@@ -470,17 +433,13 @@ class MetricsCollector:
         return rows
 
     def _vehicle_positions(self, limit: int = 250) -> list[dict[str, Any]]:
+        traffic = self._reader.read()
         lane_ids = sorted(
             set(self._area.incoming_lanes) | set(self._area.outgoing_lanes)
         )
         vehicle_ids: set[str] = set()
         for lane_id in lane_ids:
-            values = self._safe_call(
-                getattr(self._traci.lane, "getLastStepVehicleIDs", None),
-                (),
-                lane_id,
-            )
-            vehicle_ids.update(str(item) for item in values)
+            vehicle_ids.update(traffic.lane(lane_id).vehicle_ids)
 
         rows: list[dict[str, Any]] = []
         for vehicle_id in sorted(vehicle_ids)[:limit]:

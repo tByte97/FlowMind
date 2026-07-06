@@ -36,7 +36,11 @@ class MLDatasetCollector:
         self._area = area
         self._control = control
         self._config = config
-        self._reader = TrafficStateReader(traci_connection, area)
+        self._reader = TrafficStateReader(
+            traci_connection,
+            area,
+            control.sensor_range_meters,
+        )
         self._rows: list[dict[str, object]] = []
 
     @property
@@ -90,12 +94,37 @@ class MLDatasetCollector:
                         "duration": self._config.duration,
                         "sample_interval": self._config.sample_interval,
                         "decision_interval": self._control.decision_interval,
+                        "sensor_range_meters": self._control.sensor_range_meters,
                         "min_green": self._control.min_green,
                         "max_green": self._control.max_green,
+                        "use_default_phase_timing": int(
+                            self._control.use_default_phase_timing
+                        ),
+                        "default_green_extension": (
+                            self._control.default_green_extension
+                        ),
                         "blocked_occupancy": self._control.blocked_occupancy,
                         "downstream_weight": self._control.downstream_weight,
                         "area_pressure_weight": self._control.area_pressure_weight,
                         "queue_forecast_weight": self._control.queue_forecast_weight,
+                        "empty_approach_penalty": (
+                            self._control.empty_approach_penalty
+                        ),
+                        "empty_phase_penalty": self._control.empty_phase_penalty,
+                        "congested_queue_threshold": (
+                            self._control.congested_queue_threshold
+                        ),
+                        "congested_occupancy_threshold": (
+                            self._control.congested_occupancy_threshold
+                        ),
+                        "congested_approach_bonus": (
+                            self._control.congested_approach_bonus
+                        ),
+                        "demand_timer_seconds": self._control.demand_timer_seconds,
+                        "demand_wait_weight": self._control.demand_wait_weight,
+                        "max_demand_wait_bonus": (
+                            self._control.max_demand_wait_bonus
+                        ),
                         "hysteresis": self._control.hysteresis,
                         "priority_distance": self._control.priority_distance,
                         "max_priority_override": self._control.max_priority_override,

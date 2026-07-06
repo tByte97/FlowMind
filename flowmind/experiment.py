@@ -451,7 +451,14 @@ def write_live_run_status(
     system.setdefault("controller", {"status": "waiting"})
     system.setdefault("queue_forecast", {"status": "waiting"})
     system.setdefault("corridor", {"corridor_state": "waiting"})
-    system.setdefault("metrics", {"status": "waiting"})
+    system.setdefault(
+        "metrics",
+        {
+            "status": "waiting",
+            "sensor_model": "intersection_camera_detector",
+            "sensor_range_meters": config.control.sensor_range_meters,
+        },
+    )
     payload["system"] = system
 
     temporary_path = output_path.with_suffix(".json.tmp")
@@ -534,6 +541,9 @@ def build_live_system_status(
         "metrics": {
             "status": "collecting" if running else "finalized",
             "sample_interval": config.control.decision_interval,
+            "sensor_model": "intersection_camera_detector",
+            "sensor_range_meters": config.control.sensor_range_meters,
+            "coverage": "controlled_intersections_only",
         },
     }
 

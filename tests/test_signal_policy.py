@@ -7,6 +7,8 @@ from flowmind.config import ControlConfig
 from flowmind.signal_policy import (
     area_pressure_by_incoming_lane,
     choose_phase,
+    effective_max_green,
+    effective_min_green,
     score_phases,
 )
 from flowmind.traffic_state import LaneState, TrafficState
@@ -113,6 +115,69 @@ class SignalPolicyTest(unittest.TestCase):
 
         self.assertIsNotNone(best)
         self.assertEqual(best.phase_index, 2)
+
+    def test_flowmind_keeps_empty_approach_low_priority(self) -> None:
+        state = TrafficState(
+            {
+                "north": LaneState(0, 0, 0.0, 0.0, 15.0),
+                "south": LaneState(0, 0, 0.0, 10.0, 15.0),
+                "east": LaneState(9, 12, 0.72, 0.0, 2.0),
+                "west": LaneState(0, 0, 0.1, 10.0, 15.0),
+            }
+        )
+
+        best = choose_phase(
+            score_phases(self.intersection, state, "flowmind", self.config)
+        )
+
+        self.assertIsNotNone(best)
+        self.assertEqual(best.phase_index, 2)
+
+    def test_waiting_demand_timer_can_break_a_small_tie(self) -> None:
+        state = TrafficState(
+            {
+                "north": LaneState(2, 2, 0.15, 0.0, 10.0),
+                "south": LaneState(0, 0, 0.0, 10.0, 15.0),
+                "east": LaneState(2, 2, 0.15, 0.0, 10.0),
+                "west": LaneState(0, 0, 0.0, 10.0, 15.0),
+            }
+        )
+
+        fresh = choose_phase(
+            score_phases(
+                self.intersection,
+                state,
+                "flowmind",
+                self.config,
+                demand_wait_by_lane={"north": 12.0, "east": 1.0},
+            )
+        )
+        waited = choose_phase(
+            score_phases(
+                self.intersection,
+                state,
+                "flowmind",
+                self.config,
+                demand_wait_by_lane={"north": 1.0, "east": 12.0},
+            )
+        )
+
+        self.assertIsNotNone(fresh)
+        self.assertIsNotNone(waited)
+        self.assertEqual(fresh.phase_index, 0)
+        self.assertEqual(waited.phase_index, 2)
+
+    def test_default_phase_timing_caps_effective_green_window(self) -> None:
+        intersection = Intersection(
+            tls_id="timed",
+            position=(0.0, 0.0),
+            phases=("G", "y"),
+            links=(ControlledLink("north", "south", 0),),
+            phase_durations=(6.0, 3.0),
+        )
+
+        self.assertEqual(effective_min_green(self.config, intersection, 0), 6.0)
+        self.assertEqual(effective_max_green(self.config, intersection, 0), 14.0)
 
 
 if __name__ == "__main__":

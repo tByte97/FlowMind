@@ -7,7 +7,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from flowmind.config import DEFAULT_QUEUE_MODEL_PATHS, PROJECT_ROOT, RunConfig
+from flowmind.config import (
+    DEFAULT_QUEUE_MODEL_PATHS,
+    PROJECT_ROOT,
+    ControlConfig,
+    RunConfig,
+)
 from flowmind.experiment import run_experiment
 
 
@@ -16,6 +21,12 @@ def main() -> None:
     parser.add_argument("--duration", type=int, default=900)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--zone-size", type=int, default=6)
+    parser.add_argument(
+        "--sensor-range",
+        type=float,
+        default=ControlConfig().sensor_range_meters,
+        help="Intersection sensor/camera range in meters.",
+    )
     parser.add_argument("--priority-vehicle")
     parser.add_argument("--websocket-port", type=int, default=8765)
     parser.add_argument(
@@ -59,6 +70,7 @@ def main() -> None:
                 results_dir=args.results_dir,
                 priority_vehicle=args.priority_vehicle,
                 websocket_port=args.websocket_port,
+                control=ControlConfig(sensor_range_meters=args.sensor_range),
                 queue_model_paths=selected_queue_model_paths(args),
             )
         )

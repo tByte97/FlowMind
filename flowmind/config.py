@@ -17,12 +17,23 @@ DEFAULT_QUEUE_MODEL_PATHS = (
 @dataclass(frozen=True)
 class ControlConfig:
     decision_interval: int = 3
+    sensor_range_meters: float = 120.0
     min_green: int = 10
     max_green: int = 45
+    use_default_phase_timing: bool = True
+    default_green_extension: float = 8.0
     blocked_occupancy: float = 0.82
     downstream_weight: float = 10.0
     area_pressure_weight: float = 0.35
     queue_forecast_weight: float = 0.75
+    empty_approach_penalty: float = 8.0
+    empty_phase_penalty: float = 30.0
+    congested_queue_threshold: int = 8
+    congested_occupancy_threshold: float = 0.65
+    congested_approach_bonus: float = 12.0
+    demand_timer_seconds: int = 6
+    demand_wait_weight: float = 0.45
+    max_demand_wait_bonus: float = 18.0
     queue_forecast_horizon_weights: tuple[tuple[int, float], ...] = (
         (30, 0.50),
         (60, 0.35),
@@ -75,6 +86,8 @@ class RunConfig:
             raise ValueError("websocket_port must be between 1 and 65535")
         if self.dataset_sample_interval <= 0:
             raise ValueError("dataset_sample_interval must be positive")
+        if self.control.sensor_range_meters <= 0:
+            raise ValueError("sensor_range_meters must be positive")
         if any(value <= 0 for value in self.dataset_target_horizons):
             raise ValueError("dataset_target_horizons must be positive")
         if any(weight < 0 for _horizon, weight in self.control.queue_forecast_horizon_weights):

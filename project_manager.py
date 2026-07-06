@@ -314,6 +314,16 @@ def network_port(value: str, field: str) -> int:
     return port
 
 
+def positive_float(value: str, field: str, minimum: float = 0.1) -> float:
+    try:
+        result = float(value)
+    except ValueError as error:
+        raise ValueError(f'"{field}" має бути числом.') from error
+    if result < minimum:
+        raise ValueError(f'"{field}" має бути не менше {minimum:g}.')
+    return result
+
+
 def find_free_port(preferred: int, attempts: int = 50) -> int:
     for port in range(preferred, preferred + attempts):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
@@ -359,6 +369,7 @@ def run_gui() -> bool:
             self.duration = tk.StringVar(value="900")
             self.seed = tk.StringVar(value="42")
             self.zone_size = tk.StringVar(value="6")
+            self.sensor_range = tk.StringVar(value="120")
             self.gui_enabled = tk.BooleanVar(value=True)
             self.live_dashboard_enabled = tk.BooleanVar(value=True)
             self.emergency_enabled = tk.BooleanVar(value=False)
@@ -381,7 +392,7 @@ def run_gui() -> bool:
             self.results_path = tk.StringVar(value=str(self.current_scenario.results_path))
 
             self.traffic_duration = tk.StringVar(value="1800")
-            self.vehicles_per_hour = tk.StringVar(value="2400")
+            self.vehicles_per_hour = tk.StringVar(value="3600")
             self.route_count = tk.StringVar(value="8")
 
             self.status = tk.StringVar(value="Готово")
@@ -501,16 +512,17 @@ def run_gui() -> bool:
             self._entry(parent, "Розмір зони", self.zone_size, 2, 0)
             self._entry(parent, "GUI delay, мс", self.gui_delay, 2, 2)
             self._entry(parent, "Порт dashboard", self.dashboard_port, 2, 4)
+            self._entry(parent, "Дальність датчиків, м", self.sensor_range, 3, 0)
 
             ttk.Checkbutton(
                 parent, text="Відкрити SUMO GUI", variable=self.gui_enabled
-            ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(8, 0))
+            ).grid(row=3, column=2, columnspan=2, sticky="w", pady=(8, 0))
             ttk.Checkbutton(
                 parent,
                 text="Live dashboard",
                 variable=self.live_dashboard_enabled,
-            ).grid(row=3, column=2, columnspan=2, sticky="w", pady=(8, 0))
-            self._entry(parent, "WebSocket порт", self.websocket_port, 3, 4)
+            ).grid(row=3, column=4, columnspan=1, sticky="w", pady=(8, 0))
+            self._entry(parent, "WebSocket порт", self.websocket_port, 4, 4)
 
             ttk.Checkbutton(
                 parent,
@@ -576,8 +588,13 @@ def run_gui() -> bool:
             actions = ttk.Frame(parent)
             actions.grid(row=11, column=0, columnspan=6, sticky="ew", pady=(12, 0))
             ttk.Button(
-                actions, text="Запустити режим", command=self.run_experiment
+                actions,
+                text="Запустити повну систему",
+                command=self.run_full_system,
             ).pack(side="left", padx=(0, 7))
+            ttk.Button(
+                actions, text="Запустити режим", command=self.run_experiment
+            ).pack(side="left", padx=7)
             ttk.Button(
                 actions, text="Порівняти 3 режими", command=self.run_comparison
             ).pack(side="left", padx=7)
@@ -860,6 +877,12 @@ def run_gui() -> bool:
                 str(network_port(self.websocket_port.get(), "WebSocket порт")),
             ]
 
+        def _control_args(self) -> list[str]:
+            return [
+                "--sensor-range",
+                f"{positive_float(self.sensor_range.get(), 'Дальність датчиків'):.3f}",
+            ]
+
         def _queue_model_args(self) -> list[str]:
             if not self.queue_forecast_enabled.get():
                 return ["--no-queue-model"]
@@ -890,6 +913,7 @@ def run_gui() -> bool:
                     "--gui-delay",
                     str(gui_delay),
                     *self._experiment_paths(),
+                    *self._control_args(),
                     *self._queue_model_args(),
                 ]
                 if self.gui_enabled.get():
@@ -930,6 +954,7 @@ def run_gui() -> bool:
                     "--zone-size",
                     str(zone_size),
                     *self._experiment_paths(),
+                    *self._control_args(),
                     *self._queue_model_args(),
                 ]
                 self._ensure_live_dashboard(port)
@@ -963,6 +988,7 @@ def run_gui() -> bool:
                     "--emergency-config",
                     str(self._validate_emergency_config()),
                     *self._experiment_paths(),
+                    *self._control_args(),
                     *self._queue_model_args(),
                 ]
                 if not self.gui_enabled.get():
@@ -991,10 +1017,131 @@ def run_gui() -> bool:
                     "--zone-size",
                     str(zone_size),
                     *self._experiment_paths(),
+                    *self._control_args(),
                     *self._queue_model_args(),
                 ]
                 self._ensure_live_dashboard(port)
                 self.start_process(command, "Demo прогнозу")
+            except ValueError as error:
+                messagebox.showerror("Некоректні параметри", str(error))
+
+        def _traffic_command(
+            self,
+            duration: int,
+            vehicles_per_hour: int,
+            routes: int,
+        ) -> list[str]:
+            net_path, zone_path, output_dir = self._traffic_generation_paths()
+            return [
+                str(self.python),
+                "-u",
+                str(PROJECT_ROOT / "tools" / "generate_focused_traffic.py"),
+                "--net",
+                str(net_path),
+                "--zone",
+                str(zone_path),
+                "--output-dir",
+                str(output_dir),
+                "--duration",
+                str(duration),
+                "--vehicles-per-hour",
+                str(vehicles_per_hour),
+                "--routes",
+                str(routes),
+            ]
+
+        def _demo_command(
+            self,
+            duration: int,
+            seed: int,
+            depart: int,
+            gui_delay: int,
+            dashboard_port: int,
+            headless: bool,
+        ) -> list[str]:
+            command = [
+                str(self.python),
+                "-u",
+                str(PROJECT_ROOT / "experiments" / "run_demo.py"),
+                "--duration",
+                str(duration),
+                "--seed",
+                str(seed),
+                "--emergency-depart",
+                str(depart),
+                "--gui-delay",
+                str(gui_delay),
+                "--dashboard-port",
+                str(dashboard_port),
+                "--no-dashboard",
+                "--emergency-config",
+                str(self._validate_emergency_config()),
+                *self._experiment_paths(),
+                *self._control_args(),
+                *self._queue_model_args(),
+            ]
+            if headless:
+                command.append("--headless")
+            return command
+
+        def run_full_system(self) -> None:
+            try:
+                duration, seed, _, gui_delay, port = self._common_values()
+                duration = max(duration, 900)
+                traffic_duration = max(
+                    positive_int(
+                        self.traffic_duration.get(),
+                        "Тривалість трафіку",
+                    ),
+                    duration,
+                    1200,
+                )
+                vehicles = max(
+                    positive_int(self.vehicles_per_hour.get(), "Авто/год"),
+                    3600,
+                )
+                routes = max(
+                    positive_int(self.route_count.get(), "Кількість маршрутів", 2),
+                    8,
+                )
+                depart = positive_int(self.emergency_depart.get(), "Виїзд швидкої", 0)
+                depart = min(max(depart, 120), max(duration - 90, 1))
+                self.duration.set(str(duration))
+                self.traffic_duration.set(str(traffic_duration))
+                self.vehicles_per_hour.set(str(vehicles))
+                self.route_count.set(str(routes))
+                self.emergency_depart.set(str(depart))
+                self.gui_enabled.set(True)
+                self.live_dashboard_enabled.set(True)
+                self.emergency_enabled.set(True)
+                self.queue_forecast_enabled.set(True)
+                self.queue_model_preset.set(FORECAST_PRESET_ENSEMBLE)
+                self.apply_queue_model_preset()
+                self._queue_model_args()
+                self._ensure_live_dashboard(port)
+                generate_command = self._traffic_command(
+                    traffic_duration,
+                    vehicles,
+                    routes,
+                )
+                demo_command = self._demo_command(
+                    duration,
+                    seed,
+                    depart,
+                    gui_delay,
+                    port,
+                    headless=False,
+                )
+                self._append_log(
+                    "\n[manager] Повна система: високий потік, швидка, "
+                    "ML ensemble, live dashboard, SUMO GUI, локальні "
+                    f"датчики {self.sensor_range.get()} м біля перехресть.\n"
+                )
+                self.start_process(
+                    generate_command,
+                    "Підготовка високого потоку",
+                    after_success=(demo_command, "Повна система FlowMind", {}),
+                )
             except ValueError as error:
                 messagebox.showerror("Некоректні параметри", str(error))
 
@@ -1104,24 +1251,7 @@ def run_gui() -> bool:
                 )
                 vehicles = positive_int(self.vehicles_per_hour.get(), "Авто/год")
                 routes = positive_int(self.route_count.get(), "Кількість маршрутів", 2)
-                net_path, zone_path, output_dir = self._traffic_generation_paths()
-                command = [
-                    str(self.python),
-                    "-u",
-                    str(PROJECT_ROOT / "tools" / "generate_focused_traffic.py"),
-                    "--net",
-                    str(net_path),
-                    "--zone",
-                    str(zone_path),
-                    "--output-dir",
-                    str(output_dir),
-                    "--duration",
-                    str(duration),
-                    "--vehicles-per-hour",
-                    str(vehicles),
-                    "--routes",
-                    str(routes),
-                ]
+                command = self._traffic_command(duration, vehicles, routes)
                 self.start_process(command, "Генерація сфокусованого трафіку")
             except ValueError as error:
                 messagebox.showerror("Некоректні параметри", str(error))

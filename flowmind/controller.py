@@ -11,6 +11,9 @@ from .safety_validator import SafetyValidator
 from .signal_policy import (
     area_pressure_by_incoming_lane,
     choose_phase,
+    effective_max_green,
+    effective_min_green,
+    lane_has_demand,
     score_phases,
 )
 from .traffic_state import TrafficStateReader
@@ -69,8 +72,13 @@ class AreaSignalController:
         self._queue_forecast = queue_forecast if mode == "flowmind" else None
         self._queue_forecast_sample_interval = queue_forecast_sample_interval
         self._corridor_manager = None
-        self._reader = TrafficStateReader(traci_connection, area)
+        self._reader = TrafficStateReader(
+            traci_connection,
+            area,
+            config.sensor_range_meters,
+        )
         self._safety = SafetyValidator(traci_connection, area, config)
+        self._lane_demand_started_at: dict[str, float] = {}
         self.stats = ControllerStats()
 
     def set_corridor_manager(self, manager: object) -> None:
@@ -81,6 +89,10 @@ class AreaSignalController:
             return
 
         traffic = self._reader.read()
+        demand_wait_by_lane = self._update_demand_timers(
+            traffic,
+            simulation_time,
+        )
         area_pressure = (
             area_pressure_by_incoming_lane(self._area, traffic, self._config)
             if self._mode == "flowmind"
@@ -106,7 +118,9 @@ class AreaSignalController:
                 continue
 
             spent = float(self._traci.trafficlight.getSpentDuration(tls_id))
-            if spent < self._config.min_green:
+            min_green = effective_min_green(self._config, intersection, current_phase)
+            max_green = effective_max_green(self._config, intersection, current_phase)
+            if spent < min_green:
                 self.stats.min_green_skips += 1
                 continue
 
@@ -148,6 +162,7 @@ class AreaSignalController:
                 priority_link,
                 area_pressure,
                 queue_forecast,
+                demand_wait_by_lane,
             )
             best = choose_phase(scores)
             if best is None:
@@ -165,7 +180,7 @@ class AreaSignalController:
             should_extend = (
                 best.phase_index == current_phase
                 or current_score >= best.score - self._config.hysteresis
-            ) and spent < self._config.max_green
+            ) and spent < max_green
             if should_extend:
                 safety = self._safety.validate_extension(
                     tls_id,
@@ -178,7 +193,7 @@ class AreaSignalController:
                     continue
                 remaining = min(
                     float(self._config.decision_interval),
-                    float(self._config.max_green) - spent,
+                    max_green - spent,
                 )
                 self._traci.trafficlight.setPhaseDuration(
                     tls_id,
@@ -228,6 +243,23 @@ class AreaSignalController:
                     ),
                     "warning" if priority_link is not None else "info",
                 )
+
+    def _update_demand_timers(
+        self,
+        traffic: object,
+        simulation_time: float,
+    ) -> dict[str, float]:
+        active: dict[str, float] = {}
+        for lane_id in self._area.incoming_lanes:
+            if lane_has_demand(traffic.lane(lane_id), self._config):
+                started_at = self._lane_demand_started_at.setdefault(
+                    lane_id,
+                    simulation_time,
+                )
+                active[lane_id] = max(simulation_time - started_at, 0.0)
+            else:
+                self._lane_demand_started_at.pop(lane_id, None)
+        return active
 
     def _record_decision(
         self,

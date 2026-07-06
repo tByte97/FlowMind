@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 from .area_model import AreaModel, Intersection
 from .config import ControlConfig
-from .traffic_state import TrafficState
+from .traffic_state import LaneState, TrafficState
 
 
 @dataclass(frozen=True)
@@ -24,6 +24,18 @@ def movement_pressure(
 ) -> float:
     """Pressure score for one controlled movement."""
 
+    if not lane_has_demand(
+        LaneState(
+            incoming_queue,
+            incoming_vehicle_count,
+            incoming_occupancy,
+            0.0,
+            0.0,
+        ),
+        config,
+    ):
+        return -float(config.empty_approach_penalty)
+
     pressure = (
         float(incoming_queue)
         + float(incoming_vehicle_count) * 0.25
@@ -34,7 +46,63 @@ def movement_pressure(
     )
     if outgoing_occupancy >= config.blocked_occupancy:
         pressure -= 30.0
+    if (
+        incoming_queue >= config.congested_queue_threshold
+        or incoming_occupancy >= config.congested_occupancy_threshold
+    ):
+        pressure += float(config.congested_approach_bonus)
+        pressure += max(
+            float(incoming_queue - config.congested_queue_threshold),
+            0.0,
+        ) * 0.5
     return pressure
+
+
+def lane_has_demand(lane: LaneState, config: ControlConfig) -> bool:
+    return (
+        lane.queue > 0
+        or lane.vehicle_count > 0
+        or lane.occupancy >= max(config.congested_occupancy_threshold * 0.25, 0.05)
+    )
+
+
+def demand_wait_bonus(wait_seconds: float, config: ControlConfig) -> float:
+    if wait_seconds < float(config.demand_timer_seconds):
+        return 0.0
+    active_wait = wait_seconds - float(config.demand_timer_seconds)
+    return min(
+        active_wait * float(config.demand_wait_weight),
+        float(config.max_demand_wait_bonus),
+    )
+
+
+def effective_min_green(
+    config: ControlConfig,
+    intersection: Intersection,
+    phase_index: int,
+) -> float:
+    if not config.use_default_phase_timing:
+        return float(config.min_green)
+    default_duration = intersection.default_phase_duration(phase_index)
+    if default_duration is None:
+        return float(config.min_green)
+    return max(1.0, min(float(config.min_green), default_duration))
+
+
+def effective_max_green(
+    config: ControlConfig,
+    intersection: Intersection,
+    phase_index: int,
+) -> float:
+    if not config.use_default_phase_timing:
+        return float(config.max_green)
+    default_duration = intersection.default_phase_duration(phase_index)
+    if default_duration is None:
+        return float(config.max_green)
+    return max(
+        effective_min_green(config, intersection, phase_index),
+        min(float(config.max_green), default_duration + config.default_green_extension),
+    )
 
 
 def area_pressure_by_incoming_lane(
@@ -84,14 +152,17 @@ def score_phases(
     priority_link: int | None = None,
     area_pressure: dict[str, float] | None = None,
     queue_forecast: dict[tuple[int, int], float] | None = None,
+    demand_wait_by_lane: dict[str, float] | None = None,
 ) -> tuple[PhaseScore, ...]:
     area_pressure = area_pressure or {}
     queue_forecast = queue_forecast or {}
+    demand_wait_by_lane = demand_wait_by_lane or {}
     scores: list[PhaseScore] = []
     for phase_index in intersection.green_phase_indices:
         phase_state = intersection.phases[phase_index]
         score = 0.0
         movements = 0
+        demand_movements = 0
         for link_index, link in enumerate(intersection.links):
             if link.signal_index >= len(phase_state):
                 continue
@@ -99,8 +170,15 @@ def score_phases(
                 continue
             incoming = state.lane(link.incoming_lane)
             outgoing = state.lane(link.outgoing_lane)
+            has_demand = lane_has_demand(incoming, config)
+            if has_demand:
+                demand_movements += 1
             if mode == "local":
-                movement_score = float(incoming.queue)
+                movement_score = (
+                    float(incoming.queue)
+                    if has_demand
+                    else -float(config.empty_approach_penalty)
+                )
             else:
                 movement_score = movement_pressure(
                     incoming.queue,
@@ -119,10 +197,17 @@ def score_phases(
                     queue_forecast.get((phase_index, link_index), 0.0)
                     * config.queue_forecast_weight
                 )
+            if has_demand:
+                movement_score += demand_wait_bonus(
+                    demand_wait_by_lane.get(link.incoming_lane, 0.0),
+                    config,
+                )
             score += movement_score
             movements += 1
         if movements:
             score /= movements
+        if movements and not demand_movements:
+            score -= float(config.empty_phase_penalty)
         if priority_link is not None and priority_link < len(phase_state):
             if phase_state[priority_link] in "Gg":
                 score += 1_000.0

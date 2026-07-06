@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 from .area_model import AreaModel
 from .config import ControlConfig
+from .signal_policy import effective_max_green, effective_min_green
 
 
 @dataclass(frozen=True)
@@ -57,6 +58,8 @@ class SafetyValidator:
 
         current_state = intersection.phases[current_phase]
         target_state = intersection.phases[target_phase]
+        min_green = effective_min_green(self._config, intersection, current_phase)
+        max_green = effective_max_green(self._config, intersection, current_phase)
         if self._is_malformed_state(current_state, intersection):
             return SafetyDecision(False, "current phase signal state is malformed")
         if self._is_malformed_state(target_state, intersection):
@@ -75,7 +78,7 @@ class SafetyValidator:
             self._priority_started_at.pop(tls_id, None)
 
         if target_phase == current_phase:
-            if spent >= self._config.max_green and any(
+            if spent >= max_green and any(
                 signal in "Gg" for signal in current_state
             ):
                 return SafetyDecision(False, "max green reached")
@@ -86,7 +89,7 @@ class SafetyValidator:
             return SafetyDecision(False, "phase skip is not allowed")
 
         if any(signal in "Gg" for signal in current_state):
-            if spent < self._config.min_green:
+            if spent < min_green:
                 return SafetyDecision(False, "min green not satisfied")
         elif (
             "y" in current_state.lower()

@@ -10,7 +10,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from flowmind.config import DEFAULT_QUEUE_MODEL_PATHS, PROJECT_ROOT, RunConfig
+from flowmind.config import (
+    DEFAULT_QUEUE_MODEL_PATHS,
+    PROJECT_ROOT,
+    ControlConfig,
+    RunConfig,
+)
 from flowmind.emergency_vehicle import load_emergency_config
 from flowmind.experiment import run_experiment
 
@@ -72,6 +77,12 @@ def main() -> None:
     parser.add_argument("--emergency-to-edge")
     parser.add_argument("--dashboard-port", type=int, default=8501)
     parser.add_argument("--websocket-port", type=int, default=8765)
+    parser.add_argument(
+        "--sensor-range",
+        type=float,
+        default=ControlConfig().sensor_range_meters,
+        help="Intersection sensor/camera range in meters.",
+    )
     parser.add_argument("--gui-delay", type=int, default=75)
     parser.add_argument(
         "--config",
@@ -124,6 +135,7 @@ def main() -> None:
         destination_edge=args.emergency_to_edge,
     )
     results_dir = args.results_dir
+    control = ControlConfig(sensor_range_meters=args.sensor_range)
     dashboard_process = None
     if not args.no_dashboard:
         results_dir.mkdir(parents=True, exist_ok=True)
@@ -153,6 +165,7 @@ def main() -> None:
                     config_path=args.config,
                     zone_path=args.zone,
                     emergency=emergency,
+                    control=control,
                     queue_model_paths=(),
                 )
             )
@@ -169,6 +182,7 @@ def main() -> None:
                 config_path=args.config,
                 zone_path=args.zone,
                 emergency=emergency,
+                control=control,
                 queue_model_paths=selected_queue_model_paths(args),
             )
         )

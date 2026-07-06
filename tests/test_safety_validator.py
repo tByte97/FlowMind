@@ -88,6 +88,39 @@ class SafetyValidatorTest(unittest.TestCase):
         self.assertFalse(expired.allowed)
         self.assertEqual(expired.reason, "priority override timeout")
 
+    def test_uses_default_phase_duration_for_short_programs(self) -> None:
+        area = AreaModel(
+            (
+                Intersection(
+                    tls_id="tls_0",
+                    position=(0.0, 0.0),
+                    phases=("G", "y"),
+                    links=(ControlledLink("north_0", "south_0", 0),),
+                    phase_durations=(6.0, 3.0),
+                ),
+            )
+        )
+        validator = SafetyValidator(FakeTraci(spent=7.0), area, self.config)
+
+        early = validator.validate_transition(
+            "tls_0",
+            0,
+            1,
+            5.0,
+            spent_duration=5.0,
+        )
+        expired = validator.validate_extension(
+            "tls_0",
+            0,
+            15.0,
+            spent_duration=15.0,
+        )
+
+        self.assertFalse(early.allowed)
+        self.assertEqual(early.reason, "min green not satisfied")
+        self.assertFalse(expired.allowed)
+        self.assertEqual(expired.reason, "max green reached")
+
 
 if __name__ == "__main__":
     unittest.main()
