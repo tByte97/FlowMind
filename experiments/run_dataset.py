@@ -315,12 +315,19 @@ def main() -> None:
         return
 
     reset_index(index_path, append=args.resume)
+    completed_run_ids = (
+        successful_run_ids(index_path) if args.resume else set()
+    )
     total = len(runs)
     for number, run in enumerate(runs, start=1):
         current_run_id = run_id(args.scenario_name, run)
         sample_path = samples_dir / f"{current_run_id}.csv"
         summary_dir = summaries_dir / current_run_id
-        if args.resume and sample_path.exists():
+        if (
+            args.resume
+            and current_run_id in completed_run_ids
+            and sample_path.exists()
+        ):
             print(f"[{number}/{total}] skip existing {current_run_id}")
             continue
 
@@ -629,6 +636,17 @@ def reset_index(index_path: Path, append: bool) -> None:
     with index_path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=INDEX_COLUMNS)
         writer.writeheader()
+
+
+def successful_run_ids(index_path: Path) -> set[str]:
+    if not index_path.exists():
+        return set()
+    with index_path.open(newline="", encoding="utf-8") as handle:
+        return {
+            str(row.get("run_id"))
+            for row in csv.DictReader(handle)
+            if row.get("run_id") and row.get("status") == "ok"
+        }
 
 
 def append_index_row(index_path: Path, row: dict[str, Any]) -> None:

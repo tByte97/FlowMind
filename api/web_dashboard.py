@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import os
 import signal
@@ -32,6 +33,23 @@ WEB_RESULTS_DIR = Path(
 MAX_HISTORY_POINTS = 180
 MAX_DECISION_ROWS = 80
 MAX_TABLE_ROWS = 120
+MODE_ORDER = {"fixed": 0, "local": 1, "flowmind": 2}
+AVERAGE_METRICS = {
+    "average_travel_time": "Сер. час поїздки, с",
+    "average_waiting_time": "Сер. очікування, с",
+    "average_queue_length": "Сер. черга, авто",
+    "max_queue_length": "Макс. черга, авто",
+    "throughput": "Пропуск, авто",
+    "stops_count": "Зупинки",
+    "gridlock_risk": "Gridlock risk",
+    "controller_decisions": "Рішення контролера",
+    "phase_extensions": "Продовження зеленого",
+    "phase_advances": "Перемикання фаз",
+    "priority_decisions": "Пріоритети швидкої",
+    "queue_forecast_predictions": "ML-прогнози",
+    "sensor_range_meters": "Радіус датчиків, м",
+    "simulated_duration": "Тривалість, с",
+}
 
 
 def _python_executable() -> Path:
@@ -59,6 +77,61 @@ def _display_path(path: Path) -> str:
         return str(path.resolve().relative_to(PROJECT_ROOT.resolve()))
     except ValueError:
         return str(path.resolve())
+
+
+def _result_id(path: Path) -> str:
+    return hashlib.sha1(str(path.resolve()).encode("utf-8")).hexdigest()[:16]
+
+
+def _as_float(value: Any) -> float | None:
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _coerce_summary_value(value: str) -> Any:
+    number = _as_float(value)
+    if number is None:
+        return value
+    if number.is_integer():
+        return int(number)
+    return number
+
+
+def _read_summary_rows(path: Path) -> list[dict[str, Any]]:
+    try:
+        with path.open("r", encoding="utf-8", newline="") as handle:
+            rows = [
+                {key: _coerce_summary_value(value) for key, value in row.items()}
+                for row in csv.DictReader(handle)
+            ]
+    except OSError:
+        return []
+    return rows
+
+
+def summary_rows_for_result(result_dir: Path) -> list[dict[str, Any]]:
+    summary_path = result_dir / "summary.csv"
+    if summary_path.exists():
+        return _read_summary_rows(summary_path)
+    live_path = result_dir / "live_status.json"
+    if not live_path.exists():
+        return []
+    payload = _read_json(live_path)
+    summary = payload.get("summary")
+    if isinstance(summary, dict) and summary:
+        return [dict(summary)]
+    return []
+
+
+def primary_summary_for_result(result_dir: Path) -> dict[str, Any]:
+    rows = summary_rows_for_result(result_dir)
+    if rows:
+        return rows[-1]
+    return {}
 
 
 def find_latest_live_status(
@@ -98,11 +171,14 @@ def discover_result_sets(base_dir: Path = RESULTS_DIR) -> list[dict[str, Any]]:
         entry = result_dirs.setdefault(
             result_dir,
             {
+                "id": _result_id(result_dir),
                 "path": _display_path(result_dir),
                 "updated_at": 0.0,
                 "has_live_status": False,
                 "has_summary": False,
                 "mode": None,
+                "summary": {},
+                "summary_rows": [],
             },
         )
         entry["updated_at"] = max(entry["updated_at"], _safe_stat_mtime(marker))
@@ -110,9 +186,22 @@ def discover_result_sets(base_dir: Path = RESULTS_DIR) -> list[dict[str, Any]]:
             entry["has_live_status"] = True
             payload = _read_json(marker)
             entry["mode"] = payload.get("mode") or entry["mode"]
+            summary = payload.get("summary")
+            if isinstance(summary, dict) and summary and not entry["summary"]:
+                entry["summary"] = dict(summary)
+                entry["summary_rows"] = [dict(summary)]
+                if summary.get("mode"):
+                    entry["modes"] = [str(summary["mode"])]
         if marker.name == "summary.csv":
             entry["has_summary"] = True
-            entry["modes"] = _summary_modes(marker)
+            rows = _read_summary_rows(marker)
+            entry["summary_rows"] = rows
+            entry["summary"] = rows[-1] if rows else {}
+            entry["modes"] = sorted(
+                {str(row.get("mode")) for row in rows if row.get("mode")}
+            )
+            if entry["mode"] is None and rows:
+                entry["mode"] = rows[-1].get("mode")
 
     return sorted(
         result_dirs.values(),
@@ -129,6 +218,107 @@ def _summary_modes(path: Path) -> list[str]:
     except OSError:
         return []
     return sorted(set(modes))
+
+
+def find_result_dir_by_id(
+    result_id: str,
+    base_dir: Path | None = None,
+) -> Path | None:
+    search_dir = base_dir or RESULTS_DIR
+    for entry in discover_result_sets(search_dir):
+        if entry.get("id") == result_id:
+            path = entry.get("path")
+            if not isinstance(path, str):
+                continue
+            result_dir = PROJECT_ROOT / path
+            if result_dir.exists():
+                return result_dir.resolve()
+    return None
+
+
+def build_archive_payload(base_dir: Path = RESULTS_DIR) -> dict[str, Any]:
+    results = discover_result_sets(base_dir)
+    mode_counts: dict[str, int] = {}
+    for result in results:
+        mode = str(result.get("mode") or "unknown")
+        mode_counts[mode] = mode_counts.get(mode, 0) + 1
+    return {
+        "results": results,
+        "total": len(results),
+        "mode_counts": mode_counts,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def build_result_detail_payload(result_id: str) -> dict[str, Any]:
+    result_dir = find_result_dir_by_id(result_id)
+    if result_dir is None:
+        return {"available": False, "id": result_id}
+    live_path = result_dir / "live_status.json"
+    payload = _trim_live_payload(_read_json(live_path)) if live_path.exists() else {}
+    payload["available"] = bool(payload)
+    payload["id"] = result_id
+    payload["path"] = _display_path(result_dir)
+    payload["summary_rows"] = summary_rows_for_result(result_dir)
+    payload["summary"] = payload.get("summary") or primary_summary_for_result(result_dir)
+    payload["_meta"] = {
+        "source": _display_path(live_path if live_path.exists() else result_dir),
+        "updated_at": datetime.fromtimestamp(
+            _safe_stat_mtime(live_path if live_path.exists() else result_dir),
+            tz=timezone.utc,
+        ).isoformat(),
+    }
+    return payload
+
+
+def build_averages_payload(base_dir: Path = RESULTS_DIR) -> dict[str, Any]:
+    grouped: dict[str, dict[str, list[float]]] = {}
+    result_count_by_mode: dict[str, int] = {}
+    total_rows = 0
+    for result in discover_result_sets(base_dir):
+        path = result.get("path")
+        if not isinstance(path, str):
+            continue
+        result_dir = PROJECT_ROOT / path
+        for row in summary_rows_for_result(result_dir):
+            mode = str(row.get("mode") or result.get("mode") or "unknown")
+            total_rows += 1
+            result_count_by_mode[mode] = result_count_by_mode.get(mode, 0) + 1
+            metrics = grouped.setdefault(mode, {})
+            for key in AVERAGE_METRICS:
+                value = _as_float(row.get(key))
+                if value is not None:
+                    metrics.setdefault(key, []).append(value)
+
+    modes: list[dict[str, Any]] = []
+    for mode, metric_values in grouped.items():
+        metrics = {
+            key: {
+                "label": AVERAGE_METRICS[key],
+                "average": sum(values) / len(values),
+                "min": min(values),
+                "max": max(values),
+                "count": len(values),
+            }
+            for key, values in metric_values.items()
+            if values
+        }
+        modes.append(
+            {
+                "mode": mode,
+                "count": result_count_by_mode.get(mode, 0),
+                "metrics": metrics,
+            }
+        )
+
+    modes.sort(key=lambda item: (MODE_ORDER.get(str(item["mode"]), 99), str(item["mode"])))
+    return {
+        "modes": modes,
+        "metrics": AVERAGE_METRICS,
+        "total_rows": total_rows,
+        "total_results": len(discover_result_sets(base_dir)),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 def _trim_live_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -483,6 +673,23 @@ HTML_PAGE = r"""<!doctype html>
       justify-content: flex-end;
     }
 
+    .nav {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 10px;
+    }
+
+    .nav a {
+      color: var(--ink);
+      text-decoration: none;
+      border: 1px solid var(--line);
+      background: #fffdf9;
+      padding: 7px 10px;
+      border-radius: 6px;
+      font-weight: 750;
+    }
+
     .tag {
       border: 1px solid var(--line);
       background: #fffaf2;
@@ -764,6 +971,11 @@ HTML_PAGE = r"""<!doctype html>
       <div>
         <h1>FlowMind Dashboard</h1>
         <p class="subtitle">Live-панель симуляції з камерною моделлю датчиків біля контрольованих перехресть.</p>
+        <nav class="nav" aria-label="Dashboard navigation">
+          <a href="/">Live</a>
+          <a href="/archive">Архів</a>
+          <a href="/averages">Середні</a>
+        </nav>
       </div>
       <div class="status-line">
         <span class="tag" id="sourceTag">джерело: <strong>немає</strong></span>
@@ -1210,6 +1422,600 @@ HTML_PAGE = r"""<!doctype html>
 """
 
 
+ARCHIVE_PAGE = r"""<!doctype html>
+<html lang="uk">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>FlowMind Archive</title>
+  <style>
+    :root {
+      --bg: #f7f4ef;
+      --panel: #ffffff;
+      --ink: #1c1f23;
+      --muted: #626b76;
+      --line: #d9d3c8;
+      --green: #14866d;
+      --amber: #d8901f;
+      --red: #c94b4b;
+      --blue: #2f6f9f;
+      --shadow: 0 8px 28px rgba(28, 31, 35, 0.08);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font: 14px/1.45 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    .page { width: min(1440px, 100%); margin: 0 auto; padding: 20px; }
+    .topbar {
+      display: grid;
+      grid-template-columns: minmax(260px, 1fr) auto;
+      gap: 16px;
+      align-items: start;
+      margin-bottom: 16px;
+    }
+    h1 { margin: 0 0 4px; font-size: 28px; letter-spacing: 0; }
+    h2 { margin: 0; font-size: 15px; letter-spacing: 0; }
+    .subtitle { color: var(--muted); margin: 0; max-width: 760px; }
+    .nav { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+    .nav a, button {
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 8px 11px;
+      min-height: 38px;
+      font: inherit;
+      font-weight: 750;
+      text-decoration: none;
+      cursor: pointer;
+    }
+    .nav a { color: var(--ink); background: #fffdf9; }
+    button { color: #fff; background: var(--green); border-color: transparent; }
+    input, select {
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 9px 10px;
+      min-height: 38px;
+      background: #fffdf9;
+      color: var(--ink);
+      font: inherit;
+      width: 100%;
+    }
+    .filters {
+      display: grid;
+      grid-template-columns: minmax(220px, 1fr) 160px auto;
+      gap: 10px;
+      align-items: end;
+      padding: 14px;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: var(--shadow);
+      margin-bottom: 16px;
+    }
+    label { display: grid; gap: 5px; color: var(--muted); font-size: 12px; font-weight: 700; }
+    .grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(360px, .55fr); gap: 16px; align-items: start; }
+    .section {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: var(--shadow);
+      overflow: hidden;
+      margin-bottom: 16px;
+    }
+    .section-header {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: center;
+      padding: 12px 14px;
+      border-bottom: 1px solid var(--line);
+      background: #fffaf2;
+    }
+    .section-body { padding: 14px; }
+    .tag {
+      border: 1px solid var(--line);
+      background: #fffaf2;
+      padding: 6px 9px;
+      border-radius: 6px;
+      color: var(--muted);
+      white-space: nowrap;
+    }
+    .cards { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+    .metric {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 11px;
+      min-height: 82px;
+      background: #fffdf9;
+      display: grid;
+      gap: 6px;
+    }
+    .metric .label { color: var(--muted); font-size: 12px; font-weight: 700; }
+    .metric .value { font-size: 22px; font-weight: 850; line-height: 1.1; overflow-wrap: anywhere; }
+    .metric .note { color: var(--muted); font-size: 12px; }
+    .table-wrap { overflow: auto; max-height: 680px; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { padding: 9px 8px; border-bottom: 1px solid #ece6dc; text-align: left; vertical-align: middle; }
+    th { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0; position: sticky; top: 0; background: #fffaf2; }
+    tr { cursor: pointer; }
+    tr:hover td { background: #fffaf2; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; overflow-wrap: anywhere; }
+    canvas { display: block; width: 100%; height: 230px; border: 1px solid var(--line); border-radius: 8px; background: #fffdf9; }
+    .list { display: grid; gap: 8px; max-height: 360px; overflow: auto; }
+    .event {
+      border: 1px solid var(--line);
+      border-left: 4px solid var(--blue);
+      border-radius: 8px;
+      padding: 9px;
+      background: #fffdf9;
+    }
+    .event.success { border-left-color: var(--green); }
+    .event.warning { border-left-color: var(--amber); }
+    .event.error { border-left-color: var(--red); }
+    .empty { color: var(--muted); padding: 18px; border: 1px dashed var(--line); border-radius: 8px; background: #fffdf9; }
+    @media (max-width: 1050px) {
+      .topbar, .grid, .filters { grid-template-columns: 1fr; }
+      .cards { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+    @media (max-width: 640px) {
+      .page { padding: 12px; }
+      h1 { font-size: 23px; }
+      .cards { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <header class="topbar">
+      <div>
+        <h1>Архів симуляцій</h1>
+        <p class="subtitle">Усі збережені прогони з results: можна обрати симуляцію, прокрутити метрики, подивитися рішення і стан перехресть.</p>
+        <nav class="nav" aria-label="Archive navigation">
+          <a href="/">Live</a>
+          <a href="/archive">Архів</a>
+          <a href="/averages">Середні</a>
+        </nav>
+      </div>
+      <span class="tag" id="totalTag">0 результатів</span>
+    </header>
+
+    <section class="filters">
+      <label>Пошук
+        <input id="search" placeholder="seed, mode, шлях, run id">
+      </label>
+      <label>Режим
+        <select id="modeFilter">
+          <option value="">усі</option>
+        </select>
+      </label>
+      <button id="reloadBtn">Оновити</button>
+    </section>
+
+    <div class="grid">
+      <section class="section">
+        <div class="section-header">
+          <h2>Результати</h2>
+          <span class="tag" id="visibleTag">0 показано</span>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Режим</th>
+                <th>Очікування</th>
+                <th>Черга</th>
+                <th>Пропуск</th>
+                <th>Датчики</th>
+                <th>Шлях</th>
+              </tr>
+            </thead>
+            <tbody id="resultRows"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <aside>
+        <section class="section">
+          <div class="section-header">
+            <h2>Обрана симуляція</h2>
+            <span class="tag" id="selectedTag">не обрано</span>
+          </div>
+          <div class="section-body">
+            <div class="cards" id="detailCards"></div>
+          </div>
+        </section>
+
+        <section class="section">
+          <div class="section-header">
+            <h2>Історія</h2>
+            <span class="tag" id="historyTag">0 точок</span>
+          </div>
+          <div class="section-body">
+            <canvas id="historyChart"></canvas>
+          </div>
+        </section>
+
+        <section class="section">
+          <div class="section-header">
+            <h2>Останні рішення</h2>
+            <span class="tag" id="decisionTag">0 подій</span>
+          </div>
+          <div class="section-body">
+            <div class="list" id="decisions"></div>
+          </div>
+        </section>
+      </aside>
+    </div>
+  </main>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    let archive = [];
+    let selectedId = null;
+
+    function number(value) {
+      const parsed = Number(value);
+      return Number.isFinite(parsed) ? parsed : null;
+    }
+    function fmt(value, suffix = "", digits = 1) {
+      const parsed = number(value);
+      if (parsed === null) return "немає";
+      const text = Math.abs(parsed - Math.round(parsed)) < 0.001 ? String(Math.round(parsed)) : parsed.toFixed(digits);
+      return `${text}${suffix}`;
+    }
+    function short(value, max = 52) {
+      const text = String(value ?? "немає");
+      return text.length > max ? `${text.slice(0, max - 1)}...` : text;
+    }
+    async function api(path) {
+      const response = await fetch(path);
+      if (!response.ok) throw new Error(await response.text());
+      return await response.json();
+    }
+    function rowText(result) {
+      const summary = result.summary || {};
+      return `${result.mode || ""} ${result.path || ""} ${summary.dataset_csv || ""}`.toLowerCase();
+    }
+    function renderModeFilter(results) {
+      const modes = [...new Set(results.map(item => item.mode).filter(Boolean))].sort();
+      $("modeFilter").innerHTML = `<option value="">усі</option>` + modes.map(mode => `<option value="${mode}">${mode}</option>`).join("");
+    }
+    function filteredResults() {
+      const query = $("search").value.trim().toLowerCase();
+      const mode = $("modeFilter").value;
+      return archive.filter((result) => {
+        if (mode && result.mode !== mode) return false;
+        if (query && !rowText(result).includes(query)) return false;
+        return true;
+      });
+    }
+    function renderRows() {
+      const rows = filteredResults();
+      $("visibleTag").textContent = `${rows.length} показано`;
+      const tbody = $("resultRows");
+      tbody.innerHTML = "";
+      if (!rows.length) {
+        tbody.innerHTML = `<tr><td colspan="6"><div class="empty">Немає результатів під цей фільтр.</div></td></tr>`;
+        return;
+      }
+      rows.forEach((result) => {
+        const summary = result.summary || {};
+        const tr = document.createElement("tr");
+        tr.innerHTML = `<td></td><td></td><td></td><td></td><td></td><td class="mono"></td>`;
+        tr.children[0].textContent = result.mode || "unknown";
+        tr.children[1].textContent = fmt(summary.average_waiting_time, " с");
+        tr.children[2].textContent = fmt(summary.average_queue_length, " авто");
+        tr.children[3].textContent = fmt(summary.throughput, " авто", 0);
+        tr.children[4].textContent = fmt(summary.sensor_range_meters, " м");
+        tr.children[5].textContent = short(result.path, 80);
+        tr.addEventListener("click", () => loadDetail(result.id));
+        tbody.appendChild(tr);
+      });
+    }
+    function card(label, value, note = "") {
+      return `<article class="metric"><div class="label">${label}</div><div class="value">${value}</div><div class="note">${note}</div></article>`;
+    }
+    function renderDetail(payload) {
+      selectedId = payload.id;
+      $("selectedTag").textContent = short(payload.path, 32);
+      const summary = payload.summary || {};
+      const sample = payload.latest_sample || {};
+      $("detailCards").innerHTML = [
+        card("Режим", payload.mode || summary.mode || "немає", short(payload.path, 48)),
+        card("Очікування", fmt(summary.average_waiting_time ?? sample.waiting_time, " с"), "середнє"),
+        card("Черга", fmt(summary.average_queue_length ?? sample.queue_length, " авто"), `макс: ${fmt(summary.max_queue_length ?? sample.max_queue_length, " авто")}`),
+        card("Пропуск", fmt(summary.throughput ?? sample.throughput, " авто", 0), `виїхало: ${fmt(summary.departed_vehicles ?? sample.departed, " авто", 0)}`),
+        card("Gridlock", fmt((summary.gridlock_risk ?? sample.gridlock_risk) * 100, "%"), "ризик затору"),
+        card("ML", fmt(summary.queue_forecast_predictions, "", 0), "прогнозів черги"),
+      ].join("");
+      renderHistory(payload.metric_history || []);
+      renderDecisions(payload.decision_log || []);
+    }
+    function renderHistory(history) {
+      $("historyTag").textContent = `${history.length} точок`;
+      const canvas = $("historyChart");
+      const ctx = canvas.getContext("2d");
+      const rect = canvas.getBoundingClientRect();
+      const dpr = window.devicePixelRatio || 1;
+      canvas.width = Math.max(520, Math.floor(rect.width * dpr));
+      canvas.height = Math.max(230, Math.floor(rect.height * dpr));
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0, 0, rect.width, rect.height);
+      ctx.fillStyle = "#fffdf9";
+      ctx.fillRect(0, 0, rect.width, rect.height);
+      if (!history.length) {
+        ctx.fillStyle = "#626b76";
+        ctx.fillText("Немає історії для цього запуску", 18, 30);
+        return;
+      }
+      const pad = { left: 42, right: 16, top: 18, bottom: 28 };
+      const series = [
+        { key: "queue_length", color: "#c94b4b" },
+        { key: "waiting_time", color: "#d8901f" },
+        { key: "active_vehicles", color: "#14866d" },
+      ];
+      const maxY = Math.max(1, ...history.flatMap(row => series.map(item => number(row[item.key]) || 0)));
+      const times = history.map(row => number(row.time) || 0);
+      const minT = Math.min(...times);
+      const maxT = Math.max(...times);
+      const spanT = Math.max(1, maxT - minT);
+      const plotW = rect.width - pad.left - pad.right;
+      const plotH = rect.height - pad.top - pad.bottom;
+      ctx.strokeStyle = "#e8dfd1";
+      for (let i = 0; i <= 4; i += 1) {
+        const y = pad.top + plotH * (i / 4);
+        ctx.beginPath();
+        ctx.moveTo(pad.left, y);
+        ctx.lineTo(rect.width - pad.right, y);
+        ctx.stroke();
+      }
+      series.forEach((item) => {
+        ctx.strokeStyle = item.color;
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        history.forEach((row, index) => {
+          const x = pad.left + (((number(row.time) || 0) - minT) / spanT) * plotW;
+          const y = pad.top + plotH - ((number(row[item.key]) || 0) / maxY) * plotH;
+          if (index === 0) ctx.moveTo(x, y);
+          else ctx.lineTo(x, y);
+        });
+        ctx.stroke();
+      });
+    }
+    function renderDecisions(rows) {
+      $("decisionTag").textContent = `${rows.length} подій`;
+      const list = $("decisions");
+      list.innerHTML = "";
+      if (!rows.length) {
+        list.innerHTML = `<div class="empty">Немає записаних рішень.</div>`;
+        return;
+      }
+      rows.slice(-16).reverse().forEach((row) => {
+        const event = document.createElement("article");
+        event.className = `event ${row.level || ""}`.trim();
+        event.innerHTML = `<strong></strong><div></div>`;
+        event.querySelector("strong").textContent = `${fmt(row.time, " с", 0)} - ${row.title || row.category || "подія"}`;
+        event.querySelector("div").textContent = row.detail || row.tls_id || "";
+        list.appendChild(event);
+      });
+    }
+    async function loadDetail(id) {
+      const payload = await api(`/api/archive/${id}`);
+      renderDetail(payload);
+    }
+    async function loadArchive() {
+      const payload = await api("/api/archive");
+      archive = payload.results || [];
+      $("totalTag").textContent = `${payload.total || 0} результатів`;
+      renderModeFilter(archive);
+      renderRows();
+      if (archive.length && !selectedId) loadDetail(archive[0].id);
+    }
+    $("search").addEventListener("input", renderRows);
+    $("modeFilter").addEventListener("change", renderRows);
+    $("reloadBtn").addEventListener("click", loadArchive);
+    window.addEventListener("resize", () => { if (selectedId) loadDetail(selectedId); });
+    loadArchive();
+  </script>
+</body>
+</html>
+"""
+
+
+AVERAGES_PAGE = r"""<!doctype html>
+<html lang="uk">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>FlowMind Averages</title>
+  <style>
+    :root {
+      --bg: #f7f4ef;
+      --panel: #ffffff;
+      --ink: #1c1f23;
+      --muted: #626b76;
+      --line: #d9d3c8;
+      --green: #14866d;
+      --shadow: 0 8px 28px rgba(28, 31, 35, 0.08);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font: 14px/1.45 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    .page { width: min(1280px, 100%); margin: 0 auto; padding: 20px; }
+    .topbar {
+      display: grid;
+      grid-template-columns: minmax(260px, 1fr) auto;
+      gap: 16px;
+      align-items: start;
+      margin-bottom: 16px;
+    }
+    h1 { margin: 0 0 4px; font-size: 28px; letter-spacing: 0; }
+    h2 { margin: 0; font-size: 16px; letter-spacing: 0; }
+    .subtitle { color: var(--muted); margin: 0; max-width: 760px; }
+    .nav { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+    .nav a {
+      color: var(--ink);
+      text-decoration: none;
+      border: 1px solid var(--line);
+      background: #fffdf9;
+      padding: 7px 10px;
+      border-radius: 6px;
+      font-weight: 750;
+    }
+    .tag {
+      border: 1px solid var(--line);
+      background: #fffaf2;
+      padding: 6px 9px;
+      border-radius: 6px;
+      color: var(--muted);
+      white-space: nowrap;
+    }
+    .cards {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 10px;
+      margin-bottom: 16px;
+    }
+    .metric {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 11px;
+      min-height: 86px;
+      background: #fffdf9;
+      display: grid;
+      gap: 6px;
+    }
+    .metric .label { color: var(--muted); font-size: 12px; font-weight: 700; }
+    .metric .value { font-size: 23px; font-weight: 850; line-height: 1.1; overflow-wrap: anywhere; }
+    .metric .note { color: var(--muted); font-size: 12px; }
+    .section {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: var(--shadow);
+      overflow: hidden;
+      margin-bottom: 16px;
+    }
+    .section-header {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: center;
+      padding: 12px 14px;
+      border-bottom: 1px solid var(--line);
+      background: #fffaf2;
+    }
+    .section-body { padding: 14px; overflow: auto; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { padding: 9px 8px; border-bottom: 1px solid #ece6dc; text-align: left; vertical-align: middle; }
+    th { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0; }
+    .empty { color: var(--muted); padding: 18px; border: 1px dashed var(--line); border-radius: 8px; background: #fffdf9; }
+    @media (max-width: 900px) {
+      .topbar { grid-template-columns: 1fr; }
+      .cards { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+    @media (max-width: 620px) {
+      .page { padding: 12px; }
+      h1 { font-size: 23px; }
+      .cards { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <header class="topbar">
+      <div>
+        <h1>Середні значення</h1>
+        <p class="subtitle">Агрегація всіх збережених summary.csv по режимах керування.</p>
+        <nav class="nav" aria-label="Averages navigation">
+          <a href="/">Live</a>
+          <a href="/archive">Архів</a>
+          <a href="/averages">Середні</a>
+        </nav>
+      </div>
+      <span class="tag" id="totalTag">0 результатів</span>
+    </header>
+
+    <section class="cards" id="overview"></section>
+    <div id="modeSections"></div>
+  </main>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    function number(value) {
+      const parsed = Number(value);
+      return Number.isFinite(parsed) ? parsed : null;
+    }
+    function fmt(value, suffix = "", digits = 1) {
+      const parsed = number(value);
+      if (parsed === null) return "немає";
+      const text = Math.abs(parsed - Math.round(parsed)) < 0.001 ? String(Math.round(parsed)) : parsed.toFixed(digits);
+      return `${text}${suffix}`;
+    }
+    function card(label, value, note = "") {
+      return `<article class="metric"><div class="label">${label}</div><div class="value">${value}</div><div class="note">${note}</div></article>`;
+    }
+    async function api(path) {
+      const response = await fetch(path);
+      if (!response.ok) throw new Error(await response.text());
+      return await response.json();
+    }
+    function renderMode(mode) {
+      const metrics = mode.metrics || {};
+      const rows = Object.entries(metrics).map(([key, item]) => {
+        return `<tr>
+          <td>${item.label || key}</td>
+          <td>${fmt(item.average)}</td>
+          <td>${fmt(item.min)}</td>
+          <td>${fmt(item.max)}</td>
+          <td>${item.count || 0}</td>
+        </tr>`;
+      }).join("");
+      return `<section class="section">
+        <div class="section-header">
+          <h2>${mode.mode}</h2>
+          <span class="tag">${mode.count} запусків</span>
+        </div>
+        <div class="section-body">
+          <table>
+            <thead>
+              <tr><th>Метрика</th><th>Середнє</th><th>Мін</th><th>Макс</th><th>К-сть</th></tr>
+            </thead>
+            <tbody>${rows || `<tr><td colspan="5"><div class="empty">Немає числових метрик.</div></td></tr>`}</tbody>
+          </table>
+        </div>
+      </section>`;
+    }
+    async function loadAverages() {
+      const payload = await api("/api/averages");
+      $("totalTag").textContent = `${payload.total_results || 0} результатів`;
+      const modes = payload.modes || [];
+      const flowmind = modes.find(item => item.mode === "flowmind") || { metrics: {} };
+      const fixed = modes.find(item => item.mode === "fixed") || { metrics: {} };
+      const wait = flowmind.metrics?.average_waiting_time?.average;
+      const fixedWait = fixed.metrics?.average_waiting_time?.average;
+      const improvement = fixedWait && wait ? ((fixedWait - wait) / fixedWait) * 100 : null;
+      $("overview").innerHTML = [
+        card("Усього результатів", fmt(payload.total_results, "", 0), `${payload.total_rows || 0} summary rows`),
+        card("Режимів", fmt(modes.length, "", 0), modes.map(item => item.mode).join(", ")),
+        card("FlowMind очікування", fmt(wait, " с"), "середнє по всіх flowmind"),
+        card("Різниця з fixed", improvement == null ? "немає" : fmt(improvement, "%"), "позитивне значення краще"),
+      ].join("");
+      $("modeSections").innerHTML = modes.length ? modes.map(renderMode).join("") : `<div class="empty">Немає summary.csv для агрегації.</div>`;
+    }
+    loadAverages();
+  </script>
+</body>
+</html>
+"""
+
+
 class MissingFastAPIApp:
     async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
         body = (
@@ -1240,6 +2046,14 @@ else:
     def dashboard_page() -> Any:
         return HTML_PAGE
 
+    @app.get("/archive", response_class=HTMLResponse)
+    def archive_page() -> Any:
+        return ARCHIVE_PAGE
+
+    @app.get("/averages", response_class=HTMLResponse)
+    def averages_page() -> Any:
+        return AVERAGES_PAGE
+
     @app.get("/api/health")
     def health() -> dict[str, Any]:
         return {
@@ -1259,6 +2073,18 @@ else:
     @app.get("/api/results")
     def results() -> list[dict[str, Any]]:
         return discover_result_sets(RESULTS_DIR)
+
+    @app.get("/api/archive")
+    def archive() -> dict[str, Any]:
+        return build_archive_payload(RESULTS_DIR)
+
+    @app.get("/api/archive/{result_id}")
+    def archived_result(result_id: str) -> dict[str, Any]:
+        return build_result_detail_payload(result_id)
+
+    @app.get("/api/averages")
+    def averages() -> dict[str, Any]:
+        return build_averages_payload(RESULTS_DIR)
 
     @app.post("/api/start-demo")
     async def start_demo(request: Request) -> dict[str, Any]:

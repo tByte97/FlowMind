@@ -88,6 +88,98 @@ class WebDashboardApiTests(unittest.TestCase):
         self.assertEqual(command[command.index("--emergency-depart") + 1], "59.0")
         self.assertTrue(results_dir.name.endswith("_seed_7"))
 
+    def test_archive_payload_exposes_result_ids_and_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run_dir = root / "run_03"
+            run_dir.mkdir()
+            (run_dir / "summary.csv").write_text(
+                (
+                    "mode,average_waiting_time,average_queue_length,"
+                    "throughput,sensor_range_meters\n"
+                    "flowmind,12.5,4.25,80,120\n"
+                ),
+                encoding="utf-8",
+            )
+
+            payload = web_dashboard.build_archive_payload(root)
+
+        self.assertEqual(payload["total"], 1)
+        result = payload["results"][0]
+        self.assertTrue(result["id"])
+        self.assertEqual(result["mode"], "flowmind")
+        self.assertEqual(result["summary"]["average_waiting_time"], 12.5)
+        self.assertEqual(result["summary"]["throughput"], 80)
+
+    def test_result_detail_reads_archived_live_status_by_id(self) -> None:
+        old_results_dir = web_dashboard.RESULTS_DIR
+        old_web_results_dir = web_dashboard.WEB_RESULTS_DIR
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run_dir = root / "run_04"
+            run_dir.mkdir()
+            (run_dir / "live_status.json").write_text(
+                json.dumps(
+                    {
+                        "mode": "local",
+                        "summary": {"mode": "local", "throughput": 33},
+                        "metric_history": [{"time": 1}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            result_id = web_dashboard._result_id(run_dir)
+            web_dashboard.RESULTS_DIR = root
+            web_dashboard.WEB_RESULTS_DIR = root / "web"
+            try:
+                detail = web_dashboard.build_result_detail_payload(result_id)
+            finally:
+                web_dashboard.RESULTS_DIR = old_results_dir
+                web_dashboard.WEB_RESULTS_DIR = old_web_results_dir
+
+        self.assertTrue(detail["available"])
+        self.assertEqual(detail["mode"], "local")
+        self.assertEqual(detail["summary"]["throughput"], 33)
+        self.assertEqual(detail["metric_history"], [{"time": 1}])
+
+    def test_averages_payload_groups_numeric_metrics_by_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = root / "run_05"
+            second = root / "run_06"
+            third = root / "run_07"
+            first.mkdir()
+            second.mkdir()
+            third.mkdir()
+            (first / "summary.csv").write_text(
+                "mode,average_waiting_time,throughput\nflowmind,10,100\n",
+                encoding="utf-8",
+            )
+            (second / "summary.csv").write_text(
+                "mode,average_waiting_time,throughput\nflowmind,20,140\n",
+                encoding="utf-8",
+            )
+            (third / "summary.csv").write_text(
+                "mode,average_waiting_time,throughput\nfixed,30,90\n",
+                encoding="utf-8",
+            )
+
+            payload = web_dashboard.build_averages_payload(root)
+
+        by_mode = {item["mode"]: item for item in payload["modes"]}
+        self.assertEqual(payload["total_results"], 3)
+        self.assertEqual(payload["total_rows"], 3)
+        self.assertEqual(by_mode["flowmind"]["count"], 2)
+        self.assertEqual(
+            by_mode["flowmind"]["metrics"]["average_waiting_time"]["average"],
+            15.0,
+        )
+        self.assertEqual(
+            by_mode["flowmind"]["metrics"]["throughput"]["average"],
+            120.0,
+        )
+        self.assertEqual(by_mode["fixed"]["count"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()
