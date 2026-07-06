@@ -35,6 +35,11 @@ class CorridorManagerTest(unittest.TestCase):
         )
         self.assertEqual(manager.state, CorridorState.GREEN_WINDOW)
         self.assertEqual(manager.get_priority_overrides(), {"tls_0": 1})
+        self.assertEqual(
+            manager.decision_events[-1].title,
+            "Зелений коридор активовано",
+        )
+        self.assertEqual(manager.decision_events[-1].tls_id, "tls_0")
 
         manager.step(40.0, vehicle_in_network=True, next_tls_info=None)
         self.assertEqual(manager.state, CorridorState.CLEARANCE)
@@ -46,6 +51,10 @@ class CorridorManagerTest(unittest.TestCase):
         manager.step(52.0, vehicle_in_network=True, next_tls_info=None)
         self.assertEqual(manager.state, CorridorState.NORMAL)
         self.assertEqual(manager.completed_tls, ["tls_0"])
+        self.assertEqual(
+            manager.decision_events[-1].title,
+            "Рух повернувся до нормального режиму",
+        )
 
     def test_timeout_fallback(self) -> None:
         manager = CorridorManager("amb_1", timeout_seconds=10.0)

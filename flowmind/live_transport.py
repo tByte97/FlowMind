@@ -10,6 +10,7 @@ import struct
 import threading
 import time
 from typing import Any
+from urllib.parse import urlsplit
 
 
 GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
@@ -24,24 +25,37 @@ class LiveTelemetryPublisher:
         self._server_socket: socket.socket | None = None
         self._clients: list[socket.socket] = []
         self._lock = threading.Lock()
+        self._send_lock = threading.Lock()
         self._ready_event = threading.Event()
-        self._pending_messages: list[str] = []
+        self._latest_message: str | None = None
+        self._startup_error: Exception | None = None
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
             return
         self._stop_event.clear()
         self._ready_event.clear()
+        self._startup_error = None
         self._thread = threading.Thread(target=self._run_server, daemon=True)
         self._thread.start()
-        self._ready_event.wait(timeout=2.0)
+        if not self._ready_event.wait(timeout=2.0):
+            raise RuntimeError("WebSocket server did not start within 2 seconds")
+        if self._startup_error is not None:
+            raise RuntimeError(
+                f"Could not start WebSocket server on {self._host}:{self._port}"
+            ) from self._startup_error
 
     def _run_server(self) -> None:
-        server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        server_socket.setblocking(False)
-        server_socket.bind((self._host, self._port))
-        server_socket.listen(5)
+        try:
+            server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            server_socket.setblocking(False)
+            server_socket.bind((self._host, self._port))
+            server_socket.listen(5)
+        except Exception as error:
+            self._startup_error = error
+            self._ready_event.set()
+            return
         self._server_socket = server_socket
         self._ready_event.set()
         try:
@@ -56,7 +70,13 @@ class LiveTelemetryPublisher:
                 if self._handle_handshake(client_socket):
                     with self._lock:
                         self._clients.append(client_socket)
-                    self._replay_pending(client_socket)
+                    try:
+                        self._replay_pending(client_socket)
+                    except Exception:
+                        with self._lock:
+                            if client_socket in self._clients:
+                                self._clients.remove(client_socket)
+                        client_socket.close()
                 else:
                     client_socket.close()
         finally:
@@ -118,17 +138,17 @@ class LiveTelemetryPublisher:
 
     def _replay_pending(self, client_socket: socket.socket) -> None:
         with self._lock:
-            pending = list(self._pending_messages)
-        for message in pending:
-            try:
-                self._send_frame(client_socket, message)
-            except Exception:
-                break
+            message = self._latest_message
+        if message is not None:
+            self._send_frame(client_socket, message)
 
     def publish(self, payload: dict[str, Any]) -> None:
         message = json.dumps(payload)
         with self._lock:
-            self._pending_messages.append(message)
+            # A dashboard joining late needs only the current snapshot. Keeping
+            # every simulation step here caused unbounded memory use and replayed
+            # stale telemetry before the live state.
+            self._latest_message = message
             clients = list(self._clients)
         for client_socket in clients:
             try:
@@ -142,6 +162,11 @@ class LiveTelemetryPublisher:
                 except Exception:
                     pass
 
+    @property
+    def client_count(self) -> int:
+        with self._lock:
+            return len(self._clients)
+
     def _send_frame(self, client_socket: socket.socket, message: str) -> None:
         payload = message.encode("utf-8")
         if len(payload) < 126:
@@ -150,7 +175,8 @@ class LiveTelemetryPublisher:
             header = bytes([0x81, 126]) + struct.pack("!H", len(payload))
         else:
             header = bytes([0x81, 127]) + struct.pack("!Q", len(payload))
-        client_socket.sendall(header + payload)
+        with self._send_lock:
+            client_socket.sendall(header + payload)
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -177,12 +203,18 @@ class LiveTelemetryClient:
         self._url = url
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
-        self._queue: queue.Queue[dict[str, Any]] = queue.Queue()
+        self._queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=100)
         self._socket: socket.socket | None = None
+        self._connected_event = threading.Event()
+        self._state_lock = threading.Lock()
+        self._last_error: str | None = None
+        self._last_received_at: float | None = None
+        self._receive_buffer = bytearray()
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
             return
+        self._stop_event.clear()
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
 
@@ -190,40 +222,74 @@ class LiveTelemetryClient:
         while not self._stop_event.is_set():
             try:
                 self._connect_once()
-            except Exception:
+            except Exception as error:
+                with self._state_lock:
+                    self._last_error = str(error)
+                self._connected_event.clear()
                 time.sleep(0.2)
 
     def _connect_once(self) -> None:
-        parsed = self._parse_url(self._url)
-        client_socket = socket.create_connection(parsed, timeout=1.0)
+        host, port, path = self._parse_url(self._url)
+        client_socket = socket.create_connection((host, port), timeout=1.0)
         client_socket.settimeout(0.2)
         self._socket = client_socket
-        self._perform_handshake(client_socket, parsed[0], parsed[1])
-        while not self._stop_event.is_set():
+        self._receive_buffer.clear()
+        try:
+            self._perform_handshake(client_socket, host, port, path)
+            with self._state_lock:
+                self._last_error = None
+            self._connected_event.set()
+            while not self._stop_event.is_set():
+                try:
+                    message = self._read_frame(client_socket)
+                except TimeoutError:
+                    continue
+                except (ConnectionResetError, ConnectionAbortedError, OSError):
+                    break
+                if message is None:
+                    continue
+                payload = json.loads(message)
+                if not isinstance(payload, dict):
+                    continue
+                self._enqueue_latest(payload)
+        finally:
+            self._connected_event.clear()
+            self._socket = None
+            client_socket.close()
+
+    def _enqueue_latest(self, payload: dict[str, Any]) -> None:
+        with self._state_lock:
+            self._last_received_at = time.time()
+        try:
+            self._queue.put_nowait(payload)
+        except queue.Full:
             try:
-                message = self._read_frame(client_socket)
-            except TimeoutError:
-                continue
-            except (ConnectionResetError, ConnectionAbortedError, OSError):
-                break
-            if message is None:
-                continue
-            self._queue.put(json.loads(message))
-        self._socket = None
-        client_socket.close()
+                self._queue.get_nowait()
+            except queue.Empty:
+                pass
+            self._queue.put_nowait(payload)
 
-    def _parse_url(self, url: str) -> tuple[str, int]:
-        if not url.startswith("ws://"):
+    def _parse_url(self, url: str) -> tuple[str, int, str]:
+        parsed = urlsplit(url)
+        if parsed.scheme != "ws":
             raise ValueError("Only ws:// URLs are supported")
-        host_port = url[len("ws://") :]
-        host, _, port_text = host_port.partition(":")
-        port = int(port_text or "80")
-        return host, port
+        if not parsed.hostname:
+            raise ValueError("WebSocket URL must include a host")
+        path = parsed.path or "/"
+        if parsed.query:
+            path = f"{path}?{parsed.query}"
+        return parsed.hostname, parsed.port or 80, path
 
-    def _perform_handshake(self, client_socket: socket.socket, host: str, port: int) -> None:
+    def _perform_handshake(
+        self,
+        client_socket: socket.socket,
+        host: str,
+        port: int,
+        path: str,
+    ) -> None:
         key = base64.b64encode(random.randbytes(16)).decode("ascii")
         request = (
-            f"GET / HTTP/1.1\r\n"
+            f"GET {path} HTTP/1.1\r\n"
             f"Host: {host}:{port}\r\n"
             "Upgrade: websocket\r\n"
             "Connection: Upgrade\r\n"
@@ -245,7 +311,9 @@ class LiveTelemetryClient:
             if not chunk:
                 raise RuntimeError("Connection closed during handshake")
             buffer += chunk
-        return buffer.decode("latin-1")
+        header, remainder = buffer.split(b"\r\n\r\n", 1)
+        self._receive_buffer.extend(remainder)
+        return (header + b"\r\n\r\n").decode("latin-1")
 
     def _parse_headers(self, response_text: str) -> dict[str, str]:
         headers: dict[str, str] = {}
@@ -281,6 +349,10 @@ class LiveTelemetryClient:
 
     def _recv_exact(self, client_socket: socket.socket, size: int) -> bytes:
         chunks = bytearray()
+        if self._receive_buffer:
+            buffered_size = min(size, len(self._receive_buffer))
+            chunks.extend(self._receive_buffer[:buffered_size])
+            del self._receive_buffer[:buffered_size]
         while len(chunks) < size:
             chunk = client_socket.recv(size - len(chunks))
             if not chunk:
@@ -289,13 +361,37 @@ class LiveTelemetryClient:
         return bytes(chunks)
 
     def wait_for_update(self, timeout: float = 1.0) -> dict[str, Any]:
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            try:
+        try:
+            if timeout <= 0:
                 return self._queue.get_nowait()
+            return self._queue.get(timeout=timeout)
+        except queue.Empty as error:
+            raise TimeoutError("No websocket update received") from error
+
+    def latest_update(self) -> dict[str, Any] | None:
+        """Drain queued snapshots and return only the newest one."""
+        latest = None
+        while True:
+            try:
+                latest = self._queue.get_nowait()
             except queue.Empty:
-                time.sleep(0.01)
-        raise TimeoutError("No websocket update received")
+                return latest
+
+    def wait_until_connected(self, timeout: float = 1.0) -> bool:
+        return self._connected_event.wait(timeout)
+
+    @property
+    def connected(self) -> bool:
+        return self._connected_event.is_set()
+
+    @property
+    def status(self) -> dict[str, Any]:
+        with self._state_lock:
+            return {
+                "connected": self.connected,
+                "last_error": self._last_error,
+                "last_received_at": self._last_received_at,
+            }
 
     def stop(self) -> None:
         self._stop_event.set()

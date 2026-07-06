@@ -81,12 +81,24 @@ class FakeLane:
 class FakePolygon:
     def __init__(self) -> None:
         self.added: list[tuple[object, ...]] = []
+        self.colors: list[tuple[str, tuple[int, int, int, int]]] = []
+        self.widths: list[tuple[str, float]] = []
 
     def getIDList(self) -> tuple[str, ...]:
         return ()
 
     def add(self, *args: object, **_kwargs: object) -> None:
         self.added.append(args)
+
+    def setColor(
+        self,
+        polygon_id: str,
+        color: tuple[int, int, int, int],
+    ) -> None:
+        self.colors.append((polygon_id, color))
+
+    def setLineWidth(self, polygon_id: str, width: float) -> None:
+        self.widths.append((polygon_id, width))
 
 
 class FakePoi(FakePolygon):
@@ -183,6 +195,21 @@ class EmergencyVehicleTest(unittest.TestCase):
         self.assertEqual(details.route_length, 1_500.0)
         self.assertEqual(details.expected_travel_time, 120.0)
         self.assertEqual(details.predicted_eta, 150.0)
+
+    def test_green_corridor_recolors_route_overlay(self) -> None:
+        traci = FakeTraci()
+        manager = EmergencyVehicleManager(traci, self._config())
+        manager.install()
+
+        manager.update_corridor_visualization("GREEN_WINDOW", "tls_1")
+
+        self.assertEqual(len(traci.polygon.colors), 3)
+        self.assertTrue(
+            all(color == (20, 255, 90, 255) for _, color in traci.polygon.colors)
+        )
+        self.assertTrue(
+            all(width == 9.0 for _, width in traci.polygon.widths)
+        )
 
     def test_manager_reports_edges_from_another_map(self) -> None:
         traci = FakeTraci()

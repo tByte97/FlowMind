@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-import threading
 import time
 from pathlib import Path
 from typing import Iterable
@@ -17,6 +16,9 @@ from flowmind.live_transport import LiveTelemetryClient
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 PROJECT_RESULTS_DIR = PROJECT_ROOT / "results"
 RESULTS_DIR = Path(os.environ.get("FLOWMIND_RESULTS_DIR", str(PROJECT_RESULTS_DIR)))
+LIVE_REFRESH_INTERVAL = (
+    None if os.environ.get("FLOWMIND_DISABLE_LIVE_REFRESH") else "1s"
+)
 
 MODE_LABELS = {
     "fixed": "Fixed",
@@ -42,6 +44,8 @@ METRIC_LABELS = {
     "phase_extensions": "Продовження зеленого",
     "phase_advances": "Перемикання фаз",
     "priority_decisions": "Пріоритети швидкої",
+    "queue_forecast_predictions": "ML-прогнози черги",
+    "queue_forecast_failures": "Помилки ML-прогнозу",
 }
 LOWER_IS_BETTER = {
     "average_travel_time",
@@ -63,7 +67,19 @@ NUMERIC_COLUMNS = [
     "emergency_route_length",
     "emergency_expected_travel_time",
     "emergency_predicted_eta",
+    "queue_forecast_feature_count",
+    "queue_forecast_model_count",
+    "queue_forecast_predictions",
+    "queue_forecast_failures",
+    "queue_forecast_trace_samples",
 ]
+BEFORE_AFTER_METRICS = (
+    ("average_waiting_time", "Середнє очікування", " с", True),
+    ("average_queue_length", "Середня черга", " авто", True),
+    ("stops_count", "Зупинки транспорту", "", True),
+    ("throughput", "Завершили маршрут", " авто", False),
+    ("emergency_eta", "Час доїзду швидкої", " с", True),
+)
 
 
 st.set_page_config(page_title="FlowMind Dashboard", page_icon="🚦", layout="wide")
@@ -99,7 +115,7 @@ def discover_result_sets(base_dir: Path) -> list[Path]:
     return candidates
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=2)
 def _cached_result_sets(base_dir: Path) -> list[Path]:
     return discover_result_sets(base_dir)
 
@@ -137,6 +153,118 @@ def pct_delta(current: float, baseline: float) -> str:
     return f"{((current - baseline) / baseline) * 100:+.1f}%"
 
 
+def before_after_rows(summary: pd.DataFrame) -> list[dict[str, object]]:
+    if summary.empty or "mode" not in summary.columns:
+        return []
+    modes = set(summary["mode"].astype(str))
+    if not {"fixed", "flowmind"}.issubset(modes):
+        return []
+    before = summary[summary["mode"] == "fixed"].iloc[0]
+    after = summary[summary["mode"] == "flowmind"].iloc[0]
+    rows: list[dict[str, object]] = []
+    for metric, label, suffix, lower_is_better in BEFORE_AFTER_METRICS:
+        if metric not in summary.columns:
+            continue
+        before_value = pd.to_numeric(pd.Series([before[metric]]), errors="coerce").iloc[0]
+        after_value = pd.to_numeric(pd.Series([after[metric]]), errors="coerce").iloc[0]
+        if pd.isna(before_value) or pd.isna(after_value):
+            continue
+        improvement = None
+        if float(before_value) != 0:
+            change = (
+                float(before_value) - float(after_value)
+                if lower_is_better
+                else float(after_value) - float(before_value)
+            )
+            improvement = change / abs(float(before_value)) * 100.0
+        rows.append(
+            {
+                "metric": metric,
+                "label": label,
+                "suffix": suffix,
+                "before": float(before_value),
+                "after": float(after_value),
+                "improvement": improvement,
+            }
+        )
+    return rows
+
+
+def nearest_timeseries_snapshot(
+    frame: pd.DataFrame,
+    selected_time: float,
+) -> dict[str, float]:
+    if frame.empty or "time" not in frame.columns:
+        return {}
+    ordered = frame.copy()
+    ordered["time"] = pd.to_numeric(ordered["time"], errors="coerce")
+    ordered = ordered.dropna(subset=["time"]).sort_values("time")
+    if ordered.empty:
+        return {}
+    candidates = ordered[ordered["time"] <= selected_time]
+    row = candidates.iloc[-1] if not candidates.empty else ordered.iloc[0]
+    snapshot: dict[str, float] = {}
+    for column in [
+        "time",
+        "active_vehicles",
+        "arrived",
+        "mean_speed",
+        "waiting_time",
+        "queue_length",
+        "throughput",
+        "stops_count",
+    ]:
+        if column not in row.index:
+            continue
+        value = pd.to_numeric(pd.Series([row[column]]), errors="coerce").iloc[0]
+        if pd.notna(value):
+            snapshot[column] = float(value)
+    return snapshot
+
+
+def visual_comparison_data(
+    fixed: pd.DataFrame,
+    flowmind: pd.DataFrame,
+    selected_time: float,
+) -> dict[str, object]:
+    fixed_snapshot = nearest_timeseries_snapshot(fixed, selected_time)
+    flowmind_snapshot = nearest_timeseries_snapshot(flowmind, selected_time)
+    if not fixed_snapshot or not flowmind_snapshot:
+        return {}
+    def maximum_queue(frame: pd.DataFrame) -> float:
+        if "queue_length" not in frame.columns:
+            return 0.0
+        values = pd.to_numeric(frame["queue_length"], errors="coerce").dropna()
+        return float(values.max()) if not values.empty else 0.0
+
+    max_queue = max(
+        maximum_queue(fixed),
+        maximum_queue(flowmind),
+        1.0,
+    )
+    return {
+        "time": min(
+            fixed_snapshot.get("time", selected_time),
+            flowmind_snapshot.get("time", selected_time),
+        ),
+        "fixed": fixed_snapshot,
+        "flowmind": flowmind_snapshot,
+        "max_queue": float(max_queue),
+        "queue_difference": (
+            fixed_snapshot.get("queue_length", 0.0)
+            - flowmind_snapshot.get("queue_length", 0.0)
+        ),
+        "waiting_difference": (
+            fixed_snapshot.get("waiting_time", 0.0)
+            - flowmind_snapshot.get("waiting_time", 0.0)
+        ),
+        "throughput_difference": (
+            flowmind_snapshot.get("throughput", 0.0)
+            - fixed_snapshot.get("throughput", 0.0)
+        ),
+    }
+
+
 def best_row(summary: pd.DataFrame, metric: str) -> pd.Series | None:
     if metric not in summary.columns:
         return None
@@ -168,6 +296,22 @@ def load_trace(result_dir: Path, mode: str) -> pd.DataFrame | None:
     trace["label"] = MODE_LABELS.get(mode, mode)
     trace["result_set"] = display_path(result_dir)
     return trace
+
+
+def load_queue_forecast_trace(result_dir: Path, mode: str) -> pd.DataFrame | None:
+    path = result_dir / f"{mode}_queue_forecast.csv"
+    if not path.exists():
+        return None
+    trace = pd.read_csv(path)
+    if trace.empty:
+        return None
+    trace["mode"] = mode
+    trace["label"] = MODE_LABELS.get(mode, mode)
+    return trace
+
+
+def truthy(value: object) -> bool:
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "так"}
 
 
 def emergency_runs_for_result(result_dir: Path, summary: pd.DataFrame) -> pd.DataFrame:
@@ -277,26 +421,570 @@ def load_live_status(result_dir: Path) -> dict[str, object] | None:
 class LiveSocketClient:
     def __init__(self, url: str) -> None:
         self._client = LiveTelemetryClient(url)
-        self._messages: list[dict[str, object]] = []
-        self._lock = threading.Lock()
+        self._latest: dict[str, object] | None = None
 
     def start(self) -> None:
         self._client.start()
 
     def latest(self) -> dict[str, object] | None:
-        try:
-            payload = self._client.wait_for_update(timeout=0.0)
-        except TimeoutError:
-            return None
-        with self._lock:
-            self._messages.append(payload)
-        with self._lock:
-            if not self._messages:
-                return None
-            return self._messages.pop()
+        payload = self._client.latest_update()
+        if payload is not None:
+            self._latest = payload
+        return self._latest
+
+    @property
+    def status(self) -> dict[str, object]:
+        return self._client.status
 
     def stop(self) -> None:
         self._client.stop()
+
+
+def live_history_frame(payload: dict[str, object]) -> pd.DataFrame:
+    history = payload.get("metric_history", [])
+    if not isinstance(history, list):
+        return pd.DataFrame()
+    rows = [item for item in history if isinstance(item, dict)]
+    if not rows:
+        return pd.DataFrame()
+    frame = pd.DataFrame(rows)
+    numeric_columns = [
+        "time",
+        "active_vehicles",
+        "departed",
+        "arrived",
+        "inflow_per_minute",
+        "outflow_per_minute",
+        "mean_speed",
+        "waiting_time",
+        "queue_length",
+        "max_queue_length",
+        "throughput",
+        "stops_count",
+        "gridlock_risk",
+    ]
+    for column in numeric_columns:
+        if column in frame.columns:
+            frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    return frame
+
+
+def live_system_rows(payload: dict[str, object]) -> list[dict[str, object]]:
+    system = payload.get("system", {})
+    if not isinstance(system, dict):
+        return []
+    labels = {
+        "simulation": "SUMO simulation",
+        "websocket": "WebSocket",
+        "controller": "Signal controller",
+        "queue_forecast": "ML queue forecast",
+        "corridor": "Emergency corridor",
+        "metrics": "Metrics collector",
+    }
+    rows = []
+    for name, details in system.items():
+        if not isinstance(details, dict):
+            continue
+        status = details.get("status", details.get("corridor_state", "unknown"))
+        def visible(value: object) -> bool:
+            return value is not None and value != "" and value != ()
+
+        facts = ", ".join(
+            f"{key}={value}"
+            for key, value in details.items()
+            if key not in {"status", "corridor_state"} and visible(value)
+        )
+        rows.append(
+            {
+                "Компонент": labels.get(str(name), str(name)),
+                "Стан": status,
+                "Деталі": facts or "—",
+            }
+        )
+    return rows
+
+
+def payload_age_seconds(payload: dict[str, object]) -> float | None:
+    emitted_at = payload.get("emitted_at")
+    if not emitted_at:
+        return None
+    try:
+        timestamp = pd.Timestamp(str(emitted_at))
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.tz_localize("UTC")
+        return max(time.time() - timestamp.timestamp(), 0.0)
+    except (TypeError, ValueError):
+        return None
+
+
+def socket_payload_matches(
+    payload: dict[str, object],
+    result_dir: Path,
+) -> bool:
+    source = payload.get("results_dir")
+    if not source:
+        return True
+    try:
+        return Path(str(source)).resolve() == result_dir.resolve()
+    except OSError:
+        return False
+
+
+def simulation_status(payload: dict[str, object] | None) -> str:
+    if not isinstance(payload, dict):
+        return "waiting"
+    system = payload.get("system", {})
+    if not isinstance(system, dict):
+        return "unknown"
+    simulation = system.get("simulation", {})
+    if not isinstance(simulation, dict):
+        return "unknown"
+    return str(simulation.get("status", "unknown"))
+
+
+def live_average_metrics(payload: dict[str, object]) -> dict[str, float]:
+    history = live_history_frame(payload)
+    fields = {
+        "active_vehicles": "active_vehicles",
+        "inflow_per_minute": "inflow_per_minute",
+        "outflow_per_minute": "outflow_per_minute",
+        "queue_length": "queue_length",
+        "waiting_time": "waiting_time",
+        "mean_speed": "mean_speed",
+        "gridlock_risk": "gridlock_risk",
+    }
+    averages: dict[str, float] = {}
+    for output_name, column in fields.items():
+        if column not in history.columns:
+            averages[output_name] = 0.0
+            continue
+        values = pd.to_numeric(history[column], errors="coerce").dropna()
+        averages[output_name] = float(values.mean()) if not values.empty else 0.0
+    return averages
+
+
+def decision_log_rows(payload: dict[str, object]) -> list[dict[str, object]]:
+    value = payload.get("decision_log", [])
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, dict)]
+
+
+def corridor_status(payload: dict[str, object]) -> dict[str, object]:
+    system = payload.get("system", {})
+    if not isinstance(system, dict):
+        return {}
+    corridor = system.get("corridor", {})
+    return corridor if isinstance(corridor, dict) else {}
+
+
+def render_before_after(summary: pd.DataFrame) -> None:
+    rows = before_after_rows(summary)
+    if not rows:
+        if "flowmind" in set(summary.get("mode", pd.Series(dtype=str)).astype(str)):
+            st.info(
+                "Для фінального «було → стало» потрібен fixed-прогін із тим самим "
+                "seed. `run_demo.py` тепер збирає його автоматично."
+            )
+        return
+
+    st.subheader("🏁 Було → стало: Fixed проти FlowMind")
+    st.caption(
+        "Один сценарій, тривалість і seed. Позитивний відсоток означає "
+        "покращення FlowMind."
+    )
+    columns = st.columns(len(rows))
+    for column, row in zip(columns, rows, strict=True):
+        improvement = row["improvement"]
+        delta = (
+            (
+                f"{float(improvement):+.1f}% покращення"
+                if float(improvement) >= 0
+                else f"{float(improvement):.1f}% погіршення"
+            )
+            if improvement is not None
+            else None
+        )
+        column.metric(
+            str(row["label"]),
+            (
+                f"{format_number(row['before'], str(row['suffix']))} → "
+                f"{format_number(row['after'], str(row['suffix']))}"
+            ),
+            delta=delta,
+        )
+
+
+def traffic_strip_html(
+    snapshot: dict[str, float],
+    max_queue: float,
+    accent: str,
+) -> str:
+    queue = max(int(round(snapshot.get("queue_length", 0.0))), 0)
+    active = max(int(round(snapshot.get("active_vehicles", 0.0))), 0)
+    stopped_icons = "🚗" * min(queue, 12)
+    moving_icons = "▸" * min(max(active - queue, 0), 12)
+    load = min(queue / max(max_queue, 1.0), 1.0)
+    return (
+        f'<div style="background:#111827;border:2px solid {accent};'
+        'border-radius:12px;padding:14px;margin:8px 0 14px 0;">'
+        '<div style="height:7px;background:#374151;border-radius:4px;">'
+        f'<div style="height:7px;width:{load * 100:.1f}%;background:{accent};'
+        'border-radius:4px;"></div></div>'
+        '<div style="font-size:23px;letter-spacing:2px;min-height:36px;'
+        f'margin-top:10px;">{stopped_icons or "·"} '
+        f'<span style="color:{accent}">{moving_icons}</span></div>'
+        f'<div style="color:#d1d5db;font-size:13px;">{queue} авто в черзі · '
+        f'{active} авто в зоні</div></div>'
+    )
+
+
+def render_comparison_panel(
+    title: str,
+    subtitle: str,
+    snapshot: dict[str, float],
+    max_queue: float,
+    accent: str,
+) -> None:
+    st.markdown(f"### {title}")
+    st.caption(subtitle)
+    st.markdown(
+        traffic_strip_html(snapshot, max_queue, accent),
+        unsafe_allow_html=True,
+    )
+    first = st.columns(2)
+    first[0].metric(
+        "Черга зараз",
+        format_number(snapshot.get("queue_length"), " авто", 0),
+    )
+    first[1].metric(
+        "Очікування",
+        format_number(snapshot.get("waiting_time"), " с", 1),
+    )
+    second = st.columns(3)
+    second[0].metric(
+        "Швидкість",
+        format_number(snapshot.get("mean_speed", 0.0) * 3.6, " км/год", 1),
+    )
+    second[1].metric(
+        "Проїхали",
+        format_number(snapshot.get("throughput"), " авто", 0),
+    )
+    second[2].metric(
+        "Зупинки",
+        format_number(snapshot.get("stops_count"), "", 0),
+    )
+
+
+def render_visual_comparison(result_dir: Path) -> None:
+    fixed = load_timeseries(result_dir, "fixed")
+    flowmind = load_timeseries(result_dir, "flowmind")
+    if fixed is None or flowmind is None or fixed.empty or flowmind.empty:
+        return
+    fixed_times = pd.to_numeric(fixed["time"], errors="coerce").dropna()
+    flowmind_times = pd.to_numeric(flowmind["time"], errors="coerce").dropna()
+    if fixed_times.empty or flowmind_times.empty:
+        return
+
+    start_time = max(float(fixed_times.min()), float(flowmind_times.min()))
+    end_time = min(float(fixed_times.max()), float(flowmind_times.max()))
+    if end_time < start_time:
+        return
+    intervals = fixed_times.sort_values().diff().dropna()
+    step = float(intervals.median()) if not intervals.empty else 1.0
+
+    st.subheader("🚦 Наочне порівняння: звичайний світлофор vs FlowMind")
+    st.caption(
+        "Перетягніть час: обидві панелі показують той самий момент двох "
+        "прогонів з однаковим сценарієм."
+    )
+    selected_time = (
+        st.slider(
+            "Момент симуляції",
+            min_value=start_time,
+            max_value=end_time,
+            value=end_time,
+            step=max(step, 1.0),
+            format="%.0f с",
+            key=f"visual-comparison-time::{result_dir.resolve()}",
+        )
+        if end_time > start_time
+        else end_time
+    )
+    comparison = visual_comparison_data(fixed, flowmind, selected_time)
+    if not comparison:
+        return
+    fixed_snapshot = comparison.get("fixed")
+    flowmind_snapshot = comparison.get("flowmind")
+    if not isinstance(fixed_snapshot, dict) or not isinstance(
+        flowmind_snapshot, dict
+    ):
+        return
+
+    left, right = st.columns(2, gap="large")
+    with left:
+        render_comparison_panel(
+            "🔴 Звичайний світлофор",
+            "Працює за наперед заданою програмою та не бачить стан усієї зони.",
+            fixed_snapshot,
+            float(comparison["max_queue"]),
+            "#ef4444",
+        )
+    with right:
+        render_comparison_panel(
+            "🟢 FlowMind",
+            "Аналізує черги сусідніх перехресть і адаптує безпечні фази.",
+            flowmind_snapshot,
+            float(comparison["max_queue"]),
+            "#10b981",
+        )
+
+    queue_difference = float(comparison["queue_difference"])
+    waiting_difference = float(comparison["waiting_difference"])
+    throughput_difference = float(comparison["throughput_difference"])
+    if queue_difference >= 0 and waiting_difference >= 0:
+        st.success(
+            f"На {float(comparison['time']):.0f}-й секунді FlowMind має "
+            f"на {queue_difference:.0f} авто меншу чергу та скорочує "
+            f"поточне середнє очікування на {waiting_difference:.1f} с. "
+            f"Додатково завершили маршрут: {throughput_difference:+.0f} авто."
+        )
+    else:
+        st.warning(
+            f"На {float(comparison['time']):.0f}-й секунді локальний стан "
+            "FlowMind ще не кращий за fixed. Оцінюйте також фінальні KPI: "
+            "контролер може тимчасово накопичити чергу, щоб розвантажити "
+            "сусідні перехрестя."
+        )
+
+
+def render_completed_run_charts(payload: dict[str, object] | None) -> None:
+    if not isinstance(payload, dict) or simulation_status(payload) != "completed":
+        return
+    history = live_history_frame(payload)
+    if history.empty or "time" not in history.columns:
+        return
+
+    st.subheader("Графіки завершеної симуляції")
+    left, right = st.columns(2)
+    flow_columns = [
+        column
+        for column in ["departed", "arrived", "active_vehicles"]
+        if column in history.columns
+    ]
+    if flow_columns:
+        flow_chart = px.line(
+            history,
+            x="time",
+            y=flow_columns,
+            labels={
+                "time": "Час симуляції, с",
+                "value": "Автомобілі",
+                "variable": "Показник",
+            },
+            title="Потік машин через контрольовану зону",
+        )
+        left.plotly_chart(flow_chart, width="stretch")
+
+    operation_columns = [
+        column
+        for column in ["queue_length", "waiting_time", "mean_speed"]
+        if column in history.columns
+    ]
+    if operation_columns:
+        operation_chart = px.line(
+            history,
+            x="time",
+            y=operation_columns,
+            labels={
+                "time": "Час симуляції, с",
+                "value": "Значення",
+                "variable": "Показник",
+            },
+            title="Черга, очікування та швидкість",
+        )
+        right.plotly_chart(operation_chart, width="stretch")
+
+
+@st.fragment(run_every=LIVE_REFRESH_INTERVAL)
+def render_live_dashboard(result_dir: Path) -> None:
+    client: LiveSocketClient = st.session_state.live_socket_client
+    socket_payload = client.latest()
+    file_payload = load_live_status(result_dir)
+    live_status = (
+        socket_payload
+        if isinstance(socket_payload, dict)
+        and socket_payload
+        and socket_payload_matches(socket_payload, result_dir)
+        else file_payload
+    )
+
+    st.subheader("1. 📡 Live-стан симуляції")
+    connection = client.status
+    age = payload_age_seconds(live_status) if isinstance(live_status, dict) else None
+    if connection.get("connected"):
+        delay = f", затримка {age:.1f} с" if age is not None else ""
+        st.success(f"WebSocket підключено{delay}. Оновлення інтерфейсу: 1 с.")
+    elif live_status is not None:
+        reason = connection.get("last_error") or "очікування з’єднання"
+        st.warning(f"WebSocket не підключено ({reason}); показано останній JSON snapshot.")
+    else:
+        st.info(
+            "Очікую live-дані. Запустіть симуляцію; дашборд підключиться до "
+            f"`{st.session_state.get('live_socket_url', 'ws://127.0.0.1:8765')}` "
+            "автоматично."
+        )
+        return
+
+    assert isinstance(live_status, dict)
+    flow_value = live_status.get("traffic_flow", {})
+    traffic_flow = flow_value if isinstance(flow_value, dict) else {}
+    status = simulation_status(live_status)
+    active = status in {"starting", "running"}
+    state_key = f"live_active::{result_dir.resolve()}"
+    was_active = bool(st.session_state.get(state_key, False))
+    st.session_state[state_key] = active
+    if was_active and status == "completed":
+        st.rerun()
+
+    averages = live_average_metrics(live_status)
+    live_cols = st.columns(4)
+    live_cols[0].metric(
+        "Середньо авто в зоні",
+        format_number(averages["active_vehicles"], "", 1),
+    )
+    live_cols[1].metric(
+        "Середній вхідний потік",
+        format_number(averages["inflow_per_minute"], " авто/хв", 1),
+    )
+    live_cols[2].metric(
+        "Середній вихідний потік",
+        format_number(averages["outflow_per_minute"], " авто/хв", 1),
+    )
+    live_cols[3].metric(
+        "Середня черга",
+        format_number(averages["queue_length"], " авто", 1),
+    )
+
+    quality_cols = st.columns(3)
+    quality_cols[0].metric(
+        "Середнє очікування",
+        format_number(averages["waiting_time"], " с", 1),
+    )
+    quality_cols[1].metric(
+        "Середня швидкість",
+        format_number(averages["mean_speed"], " м/с", 1),
+    )
+    quality_cols[2].metric(
+        "Середній gridlock risk",
+        format_number(averages["gridlock_risk"], "", 3),
+    )
+
+    st.caption(
+        f"Статус: **{status}** · час симуляції: "
+        f"**{format_number(live_status.get('simulated_time'), ' с', 0)}** · "
+        f"виїхало: **{format_number(traffic_flow.get('departed_total'), '', 0)}** · "
+        f"завершили маршрут: "
+        f"**{format_number(traffic_flow.get('arrived_total'), '', 0)}**"
+    )
+
+    corridor = corridor_status(live_status)
+    corridor_state = str(corridor.get("corridor_state", "DISABLED")).upper()
+    active_tls = corridor.get("corridor_active_tls")
+    completed_tls = corridor.get("corridor_completed_tls", ())
+    completed_count = (
+        len(completed_tls)
+        if isinstance(completed_tls, (list, tuple))
+        else 0
+    )
+    if corridor_state == "GREEN_WINDOW":
+        st.success(
+            "🟢 **ЗЕЛЕНИЙ КОРИДОР АКТИВНИЙ** · "
+            f"пріоритет на перехресті `{active_tls or '—'}` · "
+            f"вже пройдено: {completed_count}"
+        )
+    elif corridor_state == "PREPARE":
+        st.warning(
+            "🟡 **ПІДГОТОВКА КОРИДОРУ** · "
+            f"FlowMind готує зелений на `{active_tls or '—'}`"
+        )
+    elif corridor_state in {"CLEARANCE", "RECOVERY"}:
+        st.info(
+            "🔵 **ВІДНОВЛЕННЯ РУХУ** · "
+            f"коридор завершив пріоритет, пройдено перехресть: {completed_count}"
+        )
+
+    intersections_value = live_status.get("intersections", [])
+    intersections = (
+        [item for item in intersections_value if isinstance(item, dict)]
+        if isinstance(intersections_value, list)
+        else []
+    )
+    if intersections:
+        intersection_frame = pd.DataFrame(intersections)
+        signals = intersection_frame.get("signal", pd.Series(dtype=str)).value_counts()
+        mean_queue = pd.to_numeric(
+            intersection_frame.get("incoming_queue", pd.Series(dtype=float)),
+            errors="coerce",
+        ).mean()
+        mean_occupancy = pd.to_numeric(
+            intersection_frame.get("outgoing_occupancy", pd.Series(dtype=float)),
+            errors="coerce",
+        ).mean()
+        st.markdown(
+            "#### Світлофори\n"
+            f"Зелених: **{int(signals.get('green', 0))}**, "
+            f"жовтих: **{int(signals.get('yellow', 0))}**, "
+            f"червоних: **{int(signals.get('red', 0))}**. "
+            f"Середня черга на перехрестя: **{format_number(mean_queue, ' авто', 1)}**, "
+            f"середня вихідна зайнятість: "
+            f"**{format_number(mean_occupancy * 100, '%', 1)}**."
+        )
+        with st.expander("Текстовий стан кожного світлофора"):
+            for item in intersections:
+                st.write(
+                    f"`{item.get('tls_id', '—')}` — {item.get('signal', 'unknown')}, "
+                    f"фаза {item.get('phase', '—')}, "
+                    f"черга {item.get('incoming_queue', 0)}, "
+                    f"авто на вході {item.get('incoming_vehicles', 0)}"
+                )
+
+    system_rows = live_system_rows(live_status)
+    if system_rows:
+        st.markdown("#### Як працюють компоненти системи")
+        for row in system_rows:
+            st.write(
+                f"**{row['Компонент']}** — {row['Стан']}. {row['Деталі']}"
+            )
+
+    decisions = decision_log_rows(live_status)
+    if decisions:
+        st.markdown("#### 🧠 Що FlowMind робить зараз")
+        icons = {
+            "system": "⚙️",
+            "route": "🗺️",
+            "controller": "🚦",
+            "corridor": "🚑",
+        }
+        for event in reversed(decisions[-7:]):
+            category = str(event.get("category", "system"))
+            st.markdown(
+                f"{icons.get(category, '•')} "
+                f"**{format_number(event.get('time'), ' с', 0)} — "
+                f"{event.get('title', 'Рішення')}**  \n"
+                f"{event.get('detail', '')}"
+            )
+
+    emergency_trace = live_status.get("emergency_trace")
+    if isinstance(emergency_trace, list) and emergency_trace:
+        latest_emergency = emergency_trace[-1]
+        if isinstance(latest_emergency, dict):
+            st.write(
+                "**Швидка:** "
+                f"ребро `{latest_emergency.get('edge_id', '—')}`, "
+                f"швидкість {format_number(latest_emergency.get('speed'), ' м/с', 1)}, "
+                f"залишилось ребер: {latest_emergency.get('remaining_edges', '—')}."
+            )
 
 
 st.title("🚦 FlowMind Dashboard")
@@ -305,21 +993,13 @@ st.caption(
     "порівняння режимів і контроль швидкої допомоги."
 )
 
-try:
-    st.autorefresh(interval=2000, limit=None)
-except Exception:
-    pass
-
 result_sets = _cached_result_sets(RESULTS_DIR)
 if not result_sets and RESULTS_DIR != PROJECT_RESULTS_DIR:
-    result_sets = _cached_result_sets(PROJECT_RESULTS_DIR)
-
+    # Keep the explicitly requested directory selectable even when Streamlit
+    # starts a moment before SUMO creates its first live snapshot.
+    result_sets = [RESULTS_DIR.resolve()]
 if not result_sets:
-    st.info(
-        "Результатів ще немає. Запустіть порівняння, наприклад: "
-        "`python experiments/run_comparison.py --duration 900`"
-    )
-    st.stop()
+    result_sets = [PROJECT_RESULTS_DIR.resolve()]
 
 labels = [display_path(path) for path in result_sets]
 default_index = 0
@@ -340,57 +1020,47 @@ with st.sidebar:
     st.caption(f"Папка: `{display_path(result_dir)}`")
 
 summary = load_summary(result_dir)
-live_status = load_live_status(result_dir)
-
-if "live_socket_client" not in st.session_state:
+live_ws_url = os.environ.get("FLOWMIND_LIVE_WS", "ws://127.0.0.1:8765")
+if (
+    "live_socket_client" not in st.session_state
+    or st.session_state.get("live_socket_url") != live_ws_url
+):
+    previous_client = st.session_state.get("live_socket_client")
+    if previous_client is not None:
+        previous_client.stop()
     st.session_state.live_socket_client = LiveSocketClient(
-        os.environ.get("FLOWMIND_LIVE_WS", "ws://127.0.0.1:8765")
+        live_ws_url
     )
+    st.session_state.live_socket_url = live_ws_url
     st.session_state.live_socket_client.start()
 
-socket_message = st.session_state.live_socket_client.latest()
-if isinstance(socket_message, dict) and socket_message:
-    live_status = socket_message
+render_live_dashboard(result_dir)
 
-if live_status is not None:
-    st.subheader("1. 📡 Live SUMO feed")
-    live_summary = dict(live_status.get("summary", {}))
-    live_cols = st.columns(5)
-    live_cols[0].metric(
-        "Час симуляції",
-        format_number(live_status.get("simulated_time"), " с", 0),
+page_live_status = load_live_status(result_dir)
+page_simulation_status = simulation_status(page_live_status)
+if page_simulation_status in {"starting", "running"}:
+    st.info(
+        "Симуляція виконується. Під час live-режиму показуються тільки "
+        "усереднені та текстові значення. Графіки з’являться після завершення."
     )
-    live_cols[1].metric(
-        "Активних авто",
-        format_number(live_summary.get("peak_active_vehicles"), "", 0),
+    st.stop()
+if page_simulation_status == "failed":
+    system = page_live_status.get("system", {}) if page_live_status else {}
+    simulation = system.get("simulation", {}) if isinstance(system, dict) else {}
+    error = simulation.get("error", "невідома помилка") if isinstance(simulation, dict) else "невідома помилка"
+    st.error(f"Симуляція завершилась з помилкою: {error}")
+    st.stop()
+
+if summary.empty:
+    st.info(
+        "Фінальний `summary.csv` з’явиться після завершення симуляції. "
+        "Live-панель вище продовжує оновлюватися щосекунди."
     )
-    live_cols[2].metric(
-        "Черга",
-        format_number(live_summary.get("average_queue_length"), "", 1),
-    )
-    live_cols[3].metric(
-        "Очікування",
-        format_number(live_summary.get("average_waiting_time"), " с", 1),
-    )
-    live_cols[4].metric(
-        "Throughput",
-        format_number(live_summary.get("throughput"), "", 0),
-    )
-    latest_sample = live_status.get("latest_sample")
-    if isinstance(latest_sample, dict) and latest_sample:
-        st.dataframe(pd.DataFrame([latest_sample]), width="stretch", hide_index=True)
-    emergency_trace = live_status.get("emergency_trace")
-    if isinstance(emergency_trace, list) and emergency_trace:
-        trace_frame = pd.DataFrame(emergency_trace)
-        if not trace_frame.empty:
-            st.caption("Останні точки треку швидкої")
-            st.dataframe(
-                trace_frame[["time", "edge_id", "speed", "remaining_edges"]],
-                width="stretch",
-                hide_index=True,
-            )
-else:
-    st.info("Поки що немає live-даних. Запустіть симуляцію SUMO, і dashboard автоматично підхопить live_status.json.")
+    st.stop()
+
+render_before_after(summary)
+render_visual_comparison(result_dir)
+render_completed_run_charts(page_live_status)
 
 st.subheader("2. Стан симуляції")
 status_columns = st.columns(5)
@@ -413,7 +1083,102 @@ if "tls_ids" in summary.columns and not summary.empty:
         tls_ids = str(summary.iloc[0].get("tls_ids", "")).split(",")
         st.write("\n".join(f"- `{tls_id}`" for tls_id in tls_ids if tls_id))
 
-st.subheader("2. Головні KPI режимів")
+st.subheader("2. ML-прогноз черг")
+if "queue_forecast_enabled" not in summary.columns:
+    st.info("У цьому наборі результатів ще немає ML forecast-полів.")
+else:
+    forecast_summary = summary.copy()
+    forecast_summary["forecast_enabled"] = forecast_summary[
+        "queue_forecast_enabled"
+    ].map(truthy)
+    enabled_rows = forecast_summary[forecast_summary["forecast_enabled"]]
+
+    forecast_columns = st.columns(5)
+    forecast_columns[0].metric("ML увімкнено", "так" if not enabled_rows.empty else "ні")
+    forecast_columns[1].metric(
+        "Моделей",
+        format_number(
+            enabled_rows["queue_forecast_model_count"].max()
+            if "queue_forecast_model_count" in enabled_rows
+            else None,
+            "",
+            0,
+        ),
+    )
+    horizons = (
+        str(enabled_rows.iloc[0].get("queue_forecast_horizons", ""))
+        if not enabled_rows.empty
+        else ""
+    )
+    forecast_columns[2].metric("Горизонти", horizons or "—")
+    forecast_columns[3].metric(
+        "Прогнозів",
+        format_number(
+            enabled_rows["queue_forecast_predictions"].sum()
+            if "queue_forecast_predictions" in enabled_rows
+            else None,
+            "",
+            0,
+        ),
+    )
+    forecast_columns[4].metric(
+        "Failures",
+        format_number(
+            enabled_rows["queue_forecast_failures"].sum()
+            if "queue_forecast_failures" in enabled_rows
+            else None,
+            "",
+            0,
+        ),
+    )
+
+    visible_forecast_columns = [
+        "label",
+        "queue_forecast_enabled",
+        "queue_forecast_model_count",
+        "queue_forecast_horizons",
+        "queue_forecast_horizon_weights",
+        "queue_forecast_predictions",
+        "queue_forecast_failures",
+        "queue_forecast_trace_samples",
+    ]
+    visible_forecast_columns = [
+        column for column in visible_forecast_columns if column in forecast_summary.columns
+    ]
+    if visible_forecast_columns:
+        st.dataframe(
+            forecast_summary[visible_forecast_columns],
+            width="stretch",
+            hide_index=True,
+        )
+
+    forecast_traces = [
+        trace
+        for mode in summary["mode"].astype(str)
+        if (trace := load_queue_forecast_trace(result_dir, mode)) is not None
+    ]
+    if forecast_traces:
+        forecast_trace = pd.concat(forecast_traces, ignore_index=True)
+        forecast_chart = px.line(
+            forecast_trace,
+            x="time",
+            y=["mean_prediction", "max_prediction"],
+            color="tls_id",
+            labels={
+                "time": "Час симуляції, с",
+                "value": "Прогнозована черга, авто",
+                "variable": "Показник",
+                "tls_id": "Світлофор",
+            },
+            title="Динаміка ML-прогнозу черги по світлофорах",
+        )
+        st.plotly_chart(forecast_chart, width="stretch")
+    else:
+        st.caption(
+            "Forecast trace зʼявиться після запуску FlowMind з увімкненим ML-прогнозом."
+        )
+
+st.subheader("3. Головні KPI режимів")
 kpi_metrics = [
     ("average_travel_time", "с"),
     ("average_waiting_time", "с"),
@@ -456,7 +1221,7 @@ st.dataframe(
 )
 st.caption(f"Дельти рахуються відносно режиму: {MODE_LABELS.get(str(baseline_mode), baseline_mode)}.")
 
-st.subheader("3. Порівняння метрик")
+st.subheader("4. Порівняння метрик")
 available_fields = [field for field in METRIC_LABELS if field in summary.columns]
 selected_metric = st.selectbox(
     "Метрика на графіку",
@@ -481,7 +1246,7 @@ timeseries_frames = [
     if (frame := load_timeseries(result_dir, mode)) is not None
 ]
 if timeseries_frames:
-    st.subheader("4. Динаміка по часу")
+    st.subheader("5. Динаміка по часу")
     timeseries_all = pd.concat(timeseries_frames, ignore_index=True)
     dynamic_candidates = [
         field
@@ -520,7 +1285,7 @@ if timeseries_frames:
         dynamic_chart.update_yaxes(matches=None)
         st.plotly_chart(dynamic_chart, width="stretch")
 
-st.subheader("5. 🚑 Екстрені служби / швидка допомога")
+st.subheader("6. 🚑 Екстрені служби / швидка допомога")
 selected_emergency = emergency_runs_for_result(result_dir, summary)
 all_emergency = load_all_emergency_runs(discover_result_sets(PROJECT_RESULTS_DIR))
 

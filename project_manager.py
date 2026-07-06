@@ -19,6 +19,29 @@ SIMULATION_ROOT = PROJECT_ROOT / "simulation"
 DEFAULT_SCENARIO_NAME = "rivne_area"
 SCENARIO_DIR = SIMULATION_ROOT / DEFAULT_SCENARIO_NAME
 DEFAULT_RESULTS = PROJECT_ROOT / "results"
+FORECAST_PRESET_ENSEMBLE = "30/60/90 ensemble"
+FORECAST_PRESET_30 = "Тільки 30s"
+FORECAST_PRESET_60 = "Тільки 60s"
+FORECAST_PRESET_90 = "Тільки 90s"
+FORECAST_PRESET_CUSTOM = "Власні моделі"
+
+QUEUE_MODEL_PRESETS = {
+    FORECAST_PRESET_ENSEMBLE: (
+        PROJECT_ROOT / "models" / "queue_lgbm_30s_current.joblib",
+        PROJECT_ROOT / "models" / "queue_lgbm_60s_current.joblib",
+        PROJECT_ROOT / "models" / "queue_lgbm_90s_current.joblib",
+    ),
+    FORECAST_PRESET_30: (
+        PROJECT_ROOT / "models" / "queue_lgbm_30s_current.joblib",
+    ),
+    FORECAST_PRESET_60: (
+        PROJECT_ROOT / "models" / "queue_lgbm_60s_current.joblib",
+    ),
+    FORECAST_PRESET_90: (
+        PROJECT_ROOT / "models" / "queue_lgbm_90s_current.joblib",
+    ),
+    FORECAST_PRESET_CUSTOM: (),
+}
 
 MODE_SCRIPTS = {
     "Fixed": PROJECT_ROOT / "experiments" / "run_fixed.py",
@@ -162,6 +185,18 @@ def command_text(command: Sequence[str | os.PathLike[str]]) -> str:
     return subprocess.list2cmdline([os.fspath(part) for part in command])
 
 
+def format_queue_model_paths(paths: Sequence[Path]) -> str:
+    return ";".join(str(path) for path in paths)
+
+
+def parse_queue_model_paths(text: str) -> tuple[Path, ...]:
+    return tuple(
+        Path(part.strip()).expanduser()
+        for part in text.replace("\n", ";").split(";")
+        if part.strip()
+    )
+
+
 def project_environment(python: Path) -> dict[str, str]:
     """Prepare SUMO variables for a child process when eclipse-sumo is installed."""
     environment = os.environ.copy()
@@ -272,6 +307,13 @@ def positive_int(value: str, field: str, minimum: int = 1) -> int:
     return result
 
 
+def network_port(value: str, field: str) -> int:
+    port = positive_int(value, field)
+    if port > 65535:
+        raise ValueError(f'"{field}" має бути в діапазоні 1–65535.')
+    return port
+
+
 def find_free_port(preferred: int, attempts: int = 50) -> int:
     for port in range(preferred, preferred + attempts):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
@@ -297,6 +339,8 @@ def run_gui() -> bool:
             self.python = project_python()
             self.events: queue.Queue[tuple[str, object]] = queue.Queue()
             self.process: subprocess.Popen[str] | None = None
+            self.dashboard_process: subprocess.Popen[bytes] | None = None
+            self.dashboard_context: tuple[Path, int] | None = None
             self.process_lock = threading.Lock()
             self.busy = False
             self.stopping = False
@@ -316,10 +360,19 @@ def run_gui() -> bool:
             self.seed = tk.StringVar(value="42")
             self.zone_size = tk.StringVar(value="6")
             self.gui_enabled = tk.BooleanVar(value=True)
+            self.live_dashboard_enabled = tk.BooleanVar(value=True)
             self.emergency_enabled = tk.BooleanVar(value=False)
+            self.queue_forecast_enabled = tk.BooleanVar(value=True)
+            self.queue_model_preset = tk.StringVar(value=FORECAST_PRESET_ENSEMBLE)
+            self.queue_model_paths = tk.StringVar(
+                value=format_queue_model_paths(
+                    QUEUE_MODEL_PRESETS[FORECAST_PRESET_ENSEMBLE]
+                )
+            )
             self.emergency_depart = tk.StringVar(value="180")
             self.gui_delay = tk.StringVar(value="75")
             self.dashboard_port = tk.StringVar(value="8501")
+            self.websocket_port = tk.StringVar(value="8765")
             self.config_path = tk.StringVar(value=str(self.current_scenario.config_path))
             self.zone_path = tk.StringVar(value=str(self.current_scenario.zone_path))
             self.emergency_config_path = tk.StringVar(
@@ -454,25 +507,74 @@ def run_gui() -> bool:
             ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(8, 0))
             ttk.Checkbutton(
                 parent,
+                text="Live dashboard",
+                variable=self.live_dashboard_enabled,
+            ).grid(row=3, column=2, columnspan=2, sticky="w", pady=(8, 0))
+            self._entry(parent, "WebSocket порт", self.websocket_port, 3, 4)
+
+            ttk.Checkbutton(
+                parent,
                 text="Створити швидку",
                 variable=self.emergency_enabled,
-            ).grid(row=3, column=2, sticky="w", pady=(8, 0))
+            ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 0))
             ttk.Label(parent, text="Виїзд швидкої, с").grid(
-                row=3, column=3, sticky="e", pady=(8, 0)
+                row=4, column=2, sticky="e", pady=(8, 0)
             )
             ttk.Entry(parent, textvariable=self.emergency_depart, width=10).grid(
-                row=3, column=4, sticky="ew", padx=(6, 14), pady=(8, 0)
+                row=4, column=3, sticky="ew", padx=(6, 14), pady=(8, 0)
             )
 
-            self._path_row(parent, "SUMO config", self.config_path, 4, "file")
-            self._path_row(parent, "Конфігурація зони", self.zone_path, 5, "file")
-            self._path_row(
-                parent, "Швидка / emergency", self.emergency_config_path, 6, "file"
+            ttk.Checkbutton(
+                parent,
+                text="ML-прогноз черг",
+                variable=self.queue_forecast_enabled,
+            ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(8, 0))
+            ttk.Label(parent, text="Моделі прогнозу").grid(
+                row=5, column=2, sticky="e", pady=(8, 0)
             )
-            self._path_row(parent, "Результати", self.results_path, 7, "directory")
+            self.queue_model_combobox = ttk.Combobox(
+                parent,
+                textvariable=self.queue_model_preset,
+                values=tuple(QUEUE_MODEL_PRESETS),
+                state="readonly",
+            )
+            self.queue_model_combobox.grid(
+                row=5,
+                column=3,
+                columnspan=2,
+                sticky="ew",
+                padx=(6, 14),
+                pady=(8, 0),
+            )
+            self.queue_model_combobox.bind(
+                "<<ComboboxSelected>>",
+                lambda _event: self.apply_queue_model_preset(),
+            )
+
+            ttk.Label(parent, text="Файли .joblib").grid(row=6, column=0, sticky="w")
+            ttk.Entry(parent, textvariable=self.queue_model_paths).grid(
+                row=6,
+                column=1,
+                columnspan=4,
+                sticky="ew",
+                padx=(6, 8),
+                pady=4,
+            )
+            ttk.Button(
+                parent,
+                text="Обрати…",
+                command=self.choose_queue_models,
+            ).grid(row=6, column=5, sticky="ew")
+
+            self._path_row(parent, "SUMO config", self.config_path, 7, "file")
+            self._path_row(parent, "Конфігурація зони", self.zone_path, 8, "file")
+            self._path_row(
+                parent, "Швидка / emergency", self.emergency_config_path, 9, "file"
+            )
+            self._path_row(parent, "Результати", self.results_path, 10, "directory")
 
             actions = ttk.Frame(parent)
-            actions.grid(row=8, column=0, columnspan=6, sticky="ew", pady=(12, 0))
+            actions.grid(row=11, column=0, columnspan=6, sticky="ew", pady=(12, 0))
             ttk.Button(
                 actions, text="Запустити режим", command=self.run_experiment
             ).pack(side="left", padx=(0, 7))
@@ -483,7 +585,13 @@ def run_gui() -> bool:
                 actions, text="Demo зі швидкою", command=self.run_demo
             ).pack(side="left", padx=7)
             ttk.Button(
+                actions, text="Demo прогнозу", command=self.run_prediction_demo
+            ).pack(side="left", padx=7)
+            ttk.Button(
                 actions, text="Відкрити dashboard", command=self.run_dashboard
+            ).pack(side="left", padx=7)
+            ttk.Button(
+                actions, text="Закрити dashboard", command=self.close_dashboard
             ).pack(side="left", padx=7)
 
         def _build_tools_tab(self, parent: ttk.Frame) -> None:
@@ -601,6 +709,26 @@ def run_gui() -> bool:
                 f"\n[manager] Обрано карту: {profile.directory}\n"
             )
 
+        def apply_queue_model_preset(self) -> None:
+            preset = self.queue_model_preset.get()
+            if preset == FORECAST_PRESET_CUSTOM:
+                return
+            self.queue_model_paths.set(
+                format_queue_model_paths(QUEUE_MODEL_PRESETS.get(preset, ()))
+            )
+
+        def choose_queue_models(self) -> None:
+            selected = filedialog.askopenfilenames(
+                initialdir=PROJECT_ROOT / "models",
+                filetypes=(("Joblib models", "*.joblib"), ("All files", "*")),
+            )
+            if not selected:
+                return
+            self.queue_model_preset.set(FORECAST_PRESET_CUSTOM)
+            self.queue_model_paths.set(
+                format_queue_model_paths(tuple(Path(path) for path in selected))
+            )
+
         @staticmethod
         def _scenario_directory_from_config(config: Path) -> Path:
             return config.expanduser().resolve().parent
@@ -711,7 +839,7 @@ def run_gui() -> bool:
                 positive_int(self.seed.get(), "Seed", 0),
                 positive_int(self.zone_size.get(), "Розмір зони"),
                 positive_int(self.gui_delay.get(), "GUI delay", 0),
-                positive_int(self.dashboard_port.get(), "Порт dashboard"),
+                network_port(self.dashboard_port.get(), "Порт dashboard"),
             )
 
         def _experiment_paths(self) -> list[str]:
@@ -728,11 +856,27 @@ def run_gui() -> bool:
                 str(zone),
                 "--results-dir",
                 str(Path(self.results_path.get()).expanduser()),
+                "--websocket-port",
+                str(network_port(self.websocket_port.get(), "WebSocket порт")),
             ]
+
+        def _queue_model_args(self) -> list[str]:
+            if not self.queue_forecast_enabled.get():
+                return ["--no-queue-model"]
+            paths = parse_queue_model_paths(self.queue_model_paths.get())
+            if not paths:
+                return []
+            missing = [path for path in paths if not path.is_file()]
+            if missing:
+                raise ValueError(
+                    "Не знайдено ML-модель прогнозу:\n"
+                    + "\n".join(str(path) for path in missing)
+                )
+            return ["--queue-model", *(str(path) for path in paths)]
 
         def run_experiment(self) -> None:
             try:
-                duration, seed, zone_size, gui_delay, _ = self._common_values()
+                duration, seed, zone_size, gui_delay, port = self._common_values()
                 command = [
                     str(self.python),
                     "-u",
@@ -746,6 +890,7 @@ def run_gui() -> bool:
                     "--gui-delay",
                     str(gui_delay),
                     *self._experiment_paths(),
+                    *self._queue_model_args(),
                 ]
                 if self.gui_enabled.get():
                     command.append("--gui")
@@ -766,13 +911,14 @@ def run_gui() -> bool:
                             str(depart),
                         ]
                     )
+                self._ensure_live_dashboard(port)
                 self.start_process(command, f"Режим {self.mode.get()}")
             except ValueError as error:
                 messagebox.showerror("Некоректні параметри", str(error))
 
         def run_comparison(self) -> None:
             try:
-                duration, seed, zone_size, _, _ = self._common_values()
+                duration, seed, zone_size, _, port = self._common_values()
                 command = [
                     str(self.python),
                     "-u",
@@ -784,7 +930,9 @@ def run_gui() -> bool:
                     "--zone-size",
                     str(zone_size),
                     *self._experiment_paths(),
+                    *self._queue_model_args(),
                 ]
+                self._ensure_live_dashboard(port)
                 self.start_process(command, "Порівняння режимів")
             except ValueError as error:
                 messagebox.showerror("Некоректні параметри", str(error))
@@ -815,38 +963,52 @@ def run_gui() -> bool:
                     "--emergency-config",
                     str(self._validate_emergency_config()),
                     *self._experiment_paths(),
+                    *self._queue_model_args(),
                 ]
                 if not self.gui_enabled.get():
                     command.append("--headless")
-                (
-                    dashboard_command,
-                    dashboard_environment,
-                    actual_port,
-                ) = self._dashboard_spec(port)
-                if actual_port != port:
-                    self.dashboard_port.set(str(actual_port))
-                    self._append_log(
-                        f"\n[manager] Порт {port} зайнятий, "
-                        f"після demo відкрию dashboard на {actual_port}.\n"
+                self._ensure_live_dashboard(port)
+                self.start_process(command, "Demo зі швидкою")
+            except ValueError as error:
+                messagebox.showerror("Некоректні параметри", str(error))
+
+        def run_prediction_demo(self) -> None:
+            try:
+                duration, seed, zone_size, _, port = self._common_values()
+                if not self.queue_forecast_enabled.get():
+                    raise ValueError(
+                        "Для demo прогнозу увімкніть “ML-прогноз черг”."
                     )
-                self.start_process(
-                    command,
-                    "Demo зі швидкою",
-                    after_success=(
-                        dashboard_command,
-                        "Dashboard demo",
-                        dashboard_environment,
-                    ),
-                )
+                duration = max(duration, 300)
+                command = [
+                    str(self.python),
+                    "-u",
+                    str(PROJECT_ROOT / "experiments" / "run_comparison.py"),
+                    "--duration",
+                    str(duration),
+                    "--seed",
+                    str(seed),
+                    "--zone-size",
+                    str(zone_size),
+                    *self._experiment_paths(),
+                    *self._queue_model_args(),
+                ]
+                self._ensure_live_dashboard(port)
+                self.start_process(command, "Demo прогнозу")
             except ValueError as error:
                 messagebox.showerror("Некоректні параметри", str(error))
 
         def _dashboard_spec(self, port: int) -> tuple[list[str], dict[str, str], int]:
             actual_port = find_free_port(port)
+            websocket_port = network_port(
+                self.websocket_port.get(),
+                "WebSocket порт",
+            )
             environment = {
                 "FLOWMIND_RESULTS_DIR": str(
                     Path(self.results_path.get()).expanduser().resolve()
-                )
+                ),
+                "FLOWMIND_LIVE_WS": f"ws://127.0.0.1:{websocket_port}",
             }
             command = [
                 str(self.python),
@@ -857,22 +1019,83 @@ def run_gui() -> bool:
                 str(PROJECT_ROOT / "dashboard" / "app.py"),
                 "--server.port",
                 str(actual_port),
+                "--server.headless",
+                "false",
             ]
             return command, environment, actual_port
 
+        def _ensure_live_dashboard(self, port: int) -> None:
+            if self.live_dashboard_enabled.get():
+                self._start_dashboard_background(port)
+
+        def _start_dashboard_background(self, port: int) -> None:
+            results_dir = Path(self.results_path.get()).expanduser().resolve()
+            websocket_port = network_port(
+                self.websocket_port.get(),
+                "WebSocket порт",
+            )
+            context = (results_dir, websocket_port)
+            process = self.dashboard_process
+            if (
+                process is not None
+                and process.poll() is None
+                and self.dashboard_context == context
+            ):
+                self._append_log(
+                    f"\n[manager] Dashboard уже працює: "
+                    f"http://localhost:{self.dashboard_port.get()}\n"
+                )
+                return
+            if process is not None and process.poll() is None:
+                self.close_dashboard()
+
+            command, extra_environment, actual_port = self._dashboard_spec(port)
+            environment = project_environment(self.python)
+            environment.update(extra_environment)
+            popen_options: dict[str, object] = {}
+            if os.name == "nt":
+                popen_options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+            else:
+                popen_options["start_new_session"] = True
+            self.dashboard_process = subprocess.Popen(
+                command,
+                cwd=PROJECT_ROOT,
+                env=environment,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.STDOUT,
+                **popen_options,
+            )
+            self.dashboard_context = context
+            self.dashboard_port.set(str(actual_port))
+            self._append_log(
+                f"\n[manager] Live dashboard: http://localhost:{actual_port} "
+                f"(WebSocket {websocket_port})\n"
+            )
+
         def run_dashboard(self) -> None:
             try:
-                port = positive_int(self.dashboard_port.get(), "Порт dashboard")
-                command, environment, actual_port = self._dashboard_spec(port)
-                if actual_port != port:
-                    self.dashboard_port.set(str(actual_port))
-                    self._append_log(
-                        f"\n[manager] Порт {port} зайнятий, "
-                        f"використовую {actual_port}.\n"
-                    )
-                self.start_process(command, "Dashboard", environment)
-            except ValueError as error:
+                port = network_port(self.dashboard_port.get(), "Порт dashboard")
+                self._start_dashboard_background(port)
+            except (OSError, ValueError) as error:
                 messagebox.showerror("Некоректні параметри", str(error))
+
+        def close_dashboard(self) -> None:
+            process = self.dashboard_process
+            self.dashboard_process = None
+            self.dashboard_context = None
+            if process is None or process.poll() is not None:
+                return
+            try:
+                self._terminate_process_tree(process, force=False)
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                try:
+                    self._terminate_process_tree(process, force=True)
+                except (OSError, ProcessLookupError):
+                    pass
+            except (OSError, ProcessLookupError):
+                pass
+            self._append_log("\n[manager] Dashboard закрито.\n")
 
         def generate_traffic(self) -> None:
             try:
@@ -1148,6 +1371,7 @@ def run_gui() -> bool:
                 return
             if running:
                 self.stop_process()
+            self.close_dashboard()
             self.root.destroy()
 
     try:

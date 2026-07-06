@@ -7,7 +7,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from flowmind.config import PROJECT_ROOT, RunConfig
+from flowmind.config import DEFAULT_QUEUE_MODEL_PATHS, PROJECT_ROOT, RunConfig
 from flowmind.emergency_vehicle import load_emergency_config
 from flowmind.experiment import run_experiment
 
@@ -35,6 +35,7 @@ def build_parser(default_mode: str | None = None) -> argparse.ArgumentParser:
     parser.add_argument("--emergency-from-edge")
     parser.add_argument("--emergency-to-edge")
     parser.add_argument("--gui", action="store_true")
+    parser.add_argument("--websocket-port", type=int, default=8765)
     parser.add_argument(
         "--gui-delay",
         type=int,
@@ -52,6 +53,22 @@ def build_parser(default_mode: str | None = None) -> argparse.ArgumentParser:
         default=PROJECT_ROOT / "simulation" / "rivne_area" / "central_zone.json",
     )
     parser.add_argument("--results-dir", type=Path, default=PROJECT_ROOT / "results")
+    parser.add_argument(
+        "--queue-model",
+        dest="queue_models",
+        type=Path,
+        nargs="+",
+        action="extend",
+        help=(
+            "One or more trained queue forecast models used by flowmind mode. "
+            "Defaults to the 30s/60s/90s current models."
+        ),
+    )
+    parser.add_argument(
+        "--no-queue-model",
+        action="store_true",
+        help="Disable ML queue forecast and run classic FlowMind scoring.",
+    )
     parser.set_defaults(default_mode=default_mode)
     return parser
 
@@ -74,15 +91,23 @@ def main(default_mode: str | None = None) -> None:
             zone_size=args.zone_size,
             gui=args.gui,
             gui_delay_ms=args.gui_delay,
+            websocket_port=args.websocket_port,
             config_path=args.config,
             zone_path=args.zone,
             results_dir=args.results_dir,
             tls_ids=tuple(args.tls),
             priority_vehicle=args.priority_vehicle,
             emergency=emergency,
+            queue_model_paths=selected_queue_model_paths(args),
         )
     )
     print(json.dumps(summary, ensure_ascii=False, indent=2))
+
+
+def selected_queue_model_paths(args: argparse.Namespace) -> tuple[Path, ...]:
+    if args.no_queue_model:
+        return ()
+    return tuple(args.queue_models or DEFAULT_QUEUE_MODEL_PATHS)
 
 
 if __name__ == "__main__":

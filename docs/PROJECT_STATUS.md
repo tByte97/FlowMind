@@ -290,6 +290,8 @@ simulation/new_area/README.md
   `.osm`;
 - `docs/AI_AND_PRESENTATION_ROADMAP.md` — план підключення AI, зеленого
   коридору та підготовки презентації;
+- `docs/ML_TRAINING_GUIDE.md` — збір ML-dataset, тренування LightGBM/XGBoost,
+  контроль регресу та оновлення моделей;
 - `docs/CURRENT_STATUS_AND_TEAM_TASKS.md` — актуальні задачі кожного
   учасника.
 

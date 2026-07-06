@@ -7,6 +7,11 @@ from .emergency_vehicle import EmergencyVehicleConfig
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_QUEUE_MODEL_PATHS = (
+    PROJECT_ROOT / "models" / "queue_lgbm_30s_current.joblib",
+    PROJECT_ROOT / "models" / "queue_lgbm_60s_current.joblib",
+    PROJECT_ROOT / "models" / "queue_lgbm_90s_current.joblib",
+)
 
 
 @dataclass(frozen=True)
@@ -17,6 +22,12 @@ class ControlConfig:
     blocked_occupancy: float = 0.82
     downstream_weight: float = 10.0
     area_pressure_weight: float = 0.35
+    queue_forecast_weight: float = 0.75
+    queue_forecast_horizon_weights: tuple[tuple[int, float], ...] = (
+        (30, 0.50),
+        (60, 0.35),
+        (90, 0.15),
+    )
     hysteresis: float = 1.0
     priority_distance: float = 500.0
     max_priority_override: int = 35
@@ -31,6 +42,7 @@ class RunConfig:
     zone_size: int = 6
     gui: bool = False
     gui_delay_ms: int = 50
+    websocket_port: int = 8765
     config_path: Path = (
         PROJECT_ROOT / "simulation" / "rivne_area" / "focused.sumocfg"
     )
@@ -42,6 +54,8 @@ class RunConfig:
     priority_vehicle: str | None = None
     emergency: EmergencyVehicleConfig | None = None
     control: ControlConfig = field(default_factory=ControlConfig)
+    queue_model_path: Path | None = None
+    queue_model_paths: tuple[Path, ...] = DEFAULT_QUEUE_MODEL_PATHS
     dataset_dir: Path | None = None
     dataset_run_id: str | None = None
     dataset_scenario: str = "rivne_focused"
@@ -57,9 +71,13 @@ class RunConfig:
             raise ValueError("zone_size must be between 1 and 20")
         if self.gui_delay_ms < 0:
             raise ValueError("gui_delay_ms cannot be negative")
+        if not 1 <= self.websocket_port <= 65535:
+            raise ValueError("websocket_port must be between 1 and 65535")
         if self.dataset_sample_interval <= 0:
             raise ValueError("dataset_sample_interval must be positive")
         if any(value <= 0 for value in self.dataset_target_horizons):
             raise ValueError("dataset_target_horizons must be positive")
+        if any(weight < 0 for _horizon, weight in self.control.queue_forecast_horizon_weights):
+            raise ValueError("queue forecast horizon weights cannot be negative")
         if self.emergency is not None and self.emergency.depart_time >= self.duration:
             raise ValueError("Emergency must depart before the simulation ends")

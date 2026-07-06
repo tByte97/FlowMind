@@ -53,12 +53,38 @@ class ProjectManagerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "duration"):
             project_manager.positive_int("abc", "duration")
 
+    def test_network_port_validation(self) -> None:
+        self.assertEqual(project_manager.network_port("8765", "WebSocket"), 8765)
+        with self.assertRaisesRegex(ValueError, "1–65535"):
+            project_manager.network_port("70000", "WebSocket")
+
     def test_command_text_uses_platform_quoting(self) -> None:
         command = ["python", "folder with spaces/script.py", "--duration", "900"]
         self.assertEqual(
             project_manager.command_text(command),
             subprocess.list2cmdline(command),
         )
+
+    def test_queue_model_path_helpers(self) -> None:
+        paths = (
+            Path("models/queue_lgbm_30s_current.joblib"),
+            Path("models/queue_lgbm_60s_current.joblib"),
+        )
+
+        text = project_manager.format_queue_model_paths(paths)
+        parsed = project_manager.parse_queue_model_paths(text)
+
+        self.assertEqual(parsed, paths)
+
+    def test_default_queue_model_preset_has_three_horizons(self) -> None:
+        paths = project_manager.QUEUE_MODEL_PRESETS[
+            project_manager.FORECAST_PRESET_ENSEMBLE
+        ]
+
+        self.assertEqual(len(paths), 3)
+        self.assertIn("30s", paths[0].name)
+        self.assertIn("60s", paths[1].name)
+        self.assertIn("90s", paths[2].name)
 
     def test_scenario_profile_prefers_focused_scenario_files(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

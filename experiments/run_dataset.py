@@ -3,16 +3,18 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import random
 import sys
 import time
 import xml.etree.ElementTree as ET
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from flowmind.config import PROJECT_ROOT, RunConfig
+from flowmind.config import DEFAULT_QUEUE_MODEL_PATHS, PROJECT_ROOT, ControlConfig, RunConfig
 from flowmind.experiment import run_experiment
 
 
@@ -23,6 +25,17 @@ INDEX_COLUMNS = (
     "seed",
     "duration",
     "sample_interval",
+    "decision_interval",
+    "min_green",
+    "max_green",
+    "blocked_occupancy",
+    "downstream_weight",
+    "area_pressure_weight",
+    "queue_forecast_weight",
+    "hysteresis",
+    "priority_distance",
+    "max_priority_override",
+    "clearance_seconds",
     "started_at",
     "finished_at",
     "elapsed_seconds",
@@ -44,8 +57,32 @@ INDEX_COLUMNS = (
     "phase_extensions",
     "phase_advances",
     "priority_decisions",
+    "phase_out_of_range_skips",
+    "clearance_phase_skips",
+    "min_green_skips",
+    "scoreless_skips",
+    "queue_forecast_enabled",
+    "queue_forecast_model",
+    "queue_forecast_target",
+    "queue_forecast_feature_count",
+    "queue_forecast_model_count",
+    "queue_forecast_horizons",
+    "queue_forecast_horizon_weights",
+    "queue_forecast_predictions",
+    "queue_forecast_failures",
+    "queue_forecast_trace_samples",
     "error",
 )
+
+
+@dataclass(frozen=True)
+class DatasetRun:
+    mode: str
+    seed: int
+    duration: int
+    sample_interval: int
+    control: ControlConfig
+    run_index: int | None = None
 
 
 def default_scenario_file(name: str) -> Path:
@@ -87,7 +124,45 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--seed-start", type=int, default=42)
     parser.add_argument("--duration", type=int)
+    parser.add_argument(
+        "--randomize",
+        action="store_true",
+        help=(
+            "Generate random seeds, durations, sample intervals and control "
+            "parameters while keeping the same configured zone."
+        ),
+    )
+    parser.add_argument(
+        "--plan-seed",
+        type=int,
+        default=20260705,
+        help="Seed for the dataset plan generator; use another value for a new plan.",
+    )
+    parser.add_argument("--seed-min", type=int, default=1_000)
+    parser.add_argument("--seed-max", type=int, default=2_000_000_000)
+    parser.add_argument(
+        "--duration-min",
+        type=int,
+        default=600,
+        help="Minimum randomized simulation duration in seconds.",
+    )
+    parser.add_argument(
+        "--duration-max",
+        type=int,
+        default=1800,
+        help="Maximum randomized simulation duration in seconds.",
+    )
     parser.add_argument("--sample-interval", type=int, default=5)
+    parser.add_argument(
+        "--random-sample-intervals",
+        type=int,
+        nargs="+",
+        default=(3, 5, 6, 10),
+        help=(
+            "Allowed sample intervals for --randomize. Each value must divide "
+            "every target horizon."
+        ),
+    )
     parser.add_argument("--scenario-name", default="rivne_focused")
     parser.add_argument(
         "--target-horizons",
@@ -112,6 +187,22 @@ def build_parser() -> argparse.ArgumentParser:
         default=PROJECT_ROOT / "results" / "dataset",
     )
     parser.add_argument(
+        "--queue-model",
+        dest="queue_models",
+        type=Path,
+        nargs="+",
+        action="extend",
+        help=(
+            "One or more trained queue forecast models used by flowmind runs. "
+            "Defaults to the 30s/60s/90s current models."
+        ),
+    )
+    parser.add_argument(
+        "--no-queue-model",
+        action="store_true",
+        help="Disable ML queue forecast for dataset generation.",
+    )
+    parser.add_argument(
         "--resume",
         action="store_true",
         help="Skip runs whose sample CSV already exists.",
@@ -130,8 +221,20 @@ def main() -> None:
         raise ValueError("--runs-per-mode must be positive")
     if args.sample_interval <= 0:
         raise ValueError("--sample-interval must be positive")
+    if args.seed_min <= 0 or args.seed_max <= 0 or args.seed_min > args.seed_max:
+        raise ValueError("--seed-min/--seed-max must be positive and ordered")
 
-    duration = args.duration or infer_duration(args.config)
+    default_duration = args.duration or infer_duration(args.config)
+    if args.duration_min <= 0 or args.duration_max <= 0:
+        raise ValueError("--duration-min/--duration-max must be positive")
+    if args.duration_min > args.duration_max:
+        raise ValueError("--duration-min cannot be greater than --duration-max")
+    if args.randomize:
+        validate_random_sample_intervals(
+            tuple(args.random_sample_intervals),
+            tuple(args.target_horizons),
+        )
+
     output_dir = args.output_dir.resolve()
     samples_dir = output_dir / "samples"
     summaries_dir = output_dir / "summaries"
@@ -140,24 +243,39 @@ def main() -> None:
     samples_dir.mkdir(parents=True, exist_ok=True)
     summaries_dir.mkdir(parents=True, exist_ok=True)
 
-    runs = list(planned_runs(args.modes, args.runs_per_mode, args.seed_start))
+    runs = list(planned_runs(args, default_duration))
     print(
-        f"Dataset plan: {len(runs)} runs, duration={duration}s, "
-        f"sample_interval={args.sample_interval}s"
+        f"Dataset plan: {len(runs)} runs, "
+        f"randomized={'yes' if args.randomize else 'no'}"
     )
+    if args.randomize:
+        durations = [run.duration for run in runs]
+        print(
+            f"Duration range: {min(durations)}..{max(durations)}s, "
+            f"plan_seed={args.plan_seed}"
+        )
+        print(
+            "Sample intervals: "
+            + ", ".join(str(value) for value in sorted({run.sample_interval for run in runs}))
+        )
+    else:
+        print(
+            f"Duration: {default_duration}s, "
+            f"sample_interval={args.sample_interval}s"
+        )
     print(f"Config: {args.config}")
     print(f"Zone:   {args.zone}")
     print(f"Output: {output_dir}")
 
     if args.dry_run:
-        for mode, seed in runs:
-            print(run_id(args.scenario_name, mode, seed))
+        for run in runs:
+            print(describe_run(args.scenario_name, run))
         return
 
     reset_index(index_path, append=args.resume)
     total = len(runs)
-    for number, (mode, seed) in enumerate(runs, start=1):
-        current_run_id = run_id(args.scenario_name, mode, seed)
+    for number, run in enumerate(runs, start=1):
+        current_run_id = run_id(args.scenario_name, run)
         sample_path = samples_dir / f"{current_run_id}.csv"
         summary_dir = summaries_dir / current_run_id
         if args.resume and sample_path.exists():
@@ -170,28 +288,41 @@ def main() -> None:
         failure: Exception | None = None
         row: dict[str, Any] = {
             "run_id": current_run_id,
-            "mode": mode,
+            "mode": run.mode,
             "scenario": args.scenario_name,
-            "seed": seed,
-            "duration": duration,
-            "sample_interval": args.sample_interval,
+            "seed": run.seed,
+            "duration": run.duration,
+            "sample_interval": run.sample_interval,
+            "decision_interval": run.control.decision_interval,
+            "min_green": run.control.min_green,
+            "max_green": run.control.max_green,
+            "blocked_occupancy": run.control.blocked_occupancy,
+            "downstream_weight": run.control.downstream_weight,
+            "area_pressure_weight": run.control.area_pressure_weight,
+            "queue_forecast_weight": run.control.queue_forecast_weight,
+            "hysteresis": run.control.hysteresis,
+            "priority_distance": run.control.priority_distance,
+            "max_priority_override": run.control.max_priority_override,
+            "clearance_seconds": run.control.clearance_seconds,
             "started_at": started_at,
             "summary_dir": str(summary_dir),
         }
         try:
             summary = run_experiment(
                 RunConfig(
-                    mode=mode,
-                    duration=duration,
-                    seed=seed,
+                    mode=run.mode,
+                    duration=run.duration,
+                    seed=run.seed,
                     gui=False,
                     config_path=args.config,
                     zone_path=args.zone,
                     results_dir=summary_dir,
+                    control=run.control,
+                    queue_model_paths=selected_queue_model_paths(args),
                     dataset_dir=samples_dir,
                     dataset_run_id=current_run_id,
                     dataset_scenario=args.scenario_name,
-                    dataset_sample_interval=args.sample_interval,
+                    dataset_sample_interval=run.sample_interval,
                     dataset_target_horizons=tuple(args.target_horizons),
                 )
             )
@@ -220,19 +351,130 @@ def main() -> None:
 
 
 def planned_runs(
-    modes: tuple[str, ...] | list[str],
-    runs_per_mode: int,
-    seed_start: int,
-) -> tuple[tuple[str, int], ...]:
+    args: argparse.Namespace,
+    default_duration: int,
+) -> tuple[DatasetRun, ...]:
+    if args.randomize:
+        return randomized_runs(args)
+
     return tuple(
-        (mode, seed_start + offset)
-        for mode in modes
-        for offset in range(runs_per_mode)
+        DatasetRun(
+            mode=mode,
+            seed=args.seed_start + offset,
+            duration=default_duration,
+            sample_interval=args.sample_interval,
+            control=ControlConfig(),
+        )
+        for mode in args.modes
+        for offset in range(args.runs_per_mode)
     )
 
 
-def run_id(scenario: str, mode: str, seed: int) -> str:
-    return f"{scenario}_{mode}_seed_{seed:05d}"
+def selected_queue_model_paths(args: argparse.Namespace) -> tuple[Path, ...]:
+    if args.no_queue_model:
+        return ()
+    return tuple(args.queue_models or DEFAULT_QUEUE_MODEL_PATHS)
+
+
+def randomized_runs(args: argparse.Namespace) -> tuple[DatasetRun, ...]:
+    rng = random.Random(args.plan_seed)
+    used_seeds: set[int] = set()
+    runs: list[DatasetRun] = []
+
+    for mode in args.modes:
+        for offset in range(args.runs_per_mode):
+            seed = unique_random_seed(rng, args.seed_min, args.seed_max, used_seeds)
+            control = random_control_config(rng)
+            runs.append(
+                DatasetRun(
+                    mode=mode,
+                    seed=seed,
+                    duration=rng.randint(args.duration_min, args.duration_max),
+                    sample_interval=rng.choice(tuple(args.random_sample_intervals)),
+                    control=control,
+                    run_index=offset + 1,
+                )
+            )
+
+    rng.shuffle(runs)
+    return tuple(runs)
+
+
+def unique_random_seed(
+    rng: random.Random,
+    minimum: int,
+    maximum: int,
+    used: set[int],
+) -> int:
+    if len(used) >= maximum - minimum + 1:
+        raise ValueError("Random seed range is too small for the requested runs")
+    while True:
+        seed = rng.randint(minimum, maximum)
+        if seed not in used:
+            used.add(seed)
+            return seed
+
+
+def random_control_config(rng: random.Random) -> ControlConfig:
+    min_green = rng.randint(8, 16)
+    max_green = rng.randint(max(min_green + 15, 30), 65)
+    return ControlConfig(
+        decision_interval=rng.choice((2, 3, 4, 5)),
+        min_green=min_green,
+        max_green=max_green,
+        blocked_occupancy=round(rng.uniform(0.72, 0.90), 3),
+        downstream_weight=round(rng.uniform(6.0, 15.0), 3),
+        area_pressure_weight=round(rng.uniform(0.15, 0.65), 3),
+        queue_forecast_weight=round(rng.uniform(0.35, 1.25), 3),
+        hysteresis=round(rng.uniform(0.4, 2.5), 3),
+        priority_distance=round(rng.uniform(350.0, 700.0), 3),
+        max_priority_override=rng.randint(25, 50),
+        clearance_seconds=rng.randint(3, 8),
+    )
+
+
+def validate_random_sample_intervals(
+    sample_intervals: tuple[int, ...],
+    target_horizons: tuple[int, ...],
+) -> None:
+    if not sample_intervals:
+        raise ValueError("--random-sample-intervals cannot be empty")
+    invalid = [value for value in sample_intervals if value <= 0]
+    if invalid:
+        raise ValueError("--random-sample-intervals values must be positive")
+    incompatible = [
+        value
+        for value in sample_intervals
+        if any(horizon % value for horizon in target_horizons)
+    ]
+    if incompatible:
+        values = ", ".join(str(value) for value in incompatible)
+        horizons = ", ".join(str(value) for value in target_horizons)
+        raise ValueError(
+            "Random sample intervals must divide every target horizon. "
+            f"Invalid: {values}; horizons: {horizons}"
+        )
+
+
+def run_id(scenario: str, run: DatasetRun) -> str:
+    prefix = f"{scenario}_{run.mode}"
+    if run.run_index is None:
+        return f"{prefix}_seed_{run.seed:05d}"
+    return f"{prefix}_r{run.run_index:04d}_seed_{run.seed:010d}"
+
+
+def describe_run(scenario: str, run: DatasetRun) -> str:
+    return (
+        f"{run_id(scenario, run)} "
+        f"duration={run.duration}s "
+        f"sample_interval={run.sample_interval}s "
+        f"decision_interval={run.control.decision_interval}s "
+        f"green={run.control.min_green}-{run.control.max_green}s "
+        f"blocked={run.control.blocked_occupancy} "
+        f"downstream_weight={run.control.downstream_weight} "
+        f"area_weight={run.control.area_pressure_weight} "
+        f"queue_weight={run.control.queue_forecast_weight}"
+    )
 
 
 def reset_index(index_path: Path, append: bool) -> None:

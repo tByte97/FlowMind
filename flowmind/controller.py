@@ -1,10 +1,12 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from .area_model import AreaModel
 from .config import ControlConfig
+from .decision_feed import DecisionEvent
 from .priority_flow import priority_links
+from .queue_forecast import QueueForecastEnsemble, QueueForecastModel
 from .safety_validator import SafetyValidator
 from .signal_policy import (
     area_pressure_by_incoming_lane,
@@ -15,11 +17,29 @@ from .traffic_state import TrafficStateReader
 
 
 @dataclass
+class QueueForecastSample:
+    time: float
+    tls_id: str
+    candidates: int
+    min_prediction: float
+    mean_prediction: float
+    max_prediction: float
+
+
+@dataclass
 class ControllerStats:
     decisions: int = 0
     extensions: int = 0
     advances: int = 0
     priority_decisions: int = 0
+    phase_out_of_range_skips: int = 0
+    clearance_phase_skips: int = 0
+    min_green_skips: int = 0
+    scoreless_skips: int = 0
+    queue_forecast_predictions: int = 0
+    queue_forecast_failures: int = 0
+    queue_forecast_samples: list[QueueForecastSample] = field(default_factory=list)
+    decision_events: list[DecisionEvent] = field(default_factory=list)
 
 
 class AreaSignalController:
@@ -36,6 +56,8 @@ class AreaSignalController:
         mode: str,
         config: ControlConfig,
         priority_vehicle: str | None = None,
+        queue_forecast: QueueForecastModel | QueueForecastEnsemble | None = None,
+        queue_forecast_sample_interval: int = 5,
     ) -> None:
         if mode not in {"local", "flowmind"}:
             raise ValueError("Adaptive controller mode must be local or flowmind")
@@ -44,6 +66,8 @@ class AreaSignalController:
         self._mode = mode
         self._config = config
         self._priority_vehicle = priority_vehicle
+        self._queue_forecast = queue_forecast if mode == "flowmind" else None
+        self._queue_forecast_sample_interval = queue_forecast_sample_interval
         self._corridor_manager = None
         self._reader = TrafficStateReader(traci_connection, area)
         self._safety = SafetyValidator(traci_connection, area, config)
@@ -72,18 +96,50 @@ class AreaSignalController:
             tls_id = intersection.tls_id
             current_phase = int(self._traci.trafficlight.getPhase(tls_id))
             if current_phase >= len(intersection.phases):
+                self.stats.phase_out_of_range_skips += 1
                 continue
             current_state = intersection.phases[current_phase]
             if "y" in current_state.lower() or not any(
                 signal in "Gg" for signal in current_state
             ):
+                self.stats.clearance_phase_skips += 1
                 continue
 
             spent = float(self._traci.trafficlight.getSpentDuration(tls_id))
             if spent < self._config.min_green:
+                self.stats.min_green_skips += 1
                 continue
 
             priority_link = overrides.get(tls_id)
+            queue_forecast = {}
+            if self._queue_forecast is not None:
+                try:
+                    queue_forecast = self._queue_forecast.predict_intersection(
+                        mode=self._mode,
+                        simulation_time=simulation_time,
+                        intersection=intersection,
+                        state=traffic,
+                        current_phase=current_phase,
+                        phase_elapsed=spent,
+                        control=self._config,
+                        sample_interval=self._queue_forecast_sample_interval,
+                    )
+                    self.stats.queue_forecast_predictions += len(queue_forecast)
+                    if queue_forecast:
+                        values = tuple(queue_forecast.values())
+                        self.stats.queue_forecast_samples.append(
+                            QueueForecastSample(
+                                time=round(simulation_time, 3),
+                                tls_id=tls_id,
+                                candidates=len(values),
+                                min_prediction=round(min(values), 5),
+                                mean_prediction=round(sum(values) / len(values), 5),
+                                max_prediction=round(max(values), 5),
+                            )
+                        )
+                except Exception:
+                    self.stats.queue_forecast_failures += 1
+
             scores = score_phases(
                 intersection,
                 traffic,
@@ -91,9 +147,11 @@ class AreaSignalController:
                 self._config,
                 priority_link,
                 area_pressure,
+                queue_forecast,
             )
             best = choose_phase(scores)
             if best is None:
+                self.stats.scoreless_skips += 1
                 continue
             current_score = next(
                 (item.score for item in scores if item.phase_index == current_phase),
@@ -127,6 +185,21 @@ class AreaSignalController:
                     max(remaining, 1.0),
                 )
                 self.stats.extensions += 1
+                self._record_decision(
+                    simulation_time,
+                    tls_id,
+                    (
+                        "Продовжено зелений для швидкої"
+                        if priority_link is not None
+                        else "Продовжено зелену фазу"
+                    ),
+                    (
+                        f"Перехрестя {tls_id}: фаза {current_phase} продовжена "
+                        f"на {max(remaining, 1.0):.0f} с; оцінка попиту "
+                        f"{best.score:.2f}."
+                    ),
+                    "success" if priority_link is not None else "info",
+                )
             else:
                 next_phase = (current_phase + 1) % len(intersection.phases)
                 safety = self._safety.validate_transition(
@@ -141,3 +214,37 @@ class AreaSignalController:
                     continue
                 self._traci.trafficlight.setPhase(tls_id, next_phase)
                 self.stats.advances += 1
+                self._record_decision(
+                    simulation_time,
+                    tls_id,
+                    (
+                        "Підготовлено фазу для швидкої"
+                        if priority_link is not None
+                        else "Змінено фазу через стан черги"
+                    ),
+                    (
+                        f"Перехрестя {tls_id}: перехід із фази {current_phase} "
+                        f"до {next_phase}; найкраща оцінка {best.score:.2f}."
+                    ),
+                    "warning" if priority_link is not None else "info",
+                )
+
+    def _record_decision(
+        self,
+        simulation_time: float,
+        tls_id: str,
+        title: str,
+        detail: str,
+        level: str,
+    ) -> None:
+        self.stats.decision_events.append(
+            DecisionEvent(
+                time=round(simulation_time, 3),
+                category="controller",
+                title=title,
+                detail=detail,
+                level=level,
+                tls_id=tls_id,
+            )
+        )
+        self.stats.decision_events = self.stats.decision_events[-100:]

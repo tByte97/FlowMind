@@ -140,6 +140,8 @@ class EmergencyVehicleManager:
         self._traci = traci_connection
         self.config = config
         self.details: EmergencyRouteDetails | None = None
+        self._route_overlay_ids: list[str] = []
+        self._corridor_visual_state = ""
 
     def install(
         self,
@@ -277,10 +279,11 @@ class EmergencyVehicleManager:
             pass
 
     def _draw_route_overlay(self, edges: tuple[str, ...]) -> None:
-        """Draw the selected emergency route as a red line in SUMO GUI."""
+        """Draw the selected emergency route, ready for live corridor coloring."""
 
         if not hasattr(self._traci, "lane") or not hasattr(self._traci, "polygon"):
             return
+        self._route_overlay_ids.clear()
         try:
             lane_by_edge = {
                 self._traci.lane.getEdgeID(lane_id): lane_id
@@ -314,12 +317,13 @@ class EmergencyVehicleManager:
                 self._traci.polygon.add(
                     polygon_id,
                     shape,
-                    (255, 35, 35, 180),
+                    (45, 125, 255, 190),
                     fill=False,
                     polygonType="emergency_route",
                     layer=100,
                     lineWidth=4,
                 )
+                self._route_overlay_ids.append(polygon_id)
             except Exception:
                 pass
 
@@ -327,6 +331,45 @@ class EmergencyVehicleManager:
         self._draw_route_marker(
             "destination", last_shape[-1] if last_shape else None
         )
+
+    def update_corridor_visualization(
+        self,
+        corridor_state: object,
+        active_tls: str | None = None,
+    ) -> None:
+        """Recolor the route overlay as the green-corridor state changes."""
+
+        state_name = getattr(corridor_state, "name", str(corridor_state)).upper()
+        visual_key = f"{state_name}:{active_tls or ''}"
+        if visual_key == self._corridor_visual_state:
+            return
+        self._corridor_visual_state = visual_key
+
+        if state_name == "GREEN_WINDOW":
+            color = (20, 255, 90, 255)
+            line_width = 9.0
+        elif state_name == "PREPARE":
+            color = (255, 190, 35, 235)
+            line_width = 7.0
+        elif state_name in {"CLEARANCE", "RECOVERY"}:
+            color = (50, 220, 255, 220)
+            line_width = 6.0
+        else:
+            color = (45, 125, 255, 190)
+            line_width = 4.0
+
+        polygon = getattr(self._traci, "polygon", None)
+        if polygon is None:
+            return
+        for polygon_id in self._route_overlay_ids:
+            try:
+                polygon.setColor(polygon_id, color)
+            except Exception:
+                pass
+            try:
+                polygon.setLineWidth(polygon_id, line_width)
+            except Exception:
+                pass
 
     def _draw_route_marker(
         self, suffix: str, position: tuple[float, float] | None

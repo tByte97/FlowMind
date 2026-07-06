@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import csv
+import json
 import os
+from dataclasses import asdict
+from datetime import datetime, timezone
 from pathlib import Path
 
 import sumolib
@@ -12,21 +16,46 @@ def start_sumo(command: list[str]) -> None:
     try:
         traci.start(
             command,
-            numRetries=1,
+            # Loading the Rivne map takes several seconds on a cold start.
+            # sumo-gui also initializes fonts/OpenGL and can need 10-15 seconds
+            # before TraCI begins listening on a cold Fedora/Wayland session.
+            numRetries=30,
             verbose=False,
         )
-    except traci.TraCIException as error:
-        raise RuntimeError(f"SUMO failed to start: {error}") from error
+    except (traci.TraCIException, traci.FatalTraCIError) as error:
+        details = _sumo_log_tail(command)
+        suffix = f"\nSUMO log:\n{details}" if details else ""
+        raise RuntimeError(f"SUMO failed to start: {error}{suffix}") from error
+
+
+def _sumo_log_tail(command: list[str], max_lines: int = 20) -> str:
+    try:
+        log_index = command.index("--log") + 1
+        log_path = Path(command[log_index])
+    except (ValueError, IndexError):
+        return ""
+    try:
+        lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return ""
+    return "\n".join(lines[-max_lines:])
 
 from .area_model import AreaModel, discover_area, load_zone_tls_ids
 from .config import RunConfig
 from .controller import AreaSignalController
 from .corridor_manager import CorridorManager
+from .decision_feed import DecisionEvent, merged_decision_log
 from .emergency_router import EmergencyRouter
 from .emergency_vehicle import EmergencyVehicleManager
 from .live_transport import LiveTelemetryPublisher
 from .metrics import MetricsCollector
 from .ml_dataset import MLDatasetCollector, MLDatasetConfig
+from .queue_forecast import (
+    QueueForecastEnsemble,
+    QueueForecastModel,
+    QueueForecastStats,
+    load_queue_forecast_models,
+)
 
 
 def configure_projection_data() -> Path | None:
@@ -59,6 +88,8 @@ def _sumo_command(config: RunConfig) -> list[str]:
         str(raw_dir / f"{config.mode}_tripinfos.xml"),
         "--statistic-output",
         str(raw_dir / f"{config.mode}_stats.xml"),
+        "--log",
+        str(raw_dir / f"{config.mode}_sumo.log"),
         "--seed",
         str(config.seed),
         "--end",
@@ -84,19 +115,33 @@ def load_area(config: RunConfig) -> AreaModel:
 
 
 def run_experiment(config: RunConfig) -> dict[str, object]:
-    area = load_area(config)
-    net_path = config.config_path.resolve().parent / "osm.net.xml.gz"
+    write_live_run_status(config, "starting")
     connection = None
     try:
+        area = load_area(config)
+        net_path = config.config_path.resolve().parent / "osm.net.xml.gz"
+        queue_forecast = load_queue_forecast(config)
+        queue_forecast_stats = (
+            queue_forecast.stats if queue_forecast is not None else None
+        )
         configure_projection_data()
         start_sumo(_sumo_command(config))
         connection = traci.getConnection()
         emergency_details = None
+        emergency_manager = None
         corridor_manager = None
         alternatives_log = []
         emergency_route_tls: tuple[str, ...] = ()
         emergency_controlled_tls: tuple[str, ...] = ()
         dataset_collector = None
+        session_events = [
+            DecisionEvent(
+                time=0.0,
+                category="system",
+                title="Симуляцію запущено",
+                detail=f"Активний режим керування: {config.mode}.",
+            )
+        ]
 
         if config.emergency is not None:
             router = EmergencyRouter(
@@ -133,8 +178,21 @@ def run_experiment(config: RunConfig) -> dict[str, object]:
                 ),
                 predicted_eta=best_route.predicted_eta if best_route else None,
             )
-
-            corridor_manager = CorridorManager(config.emergency.vehicle_id)
+            session_events.append(
+                DecisionEvent(
+                    time=0.0,
+                    category="route",
+                    title="Маршрут швидкої обрано",
+                    detail=(
+                        f"{emergency_details.route_edge_count} ділянок, "
+                        f"прогнозований ETA "
+                        f"{emergency_details.predicted_eta:.0f} с."
+                    ),
+                    level="success",
+                )
+            )
+            if config.mode != "fixed":
+                corridor_manager = CorridorManager(config.emergency.vehicle_id)
         priority_vehicle = (
             config.emergency.vehicle_id
             if config.emergency is not None
@@ -147,13 +205,18 @@ def run_experiment(config: RunConfig) -> dict[str, object]:
                 config.mode,
                 config.control,
                 priority_vehicle,
+                queue_forecast,
+                config.dataset_sample_interval,
             )
             if config.mode != "fixed"
             else None
         )
         if controller is not None and corridor_manager is not None:
             controller.set_corridor_manager(corridor_manager)
-        publisher = LiveTelemetryPublisher(host="127.0.0.1", port=8765)
+        publisher = LiveTelemetryPublisher(
+            host="127.0.0.1",
+            port=config.websocket_port,
+        )
         publisher.start()
         metrics = MetricsCollector(
             connection, area, config.control, priority_vehicle
@@ -199,11 +262,34 @@ def run_experiment(config: RunConfig) -> dict[str, object]:
                             for tls_id, link_index, distance, *_state in next_tls_list
                         ]
                 corridor_manager.step(simulated_time, in_network, next_tls_info)
+                if emergency_manager is not None:
+                    emergency_manager.update_corridor_visualization(
+                        corridor_manager.state,
+                        corridor_manager.active_tls,
+                    )
 
             if controller is not None:
                 controller.step(simulated_time)
             metrics.collect(simulated_time)
-            metrics.write_live_status(config.results_dir, config.mode, simulated_time)
+            metrics.write_live_status(
+                config.results_dir,
+                config.mode,
+                simulated_time,
+                build_live_system_status(
+                    config=config,
+                    connection=connection,
+                    controller=controller,
+                    corridor_manager=corridor_manager,
+                    publisher=publisher,
+                    queue_forecast=queue_forecast,
+                    running=True,
+                ),
+                decision_log=build_decision_log(
+                    session_events,
+                    controller,
+                    corridor_manager,
+                ),
+            )
             if dataset_collector is not None:
                 dataset_collector.collect(simulated_time)
 
@@ -222,7 +308,26 @@ def run_experiment(config: RunConfig) -> dict[str, object]:
                     "phase_extensions": controller.stats.extensions,
                     "phase_advances": controller.stats.advances,
                     "priority_decisions": controller.stats.priority_decisions,
+                    "phase_out_of_range_skips": (
+                        controller.stats.phase_out_of_range_skips
+                    ),
+                    "clearance_phase_skips": controller.stats.clearance_phase_skips,
+                    "min_green_skips": controller.stats.min_green_skips,
+                    "scoreless_skips": controller.stats.scoreless_skips,
+                    "queue_forecast_enabled": queue_forecast is not None,
+                    "queue_forecast_predictions": (
+                        controller.stats.queue_forecast_predictions
+                    ),
+                    "queue_forecast_failures": controller.stats.queue_forecast_failures,
+                    "queue_forecast_trace_samples": len(
+                        controller.stats.queue_forecast_samples
+                    ),
                 }
+            )
+            write_queue_forecast_trace(
+                config.results_dir,
+                config.mode,
+                controller.stats.queue_forecast_samples,
             )
         else:
             summary.update(
@@ -231,17 +336,278 @@ def run_experiment(config: RunConfig) -> dict[str, object]:
                     "phase_extensions": 0,
                     "phase_advances": 0,
                     "priority_decisions": 0,
+                    "phase_out_of_range_skips": 0,
+                    "clearance_phase_skips": 0,
+                    "min_green_skips": 0,
+                    "scoreless_skips": 0,
+                    "queue_forecast_enabled": False,
+                    "queue_forecast_predictions": 0,
+                    "queue_forecast_failures": 0,
+                    "queue_forecast_trace_samples": 0,
                 }
             )
+        summary.update(queue_forecast_summary(queue_forecast_stats))
         if dataset_collector is not None:
             summary.update(dataset_collector.write())
+        session_events.append(
+            DecisionEvent(
+                time=round(simulated_time, 3),
+                category="system",
+                title="Симуляцію завершено",
+                detail=(
+                    f"Завершили маршрут {summary.get('throughput', 0)} авто; "
+                    f"середнє очікування "
+                    f"{float(summary.get('average_waiting_time', 0.0)):.1f} с."
+                ),
+                level="success",
+            )
+        )
         metrics.write(config.results_dir, summary)
+        metrics.write_live_status(
+            config.results_dir,
+            config.mode,
+            simulated_time,
+            build_live_system_status(
+                config=config,
+                connection=connection,
+                controller=controller,
+                corridor_manager=corridor_manager,
+                publisher=publisher,
+                queue_forecast=queue_forecast,
+                running=False,
+            ),
+            decision_log=build_decision_log(
+                session_events,
+                controller,
+                corridor_manager,
+            ),
+        )
         return summary
+    except Exception as error:
+        write_live_run_status(config, "failed", str(error))
+        raise
     finally:
         if connection is not None:
             connection.close()
         if "publisher" in locals():
             publisher.stop()
+
+
+def write_live_run_status(
+    config: RunConfig,
+    status: str,
+    error: str | None = None,
+) -> Path:
+    config.results_dir.mkdir(parents=True, exist_ok=True)
+    output_path = config.results_dir / "live_status.json"
+    payload: dict[str, object] = {}
+    if status != "starting" and output_path.exists():
+        try:
+            loaded = json.loads(output_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                payload = loaded
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    payload.update(
+        {
+            "schema_version": 2,
+            "mode": config.mode,
+            "results_dir": str(config.results_dir.resolve()),
+            "simulated_time": payload.get("simulated_time", 0.0),
+            "emitted_at": datetime.now(timezone.utc).isoformat(),
+            "summary": payload.get("summary", {}),
+            "latest_sample": payload.get("latest_sample"),
+            "metric_history": payload.get("metric_history", []),
+            "traffic_flow": payload.get("traffic_flow", {}),
+            "lanes": payload.get("lanes", []),
+            "intersections": payload.get("intersections", []),
+            "vehicles": payload.get("vehicles", []),
+            "decision_log": payload.get("decision_log", []),
+            "emergency_trace": payload.get("emergency_trace", []),
+        }
+    )
+    system = payload.get("system", {})
+    if not isinstance(system, dict):
+        system = {}
+    simulation = {
+        "status": status,
+        "expected_vehicles": 0,
+        "mode": config.mode,
+        "duration": config.duration,
+    }
+    if error:
+        simulation["error"] = error
+    system["simulation"] = simulation
+    system.setdefault(
+        "websocket",
+        {
+            "status": "waiting",
+            "clients": 0,
+            "host": "127.0.0.1",
+            "port": config.websocket_port,
+        },
+    )
+    system.setdefault("controller", {"status": "waiting"})
+    system.setdefault("queue_forecast", {"status": "waiting"})
+    system.setdefault("corridor", {"corridor_state": "waiting"})
+    system.setdefault("metrics", {"status": "waiting"})
+    payload["system"] = system
+
+    temporary_path = output_path.with_suffix(".json.tmp")
+    temporary_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    temporary_path.replace(output_path)
+    return output_path
+
+
+def build_live_system_status(
+    *,
+    config: RunConfig,
+    connection: object,
+    controller: AreaSignalController | None,
+    corridor_manager: CorridorManager | None,
+    publisher: LiveTelemetryPublisher,
+    queue_forecast: QueueForecastModel | QueueForecastEnsemble | None,
+    running: bool,
+) -> dict[str, object]:
+    controller_stats = controller.stats if controller is not None else None
+    corridor_summary = (
+        corridor_manager.as_summary()
+        if corridor_manager is not None
+        else {
+            "corridor_state": "DISABLED",
+            "corridor_active_tls": None,
+            "corridor_completed_tls": (),
+        }
+    )
+    try:
+        expected_vehicles = int(connection.simulation.getMinExpectedNumber())
+    except Exception:
+        expected_vehicles = 0
+    return {
+        "simulation": {
+            "status": "running" if running else "completed",
+            "expected_vehicles": expected_vehicles,
+            "mode": config.mode,
+            "duration": config.duration,
+        },
+        "websocket": {
+            "status": "online",
+            "clients": publisher.client_count,
+            "host": "127.0.0.1",
+            "port": config.websocket_port,
+        },
+        "controller": {
+            "status": "active" if controller is not None else "fixed_plan",
+            "decisions": controller_stats.decisions if controller_stats else 0,
+            "extensions": controller_stats.extensions if controller_stats else 0,
+            "advances": controller_stats.advances if controller_stats else 0,
+            "priority_decisions": (
+                controller_stats.priority_decisions if controller_stats else 0
+            ),
+            "safety_skips": (
+                controller_stats.phase_out_of_range_skips
+                + controller_stats.clearance_phase_skips
+                + controller_stats.min_green_skips
+                + controller_stats.scoreless_skips
+                if controller_stats
+                else 0
+            ),
+        },
+        "queue_forecast": {
+            "status": "active" if queue_forecast is not None else "disabled",
+            "predictions": (
+                controller_stats.queue_forecast_predictions
+                if controller_stats
+                else 0
+            ),
+            "failures": (
+                controller_stats.queue_forecast_failures
+                if controller_stats
+                else 0
+            ),
+        },
+        "corridor": corridor_summary,
+        "metrics": {
+            "status": "collecting" if running else "finalized",
+            "sample_interval": config.control.decision_interval,
+        },
+    }
+
+
+def build_decision_log(
+    session_events: list[DecisionEvent],
+    controller: AreaSignalController | None,
+    corridor_manager: CorridorManager | None,
+) -> list[dict[str, object]]:
+    controller_events = (
+        controller.stats.decision_events if controller is not None else ()
+    )
+    corridor_events = (
+        corridor_manager.decision_events if corridor_manager is not None else ()
+    )
+    return merged_decision_log(
+        session_events,
+        controller_events,
+        corridor_events,
+    )
+
+
+def load_queue_forecast(
+    config: RunConfig,
+) -> QueueForecastModel | QueueForecastEnsemble | None:
+    if config.mode != "flowmind":
+        return None
+    if config.queue_model_path is not None:
+        model_paths = (config.queue_model_path,)
+    else:
+        model_paths = tuple(config.queue_model_paths)
+    if not model_paths:
+        return None
+    return load_queue_forecast_models(
+        model_paths,
+        config.control.queue_forecast_horizon_weights,
+    )
+
+
+def queue_forecast_summary(stats: QueueForecastStats | None) -> dict[str, object]:
+    if stats is None:
+        return {
+            "queue_forecast_model": "",
+            "queue_forecast_target": "",
+            "queue_forecast_feature_count": 0,
+            "queue_forecast_model_count": 0,
+            "queue_forecast_horizons": "",
+            "queue_forecast_horizon_weights": "",
+        }
+    return {
+        "queue_forecast_model": stats.model_path,
+        "queue_forecast_target": stats.target,
+        "queue_forecast_feature_count": stats.feature_count,
+        "queue_forecast_model_count": stats.model_count,
+        "queue_forecast_horizons": stats.horizons,
+        "queue_forecast_horizon_weights": stats.horizon_weights,
+    }
+
+
+def write_queue_forecast_trace(
+    results_dir: Path,
+    mode: str,
+    samples: object,
+) -> None:
+    samples = list(samples)
+    if not samples:
+        return
+    results_dir.mkdir(parents=True, exist_ok=True)
+    trace_path = results_dir / f"{mode}_queue_forecast.csv"
+    with trace_path.open("w", newline="", encoding="utf-8") as handle:
+        fieldnames = list(asdict(samples[0]).keys())
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(asdict(sample) for sample in samples)
 
 
 def _merge_tls_ids(

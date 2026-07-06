@@ -3,6 +3,8 @@ from __future__ import annotations
 import logging
 from enum import Enum, auto
 
+from .decision_feed import DecisionEvent
+
 logger = logging.getLogger(__name__)
 
 
@@ -43,6 +45,7 @@ class CorridorManager:
         self._clearance_start_time = -1.0
         self._recovery_start_time = -1.0
         self.completed_tls: list[str] = []
+        self.decision_events: list[DecisionEvent] = []
 
     def step(
         self,
@@ -57,10 +60,20 @@ class CorridorManager:
             vehicle_in_network: True if the vehicle is currently in the simulation.
             next_tls_info: Upcoming TLS tuple(s) as (tls_id, link_index, distance).
         """
+        previous_state = self.state
+        previous_tls = self.active_tls
+        self._step(simulation_time, vehicle_in_network, next_tls_info)
+        self._record_transition(simulation_time, previous_state, previous_tls)
+
+    def _step(
+        self,
+        simulation_time: float,
+        vehicle_in_network: bool,
+        next_tls_info: NextTlsInfo | list[NextTlsInfo] | None,
+    ) -> None:
         if not vehicle_in_network:
             self._handle_missing_vehicle(simulation_time)
             return
-
         self._last_seen_time = simulation_time
         selected = self._select_next_tls(next_tls_info)
 
@@ -89,6 +102,56 @@ class CorridorManager:
                 self.state = CorridorState.NORMAL
                 self.active_tls = None
                 self.active_link_index = None
+
+    def _record_transition(
+        self,
+        simulation_time: float,
+        previous_state: CorridorState,
+        previous_tls: str | None,
+    ) -> None:
+        if self.state == previous_state and self.active_tls == previous_tls:
+            return
+
+        tls_id = self.active_tls or previous_tls
+        descriptions = {
+            CorridorState.NORMAL: (
+                "Рух повернувся до нормального режиму",
+                "Світлофори знову керуються загальним транспортним попитом.",
+                "success",
+            ),
+            CorridorState.PREPARE: (
+                "Підготовка зеленого коридору",
+                f"FlowMind готує пріоритет на перехресті {tls_id or '—'}.",
+                "warning",
+            ),
+            CorridorState.GREEN_WINDOW: (
+                "Зелений коридор активовано",
+                f"Швидка отримала пріоритет на перехресті {tls_id or '—'}.",
+                "success",
+            ),
+            CorridorState.CLEARANCE: (
+                "Швидка пройшла контрольоване перехрестя",
+                f"Перехрестя {tls_id or '—'} звільняється перед відновленням руху.",
+                "info",
+            ),
+            CorridorState.RECOVERY: (
+                "Відновлення звичайного руху",
+                "FlowMind плавно повертає стандартний порядок фаз.",
+                "info",
+            ),
+        }
+        title, detail, level = descriptions[self.state]
+        self.decision_events.append(
+            DecisionEvent(
+                time=round(simulation_time, 3),
+                category="corridor",
+                title=title,
+                detail=detail,
+                level=level,
+                tls_id=tls_id,
+            )
+        )
+        self.decision_events = self.decision_events[-80:]
 
     def get_priority_overrides(self) -> dict[str, int]:
         """Return the overrides for the controller based on the current state."""

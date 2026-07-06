@@ -83,14 +83,16 @@ def score_phases(
     config: ControlConfig,
     priority_link: int | None = None,
     area_pressure: dict[str, float] | None = None,
+    queue_forecast: dict[tuple[int, int], float] | None = None,
 ) -> tuple[PhaseScore, ...]:
     area_pressure = area_pressure or {}
+    queue_forecast = queue_forecast or {}
     scores: list[PhaseScore] = []
     for phase_index in intersection.green_phase_indices:
         phase_state = intersection.phases[phase_index]
         score = 0.0
         movements = 0
-        for link in intersection.links:
+        for link_index, link in enumerate(intersection.links):
             if link.signal_index >= len(phase_state):
                 continue
             if phase_state[link.signal_index] not in "Gg":
@@ -112,6 +114,10 @@ def score_phases(
                 movement_score += (
                     area_pressure.get(link.incoming_lane, 0.0)
                     * config.area_pressure_weight
+                )
+                movement_score += (
+                    queue_forecast.get((phase_index, link_index), 0.0)
+                    * config.queue_forecast_weight
                 )
             score += movement_score
             movements += 1

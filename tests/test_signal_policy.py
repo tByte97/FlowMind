@@ -98,6 +98,22 @@ class SignalPolicyTest(unittest.TestCase):
         self.assertIn("north", area_pressure)
         self.assertEqual(best.phase_index, 0)
 
+    def test_flowmind_can_use_queue_forecast_bias(self) -> None:
+        state = TrafficState({})
+
+        best = choose_phase(
+            score_phases(
+                self.intersection,
+                state,
+                "flowmind",
+                ControlConfig(queue_forecast_weight=1.0),
+                queue_forecast={(2, 1): 9.0},
+            )
+        )
+
+        self.assertIsNotNone(best)
+        self.assertEqual(best.phase_index, 2)
+
 
 if __name__ == "__main__":
     unittest.main()

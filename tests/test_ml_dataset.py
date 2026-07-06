@@ -88,6 +88,8 @@ class MLDatasetCollectorTest(unittest.TestCase):
         self.assertEqual(len(rows), 2)
         self.assertEqual(rows[0]["incoming_queue"], "2")
         self.assertEqual(rows[0]["target_incoming_queue_30s"], "7")
+        self.assertEqual(rows[0]["sample_interval"], "5")
+        self.assertEqual(rows[0]["queue_forecast_weight"], "0.75")
         self.assertEqual(rows[1]["target_incoming_queue_30s"], "")
 
 
