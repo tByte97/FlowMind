@@ -123,7 +123,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Run many headless FlowMind simulations and write ML-ready CSV "
-            "samples for queue prediction."
+            "samples for queue prediction. Use --full-real for the complete "
+            "100-cycle fixed/local/flowmind training plan."
         )
     )
     parser.add_argument("--runs-per-mode", type=int, default=100)
@@ -132,6 +133,29 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="+",
         choices=("local", "fixed", "flowmind"),
         default=("local", "fixed", "flowmind"),
+    )
+    parser.add_argument(
+        "--full-real",
+        action="store_true",
+        help=(
+            "Use the full realistic training profile: fixed/local/flowmind, "
+            "randomized sensor-window control settings, paired seeds, and "
+            "100 cycles by default. This produces 300 runs unless "
+            "--runs-per-mode is changed."
+        ),
+    )
+    parser.add_argument(
+        "--independent-random-seeds",
+        action="store_true",
+        help=(
+            "With --randomize, generate an independent seed/settings tuple for "
+            "each mode instead of pairing the same seed across all modes."
+        ),
+    )
+    parser.add_argument(
+        "--keep-going",
+        action="store_true",
+        help="Continue collecting the dataset after a failed simulation.",
     )
     parser.add_argument("--seed-start", type=int, default=42)
     parser.add_argument("--duration", type=int)
@@ -228,6 +252,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
+    apply_full_real_profile(args)
     if args.runs_per_mode <= 0:
         raise ValueError("--runs-per-mode must be positive")
     if args.sample_interval <= 0:
@@ -255,10 +280,16 @@ def main() -> None:
     summaries_dir.mkdir(parents=True, exist_ok=True)
 
     runs = list(planned_runs(args, default_duration))
+    write_plan_manifest(output_dir / "dataset_plan.json", args, runs)
     print(
         f"Dataset plan: {len(runs)} runs, "
         f"randomized={'yes' if args.randomize else 'no'}"
     )
+    if args.randomize and not args.independent_random_seeds:
+        print(
+            f"Paired seed cycles: {args.runs_per_mode}; "
+            f"modes per cycle: {', '.join(args.modes)}"
+        )
     if args.randomize:
         durations = [run.duration for run in runs]
         print(
@@ -363,7 +394,9 @@ def main() -> None:
         append_index_row(index_path, row)
         if failure is not None:
             print(f"[{number}/{total}] failed {current_run_id}: {failure!r}")
-            raise failure
+            if not args.keep_going:
+                raise failure
+            continue
         print(
             f"[{number}/{total}] done {current_run_id}: "
             f"rows={row.get('dataset_rows')} "
@@ -372,6 +405,14 @@ def main() -> None:
         )
 
     print(f"Dataset complete: {index_path}")
+
+
+def apply_full_real_profile(args: argparse.Namespace) -> None:
+    if not args.full_real:
+        return
+    args.randomize = True
+    args.modes = ("fixed", "local", "flowmind")
+    args.independent_random_seeds = False
 
 
 def planned_runs(
@@ -404,6 +445,26 @@ def randomized_runs(args: argparse.Namespace) -> tuple[DatasetRun, ...]:
     rng = random.Random(args.plan_seed)
     used_seeds: set[int] = set()
     runs: list[DatasetRun] = []
+
+    if not args.independent_random_seeds:
+        for offset in range(args.runs_per_mode):
+            seed = unique_random_seed(rng, args.seed_min, args.seed_max, used_seeds)
+            duration = rng.randint(args.duration_min, args.duration_max)
+            sample_interval = rng.choice(tuple(args.random_sample_intervals))
+            control = random_control_config(rng)
+            for mode in args.modes:
+                runs.append(
+                    DatasetRun(
+                        mode=mode,
+                        seed=seed,
+                        duration=duration,
+                        sample_interval=sample_interval,
+                        control=control,
+                        run_index=offset + 1,
+                    )
+                )
+        rng.shuffle(runs)
+        return tuple(runs)
 
     for mode in args.modes:
         for offset in range(args.runs_per_mode):
@@ -504,11 +565,61 @@ def describe_run(scenario: str, run: DatasetRun) -> str:
         f"duration={run.duration}s "
         f"sample_interval={run.sample_interval}s "
         f"decision_interval={run.control.decision_interval}s "
+        f"sensor_range={run.control.sensor_range_meters}m "
         f"green={run.control.min_green}-{run.control.max_green}s "
         f"blocked={run.control.blocked_occupancy} "
         f"downstream_weight={run.control.downstream_weight} "
         f"area_weight={run.control.area_pressure_weight} "
         f"queue_weight={run.control.queue_forecast_weight}"
+    )
+
+
+def write_plan_manifest(
+    path: Path,
+    args: argparse.Namespace,
+    runs: list[DatasetRun],
+) -> None:
+    payload = {
+        "schema_version": 1,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "scenario": args.scenario_name,
+        "config": str(args.config),
+        "zone": str(args.zone),
+        "output_dir": str(args.output_dir),
+        "modes": list(args.modes),
+        "runs_per_mode": args.runs_per_mode,
+        "total_runs": len(runs),
+        "randomized": bool(args.randomize),
+        "full_real": bool(args.full_real),
+        "paired_seed_cycles": bool(
+            args.randomize and not args.independent_random_seeds
+        ),
+        "plan_seed": args.plan_seed,
+        "target_horizons": list(args.target_horizons),
+        "sample_intervals": sorted({run.sample_interval for run in runs}),
+        "duration_range": [
+            min((run.duration for run in runs), default=0),
+            max((run.duration for run in runs), default=0),
+        ],
+        "sensor_range_meters": [
+            min((run.control.sensor_range_meters for run in runs), default=0),
+            max((run.control.sensor_range_meters for run in runs), default=0),
+        ],
+        "first_runs": [
+            {
+                "run_id": run_id(args.scenario_name, run),
+                "mode": run.mode,
+                "seed": run.seed,
+                "duration": run.duration,
+                "sample_interval": run.sample_interval,
+                "sensor_range_meters": run.control.sensor_range_meters,
+            }
+            for run in runs[:20]
+        ],
+    }
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
     )
 
 

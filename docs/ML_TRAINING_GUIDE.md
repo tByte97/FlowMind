@@ -133,17 +133,21 @@ python -c "import lightgbm, sklearn, joblib; print('ML deps OK')"
 Повний рекомендований dataset:
 
 ```bash
-python experiments/run_dataset.py --runs-per-mode 50
+python experiments/run_dataset.py --full-real --resume
 ```
 
 Це запустить:
 
 ```text
-50 local
-50 fixed
-50 flowmind
-= 150 simulations
+100 різних seed cycles
+кожен seed проходить fixed, local і flowmind
+= 300 simulations
 ```
+
+`--full-real` вмикає різні seed-и, тривалості, sample interval-и, локальну
+дальність датчиків біля перехресть та різні параметри `ControlConfig`.
+Один і той самий seed/config проходить усі режими, щоб `fixed`, `local` і
+`flowmind` можна було чесно порівнювати між собою.
 
 За замовчуванням використовується:
 
@@ -158,13 +162,13 @@ target_horizons = 30, 60, 90 секунд
 Продовжити після переривання:
 
 ```bash
-python experiments/run_dataset.py --runs-per-mode 50 --resume
+python experiments/run_dataset.py --full-real --resume
 ```
 
 Короткий тест:
 
 ```bash
-python experiments/run_dataset.py --runs-per-mode 2
+python experiments/run_dataset.py --full-real --runs-per-mode 2 --dry-run
 ```
 
 Інший інтервал семплування:
@@ -179,7 +183,7 @@ python experiments/run_dataset.py --runs-per-mode 50 --sample-interval 3
 python experiments/run_dataset.py --runs-per-mode 50 --duration 900
 ```
 
-Більш різноманітний dataset для майбутньої ML-моделі:
+Ручний різноманітний dataset для майбутньої ML-моделі:
 
 ```bash
 python experiments/run_dataset.py \
