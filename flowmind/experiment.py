@@ -11,21 +11,31 @@ import sumolib
 import traci
 
 
+SUMO_START_RETRIES = 30
+SUMO_GUI_START_RETRIES = 120
+
+
 def start_sumo(command: list[str]) -> None:
     """Start SUMO with a bounded retry count to avoid hanging indefinitely."""
     try:
         traci.start(
             command,
             # Loading the Rivne map takes several seconds on a cold start.
-            # sumo-gui also initializes fonts/OpenGL and can need 10-15 seconds
-            # before TraCI begins listening on a cold Fedora/Wayland session.
-            numRetries=30,
+            # sumo-gui also initializes fonts/OpenGL and can take much longer
+            # before TraCI begins listening on a cold desktop session.
+            numRetries=_sumo_start_retries(command),
             verbose=False,
         )
     except (traci.TraCIException, traci.FatalTraCIError) as error:
         details = _sumo_log_tail(command)
         suffix = f"\nSUMO log:\n{details}" if details else ""
         raise RuntimeError(f"SUMO failed to start: {error}{suffix}") from error
+
+
+def _sumo_start_retries(command: list[str]) -> int:
+    if command and Path(command[0]).name.startswith("sumo-gui"):
+        return SUMO_GUI_START_RETRIES
+    return SUMO_START_RETRIES
 
 
 def _sumo_log_tail(command: list[str], max_lines: int = 20) -> str:

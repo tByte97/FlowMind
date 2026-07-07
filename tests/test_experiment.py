@@ -29,7 +29,20 @@ class ExperimentEnvironmentTest(unittest.TestCase):
             experiment.start_sumo(["sumo", "-c", "scenario.sumocfg"])
 
         start_mock.assert_called_once()
-        self.assertEqual(start_mock.call_args.kwargs.get("numRetries"), 30)
+        self.assertEqual(
+            start_mock.call_args.kwargs.get("numRetries"),
+            experiment.SUMO_START_RETRIES,
+        )
+
+    def test_sumo_gui_start_uses_longer_retries(self) -> None:
+        with patch("flowmind.experiment.traci.start") as start_mock:
+            experiment.start_sumo(["/opt/sumo/bin/sumo-gui", "-c", "scenario.sumocfg"])
+
+        start_mock.assert_called_once()
+        self.assertEqual(
+            start_mock.call_args.kwargs.get("numRetries"),
+            experiment.SUMO_GUI_START_RETRIES,
+        )
 
     def test_sumo_start_error_includes_log_tail(self) -> None:
         with TemporaryDirectory() as directory:

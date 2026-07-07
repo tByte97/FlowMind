@@ -17,15 +17,17 @@ from typing import Any
 
 try:
     from fastapi import FastAPI, Request
-    from fastapi.responses import HTMLResponse
+    from fastapi.responses import FileResponse, HTMLResponse
 except ImportError:
     FastAPI = None  # type: ignore[assignment]
+    FileResponse = None  # type: ignore[assignment]
     Request = None  # type: ignore[assignment]
     HTMLResponse = None  # type: ignore[assignment]
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 PROJECT_RESULTS_DIR = PROJECT_ROOT / "results"
+CAR_ICON_PATH = PROJECT_ROOT / "icon_car.png"
 RESULTS_DIR = Path(os.environ.get("FLOWMIND_RESULTS_DIR", PROJECT_RESULTS_DIR))
 WEB_RESULTS_DIR = Path(
     os.environ.get("FLOWMIND_WEB_RESULTS_DIR", PROJECT_RESULTS_DIR / "web_demo")
@@ -2208,20 +2210,21 @@ DESIGN_PAGE = r"""<!doctype html>
     .cars {
       display: flex;
       flex-wrap: wrap;
-      gap: 7px;
-      min-height: 28px;
+      gap: 8px;
+      min-height: 30px;
     }
 
     .car {
-      width: 30px;
-      height: 18px;
-      border-radius: 6px 8px 5px 5px;
-      background: var(--cyan);
-      box-shadow: inset 6px 0 rgba(0, 0, 0, .22), inset -5px 0 rgba(255, 255, 255, .16);
+      width: 38px;
+      height: 22px;
+      display: inline-block;
+      background-color: #3dbbaf;
+      -webkit-mask: url("/assets/icon_car.png") center / contain no-repeat;
+      mask: url("/assets/icon_car.png") center / contain no-repeat;
     }
 
-    .fixed .car { background: var(--red); }
-    .car.alt { background: var(--amber); }
+    .fixed .car { background-color: #f45140; }
+    .car.alt { background-color: #ffb631; }
 
     .bar {
       height: 8px;
@@ -2768,7 +2771,7 @@ DESIGN_PAGE = r"""<!doctype html>
         </div>
         <div class="panel-body ai-report">
           <div class="ai-report-text" id="geminiSummary">
-            Після завершення симуляції тут з'явиться короткий висновок по метриках. Якщо Gemini недоступний, система покаже локальний висновок без зупинки демо.
+            Після завершення симуляції натисни кнопку, щоб сформувати короткий висновок по метриках. Якщо Gemini недоступний, система покаже локальний висновок без зупинки демо.
           </div>
           <div class="ai-report-meta">
             <span id="geminiProvider">provider: none</span>
@@ -2792,7 +2795,6 @@ DESIGN_PAGE = r"""<!doctype html>
     let selectedHistoryIndex = null;
     let selectedHistoryTime = null;
     let userSelectedTime = false;
-    let lastProcessRunning = false;
     let geminiBusy = false;
     let geminiSourceKey = null;
     let geminiGeneratedForSource = null;
@@ -3239,7 +3241,7 @@ DESIGN_PAGE = r"""<!doctype html>
       setGeminiTag("очікує", "");
     }
 
-    function renderGeminiPanel(payload, wasRunning) {
+    function renderGeminiPanel(payload) {
       const process = payload.process || {};
       const sourceKey = resultSourceKey(payload);
       const ready = !!payload.available && !process.running;
@@ -3247,7 +3249,7 @@ DESIGN_PAGE = r"""<!doctype html>
         geminiSourceKey = sourceKey;
         geminiGeneratedForSource = null;
         resetGeminiPanel(process.running
-          ? "Симуляція виконується. Висновок буде сформовано після завершення."
+          ? "Симуляція виконується. Після завершення натисни кнопку, щоб сформувати висновок."
           : "Натисни кнопку або запусти нову симуляцію, щоб сформувати висновок по результатах.");
       }
       $("geminiBtn").disabled = !ready || geminiBusy;
@@ -3260,13 +3262,10 @@ DESIGN_PAGE = r"""<!doctype html>
         setGeminiTag("немає даних", "warn");
         return;
       }
-      const completedNow = wasRunning && !process.running && process.status === "completed";
-      if (completedNow && geminiGeneratedForSource !== sourceKey && !geminiBusy) {
-        requestGeminiSummary(false);
-      }
+      setGeminiTag(geminiGeneratedForSource === sourceKey ? "готово" : "ручний запуск", geminiGeneratedForSource === sourceKey ? "good" : "");
     }
 
-    async function requestGeminiSummary(force = true) {
+    async function requestGeminiSummary(force = false) {
       if (geminiBusy) return;
       geminiBusy = true;
       $("geminiBtn").disabled = true;
@@ -3375,11 +3374,9 @@ DESIGN_PAGE = r"""<!doctype html>
 
     async function refresh() {
       try {
-        const wasRunning = lastProcessRunning;
         const payload = await selectedPayload();
         currentPayload = payload;
         const process = payload.process || {};
-        lastProcessRunning = !!process.running;
         const source = payload._meta?.source || "немає";
         const sourceKind = payload.available ? "good" : "warn";
         setTag("sourceTag", "джерело", shortText(source, 48), sourceKind);
@@ -3392,7 +3389,7 @@ DESIGN_PAGE = r"""<!doctype html>
         renderDecisions(payload.decision_log || []);
         drawHistory(payload.metric_history || []);
         renderProcess(process);
-        renderGeminiPanel(payload, wasRunning);
+        renderGeminiPanel(payload);
       } catch (error) {
         setTag("processTag", "процес", "api error", "bad");
         $("logs").textContent = String(error);
@@ -3441,7 +3438,7 @@ DESIGN_PAGE = r"""<!doctype html>
     $("startBtn").addEventListener("click", startDemo);
     $("stopBtn").addEventListener("click", stopDemo);
     $("refreshBtn").addEventListener("click", refresh);
-    $("geminiBtn").addEventListener("click", () => requestGeminiSummary(true));
+    $("geminiBtn").addEventListener("click", () => requestGeminiSummary(false));
     $("resetBtn").addEventListener("click", () => {
       resetControls();
       refresh();
@@ -4041,6 +4038,11 @@ AVERAGES_PAGE = r"""<!doctype html>
       background: rgba(98, 212, 139, .12);
     }
     .tag.good::before { background: var(--green); }
+    .tag.warn {
+      border-color: rgba(242, 191, 94, .4);
+      background: rgba(242, 191, 94, .12);
+    }
+    .tag.warn::before { background: #f2bf5e; }
     .cards {
       display: grid;
       grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -4059,6 +4061,70 @@ AVERAGES_PAGE = r"""<!doctype html>
     .metric .label { color: var(--muted); font-size: 12px; font-weight: 700; }
     .metric .value { font-size: 23px; font-weight: 850; line-height: 1.1; overflow-wrap: anywhere; }
     .metric .note { color: var(--muted); font-size: 12px; }
+    .compare-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 12px;
+      margin-bottom: 14px;
+    }
+    .mode-card {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel-soft);
+      padding: 12px;
+      display: grid;
+      gap: 10px;
+    }
+    .mode-card.fixed { border-color: rgba(244, 81, 64, .7); }
+    .mode-card.local { border-color: rgba(255, 182, 49, .65); }
+    .mode-card.flowmind { border-color: rgba(61, 187, 175, .72); }
+    .mode-card h3 {
+      margin: 0;
+      font-size: 15px;
+      letter-spacing: 0;
+      text-transform: capitalize;
+    }
+    .mode-card.fixed h3 { color: #f45140; }
+    .mode-card.local h3 { color: #ffb631; }
+    .mode-card.flowmind h3 { color: #3dbbaf; }
+    .mode-stat {
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      padding-top: 8px;
+      border-top: 1px solid #30394d;
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .mode-stat strong { color: var(--ink); font-weight: 820; text-align: right; }
+    .delta {
+      display: inline-flex;
+      align-items: center;
+      min-width: 70px;
+      justify-content: center;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 3px 8px;
+      color: var(--muted);
+      background: #151b26;
+      font-size: 12px;
+      font-weight: 800;
+      white-space: nowrap;
+    }
+    .delta.good {
+      color: #bff3cf;
+      border-color: rgba(98, 212, 139, .35);
+      background: rgba(98, 212, 139, .12);
+    }
+    .delta.bad {
+      color: #ffbbb4;
+      border-color: rgba(244, 81, 64, .35);
+      background: rgba(244, 81, 64, .12);
+    }
+    .winner {
+      color: #bff3cf;
+      font-weight: 850;
+    }
     .section {
       background: var(--panel);
       border: 1px solid var(--line);
@@ -4080,10 +4146,25 @@ AVERAGES_PAGE = r"""<!doctype html>
     table { width: 100%; border-collapse: collapse; font-size: 13px; }
     th, td { padding: 9px 8px; border-bottom: 1px solid #30394d; text-align: left; vertical-align: middle; }
     th { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0; }
+    td.value-cell {
+      font-weight: 780;
+      white-space: nowrap;
+    }
+    td.compare-cell {
+      min-width: 132px;
+    }
+    .cell-note {
+      display: block;
+      margin-top: 3px;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 650;
+    }
     .empty { color: var(--muted); padding: 18px; border: 1px dashed var(--line); border-radius: 8px; background: var(--panel-soft); }
     @media (max-width: 900px) {
       .topbar { grid-template-columns: 1fr; }
       .cards { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .compare-grid { grid-template-columns: 1fr; }
     }
     @media (max-width: 620px) {
       .page { padding: 12px; }
@@ -4100,7 +4181,7 @@ AVERAGES_PAGE = r"""<!doctype html>
           <div class="mark" aria-hidden="true"></div>
           <div>
             <h1>FlowMind Averages</h1>
-            <p class="subtitle">Агрегація збережених summary.csv по режимах керування.</p>
+            <p class="subtitle">Порівняння середніх результатів fixed, local і FlowMind по збережених симуляціях.</p>
           </div>
         </div>
         <nav class="nav" aria-label="Averages navigation">
@@ -4116,6 +4197,7 @@ AVERAGES_PAGE = r"""<!doctype html>
     </header>
 
     <section class="cards" id="overview"></section>
+    <div id="comparison"></div>
     <div id="modeSections"></div>
   </main>
 
@@ -4138,6 +4220,124 @@ AVERAGES_PAGE = r"""<!doctype html>
       const response = await fetch(path);
       if (!response.ok) throw new Error(await response.text());
       return await response.json();
+    }
+    const modeOrder = ["fixed", "local", "flowmind"];
+    const modeLabels = {
+      fixed: "Fixed",
+      local: "Local adaptive",
+      flowmind: "FlowMind",
+    };
+    const keyMetrics = [
+      { key: "average_waiting_time", label: "Сер. очікування", suffix: " с", lower: true },
+      { key: "average_queue_length", label: "Сер. черга", suffix: " авто", lower: true },
+      { key: "max_queue_length", label: "Макс. черга", suffix: " авто", lower: true },
+      { key: "throughput", label: "Пропуск", suffix: " авто", lower: false, digits: 0 },
+      { key: "stops_count", label: "Зупинки", suffix: "", lower: true, digits: 0 },
+      { key: "gridlock_risk", label: "Gridlock risk", suffix: "", lower: true, digits: 4 },
+    ];
+    function modeClass(mode) {
+      return ["fixed", "local", "flowmind"].includes(mode) ? mode : "";
+    }
+    function byMode(modes) {
+      return Object.fromEntries((modes || []).map(item => [item.mode, item]));
+    }
+    function metricValue(mode, key) {
+      return number(mode?.metrics?.[key]?.average);
+    }
+    function metricCount(mode, key) {
+      return mode?.metrics?.[key]?.count || 0;
+    }
+    function orderedModes(modes) {
+      const known = modeOrder.map(mode => modes.find(item => item.mode === mode)).filter(Boolean);
+      const rest = modes.filter(item => !modeOrder.includes(item.mode)).sort((a, b) => String(a.mode).localeCompare(String(b.mode)));
+      return [...known, ...rest];
+    }
+    function bestModeFor(modes, metric) {
+      const candidates = modes
+        .map(mode => ({ mode, value: metricValue(mode, metric.key) }))
+        .filter(item => item.value !== null);
+      if (!candidates.length) return null;
+      candidates.sort((a, b) => metric.lower ? a.value - b.value : b.value - a.value);
+      return candidates[0].mode.mode;
+    }
+    function deltaFromFixed(fixedMode, mode, metric) {
+      const fixedValue = metricValue(fixedMode, metric.key);
+      const value = metricValue(mode, metric.key);
+      if (fixedValue === null || value === null || fixedValue === 0) return null;
+      if (mode?.mode === "fixed") return { label: "baseline", kind: "" };
+      const delta = metric.lower
+        ? ((fixedValue - value) / fixedValue) * 100
+        : ((value - fixedValue) / fixedValue) * 100;
+      return {
+        label: `${delta >= 0 ? "+" : ""}${fmt(delta, "%")}`,
+        kind: Math.abs(delta) < 0.05 ? "" : delta > 0 ? "good" : "bad",
+      };
+    }
+    function deltaPill(delta) {
+      if (!delta) return `<span class="delta">немає</span>`;
+      return `<span class="delta ${delta.kind}">${delta.label}</span>`;
+    }
+    function renderModeCard(mode, fixedMode, winners) {
+      const stats = keyMetrics.slice(0, 4).map(metric => {
+        const value = metricValue(mode, metric.key);
+        const winner = winners[metric.key] === mode.mode;
+        return `<div class="mode-stat">
+          <span>${metric.label}</span>
+          <strong class="${winner ? "winner" : ""}">${fmt(value, metric.suffix, metric.digits ?? 1)}</strong>
+        </div>`;
+      }).join("");
+      const deltas = mode.mode === "fixed"
+        ? `<span class="tag">baseline</span>`
+        : deltaPill(deltaFromFixed(fixedMode, mode, keyMetrics[0]));
+      return `<article class="mode-card ${modeClass(mode.mode)}">
+        <div class="section-header" style="padding:0;border:0;background:transparent;">
+          <h3>${modeLabels[mode.mode] || mode.mode}</h3>
+          <span class="tag">${mode.count || 0} запусків</span>
+        </div>
+        ${stats}
+        <div class="mode-stat"><span>Очікування vs fixed</span><strong>${deltas}</strong></div>
+      </article>`;
+    }
+    function renderComparison(modes) {
+      const ordered = orderedModes(modes);
+      const map = byMode(ordered);
+      const fixedMode = map.fixed || null;
+      const winners = Object.fromEntries(keyMetrics.map(metric => [metric.key, bestModeFor(ordered, metric)]));
+      const cards = ordered.length
+        ? `<div class="compare-grid">${ordered.map(mode => renderModeCard(mode, fixedMode, winners)).join("")}</div>`
+        : "";
+      const rows = keyMetrics.map(metric => {
+        const best = winners[metric.key];
+        const cells = modeOrder.map(modeName => {
+          const mode = map[modeName];
+          const value = metricValue(mode, metric.key);
+          const delta = deltaFromFixed(fixedMode, mode, metric);
+          return `<td class="compare-cell ${best === modeName ? "winner" : ""}">
+            <span class="value-cell">${fmt(value, metric.suffix, metric.digits ?? 1)}</span>
+            <span class="cell-note">${mode ? `${metricCount(mode, metric.key)} значень` : "немає режиму"} ${modeName !== "fixed" ? deltaPill(delta) : ""}</span>
+          </td>`;
+        }).join("");
+        return `<tr>
+          <td>${metric.label}</td>
+          ${cells}
+          <td>${best ? modeLabels[best] || best : "немає"}</td>
+        </tr>`;
+      }).join("");
+      return `<section class="section">
+        <div class="section-header">
+          <h2>Порівняння режимів</h2>
+          <span class="tag good">Fixed = baseline</span>
+        </div>
+        <div class="section-body">
+          ${cards}
+          <table>
+            <thead>
+              <tr><th>Метрика</th><th>Fixed</th><th>Local</th><th>FlowMind</th><th>Краще</th></tr>
+            </thead>
+            <tbody>${rows}</tbody>
+          </table>
+        </div>
+      </section>`;
     }
     function renderMode(mode) {
       const metrics = mode.metrics || {};
@@ -4168,19 +4368,28 @@ AVERAGES_PAGE = r"""<!doctype html>
     async function loadAverages() {
       const payload = await api("/api/averages");
       $("totalTag").textContent = `${payload.total_results || 0} результатів`;
-      const modes = payload.modes || [];
+      const modes = orderedModes(payload.modes || []);
       const flowmind = modes.find(item => item.mode === "flowmind") || { metrics: {} };
       const fixed = modes.find(item => item.mode === "fixed") || { metrics: {} };
+      const local = modes.find(item => item.mode === "local") || { metrics: {} };
       const wait = flowmind.metrics?.average_waiting_time?.average;
       const fixedWait = fixed.metrics?.average_waiting_time?.average;
+      const localWait = local.metrics?.average_waiting_time?.average;
       const improvement = fixedWait && wait ? ((fixedWait - wait) / fixedWait) * 100 : null;
+      const localImprovement = fixedWait && localWait ? ((fixedWait - localWait) / fixedWait) * 100 : null;
       $("overview").innerHTML = [
         card("Усього результатів", fmt(payload.total_results, "", 0), `${payload.total_rows || 0} summary rows`),
         card("Режимів", fmt(modes.length, "", 0), modes.map(item => item.mode).join(", ")),
-        card("FlowMind очікування", fmt(wait, " с"), "середнє по всіх flowmind"),
-        card("Різниця з fixed", improvement == null ? "немає" : fmt(improvement, "%"), "позитивне значення краще"),
+        card("FlowMind vs fixed", improvement == null ? "немає" : fmt(improvement, "%"), `очікування: ${fmt(wait, " с")}`),
+        card("Local vs fixed", localImprovement == null ? "немає" : fmt(localImprovement, "%"), `очікування: ${fmt(localWait, " с")}`),
       ].join("");
-      $("modeSections").innerHTML = modes.length ? modes.map(renderMode).join("") : `<div class="empty">Немає summary.csv для агрегації.</div>`;
+      $("comparison").innerHTML = modes.length ? renderComparison(modes) : `<div class="empty">Немає summary.csv для агрегації.</div>`;
+      $("modeSections").innerHTML = modes.length ? `<section class="section">
+        <div class="section-header">
+          <h2>Деталізація середніх</h2>
+          <span class="tag">усі числові метрики</span>
+        </div>
+      </section>${modes.map(renderMode).join("")}` : "";
     }
     loadAverages();
   </script>
@@ -4226,6 +4435,10 @@ else:
     @app.get("/averages", response_class=HTMLResponse)
     def averages_page() -> Any:
         return AVERAGES_PAGE
+
+    @app.get("/assets/icon_car.png")
+    def car_icon() -> Any:
+        return FileResponse(CAR_ICON_PATH, media_type="image/png")
 
     @app.get("/api/health")
     def health() -> dict[str, Any]:
