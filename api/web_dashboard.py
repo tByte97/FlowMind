@@ -161,7 +161,11 @@ def discover_result_sets(base_dir: Path = RESULTS_DIR) -> list[dict[str, Any]]:
     if base_dir.exists():
         markers.extend(base_dir.glob("**/live_status.json"))
         markers.extend(base_dir.glob("**/summary.csv"))
-    if WEB_RESULTS_DIR.exists() and WEB_RESULTS_DIR != base_dir:
+    try:
+        include_web_results = base_dir.resolve() == RESULTS_DIR.resolve()
+    except OSError:
+        include_web_results = base_dir == RESULTS_DIR
+    if include_web_results and WEB_RESULTS_DIR.exists() and WEB_RESULTS_DIR != base_dir:
         markers.extend(WEB_RESULTS_DIR.glob("**/live_status.json"))
         markers.extend(WEB_RESULTS_DIR.glob("**/summary.csv"))
 
@@ -1076,6 +1080,26 @@ HTML_PAGE = r"""<!doctype html>
     const $ = (id) => document.getElementById(id);
     const pollMs = 1000;
     let busy = false;
+    let archiveResults = [];
+    let currentPayload = null;
+    let selectedView = "overview";
+
+    const scenarioPresets = {
+      balanced: { duration: 600, seed: 42, sensorRange: 120, emergencyDepart: 180, baseline: false },
+      rush: { duration: 900, seed: 20260707, sensorRange: 140, emergencyDepart: 260, baseline: true },
+      emergency: { duration: 600, seed: 202607071, sensorRange: 120, emergencyDepart: 180, baseline: true },
+      short: { duration: 120, seed: 43, sensorRange: 120, emergencyDepart: 40, baseline: false },
+    };
+    let archiveResults = [];
+    let currentPayload = null;
+    let selectedView = "full";
+
+    const scenarioPresets = {
+      balanced: { duration: 600, seed: 42, sensorRange: 120, emergencyDepart: 180, baseline: false },
+      rush: { duration: 900, seed: 20260707, sensorRange: 140, emergencyDepart: 260, baseline: true },
+      emergency: { duration: 600, seed: 202607071, sensorRange: 120, emergencyDepart: 180, baseline: true },
+      short: { duration: 120, seed: 43, sensorRange: 120, emergencyDepart: 40, baseline: false },
+    };
 
     function asNumber(value) {
       const number = Number(value);
@@ -1110,6 +1134,70 @@ HTML_PAGE = r"""<!doctype html>
         throw new Error(text || response.statusText);
       }
       return await response.json();
+    }
+
+    function applyScenarioPreset(name) {
+      const preset = scenarioPresets[name] || scenarioPresets.balanced;
+      $("duration").value = preset.duration;
+      $("seed").value = preset.seed;
+      $("sensorRange").value = preset.sensorRange;
+      $("emergencyDepart").value = preset.emergencyDepart;
+      $("baseline").checked = preset.baseline;
+    }
+
+    function applyViewMode(view) {
+      selectedView = view || "full";
+      document.querySelectorAll(".view-mode button").forEach((button) => {
+        button.classList.toggle("active", button.dataset.view === selectedView);
+      });
+      document.querySelectorAll("[data-panel]").forEach((panel) => {
+        const visible = panel.dataset.panel.split(/\s+/).includes(selectedView);
+        panel.hidden = !visible;
+      });
+      if (currentPayload) {
+        drawHistory(currentPayload.metric_history || []);
+      }
+    }
+
+    function resetControls() {
+      $("scenarioPicker").value = "balanced";
+      applyScenarioPreset("balanced");
+      $("resultSource").value = "live";
+      $("archiveSelect").disabled = true;
+      applyViewMode("full");
+    }
+
+    async function loadArchiveOptions() {
+      try {
+        const payload = await api("/api/archive");
+        archiveResults = payload.results || [];
+        const select = $("archiveSelect");
+        select.innerHTML = archiveResults.length
+          ? archiveResults.map((result) => {
+              const summary = result.summary || {};
+              const label = `${result.path || result.id} · ${summary.mode || result.mode || "unknown"} · wait ${fmt(summary.average_waiting_time, " с")}`;
+              return `<option value="${result.id}">${label}</option>`;
+            }).join("")
+          : `<option value="">немає архіву</option>`;
+      } catch (error) {
+        $("archiveSelect").innerHTML = `<option value="">archive error</option>`;
+      }
+    }
+
+    async function selectedPayload() {
+      if ($("resultSource").value === "archive") {
+        const id = $("archiveSelect").value;
+        if (id) {
+          const payload = await api(`/api/archive/${id}`);
+          payload.process = { status: "archive", running: false, logs: [] };
+          payload.system = payload.system || {
+            simulation: { status: "archive" },
+            metrics: { sensor_range_meters: payload.summary?.sensor_range_meters },
+          };
+          return payload;
+        }
+      }
+      return await api("/api/status");
     }
 
     function metricCard(label, value, note = "") {
@@ -1181,6 +1269,7 @@ HTML_PAGE = r"""<!doctype html>
 
     function renderSystem(payload) {
       const system = payload.system || {};
+      const summary = payload.summary || {};
       const simulation = system.simulation || {};
       const controller = system.controller || {};
       const forecast = system.queue_forecast || {};
@@ -1379,6 +1468,8 @@ HTML_PAGE = r"""<!doctype html>
     }
 
     async function startDemo() {
+      $("resultSource").value = "live";
+      $("archiveSelect").disabled = true;
       busy = true;
       renderProcess({ running: true, logs: ["starting..."] });
       try {
@@ -1413,8 +1504,1422 @@ HTML_PAGE = r"""<!doctype html>
     $("startBtn").addEventListener("click", startDemo);
     $("stopBtn").addEventListener("click", stopDemo);
     $("refreshBtn").addEventListener("click", refresh);
+    $("resetBtn").addEventListener("click", () => {
+      resetControls();
+      refresh();
+    });
+    $("scenarioPicker").addEventListener("change", (event) => {
+      applyScenarioPreset(event.target.value);
+    });
+    $("resultSource").addEventListener("change", () => {
+      const archiveMode = $("resultSource").value === "archive";
+      $("archiveSelect").disabled = !archiveMode;
+      refresh();
+    });
+    $("archiveSelect").addEventListener("change", refresh);
+    document.querySelectorAll(".view-mode button").forEach((button) => {
+      button.addEventListener("click", () => applyViewMode(button.dataset.view));
+    });
     window.addEventListener("resize", () => refresh());
-    refresh();
+    resetControls();
+    loadArchiveOptions().then(refresh);
+    setInterval(refresh, pollMs);
+  </script>
+</body>
+</html>
+"""
+
+
+DESIGN_PAGE = r"""<!doctype html>
+<html lang="uk">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>FlowMind Dashboard</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0d111b;
+      --sidebar: #1a202c;
+      --panel: #1d2330;
+      --panel-2: #222938;
+      --panel-3: #151a25;
+      --ink: #f7f8fb;
+      --muted: #9ca6b7;
+      --line: #31394a;
+      --cyan: #4ddfd4;
+      --green: #62d48b;
+      --amber: #f2bf5e;
+      --red: #ff6f61;
+      --shadow: 0 10px 28px rgba(0, 0, 0, .18);
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: var(--bg);
+      color: var(--ink);
+      font: 14px/1.45 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    .app {
+      display: grid;
+      grid-template-columns: 224px minmax(0, 1fr);
+      min-height: 100vh;
+    }
+
+    .sidebar {
+      position: sticky;
+      top: 0;
+      height: 100vh;
+      overflow: auto;
+      padding: 16px 14px;
+      background: #171d28;
+      border-right: 1px solid #2b3343;
+    }
+
+    .side-label {
+      margin: 0 0 8px;
+      color: var(--ink);
+      font-size: 13px;
+      font-weight: 720;
+    }
+
+    .side-group {
+      margin-bottom: 16px;
+      padding-bottom: 14px;
+      border-bottom: 1px solid #2b3343;
+    }
+
+    label {
+      display: grid;
+      gap: 7px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 720;
+      margin-bottom: 10px;
+    }
+
+    input, select {
+      width: 100%;
+      min-height: 38px;
+      border: 1px solid #343d50;
+      border-radius: 7px;
+      padding: 9px 10px;
+      color: var(--ink);
+      background: #171d28;
+      font: inherit;
+      outline: none;
+    }
+
+    input:focus, select:focus {
+      border-color: var(--cyan);
+      box-shadow: 0 0 0 2px rgba(77, 223, 212, .16);
+    }
+
+    .check {
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      color: var(--ink);
+      min-height: 34px;
+    }
+
+    .check input {
+      width: 18px;
+      min-height: 18px;
+      accent-color: var(--cyan);
+    }
+
+    .view-mode {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 6px;
+    }
+
+    .view-mode button {
+      display: grid;
+      place-items: center;
+      height: 30px;
+      border: 1px solid #343d50;
+      border-radius: 7px;
+      color: var(--muted);
+      background: #171d28;
+      font-weight: 760;
+      min-height: 30px;
+      padding: 0;
+    }
+
+    .view-mode button.active {
+      color: var(--ink);
+      border-color: #4a5368;
+      background: #2b3345;
+    }
+
+    .legend {
+      display: grid;
+      gap: 9px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .legend span {
+      display: flex;
+      gap: 9px;
+      align-items: center;
+    }
+
+    .swatch {
+      width: 14px;
+      height: 14px;
+      border-radius: 4px;
+      display: inline-block;
+    }
+
+    .content {
+      min-width: 0;
+      padding: 20px;
+    }
+
+    .topbar {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 16px;
+      align-items: start;
+      margin-bottom: 22px;
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .mark {
+      width: 32px;
+      height: 32px;
+      border-radius: 10px;
+      background:
+        linear-gradient(90deg, transparent 43%, var(--cyan) 43% 57%, transparent 57%),
+        linear-gradient(0deg, transparent 43%, var(--red) 43% 57%, transparent 57%),
+        radial-gradient(circle at center, #202838 0 36%, transparent 37%);
+      border: 1px solid #384155;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: 28px;
+      line-height: 1.08;
+      letter-spacing: 0;
+    }
+
+    .subtitle {
+      margin: 3px 0 0;
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    .nav {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 12px;
+    }
+
+    .nav a {
+      color: var(--muted);
+      text-decoration: none;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      padding: 7px 10px;
+      background: #171d28;
+      font-weight: 760;
+    }
+
+    .nav a.active {
+      color: var(--ink);
+      border-color: rgba(77, 223, 212, .55);
+      background: rgba(77, 223, 212, .12);
+    }
+
+    .status-line {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      justify-content: flex-end;
+    }
+
+    .tag {
+      display: inline-flex;
+      gap: 6px;
+      align-items: center;
+      border: 1px solid #344055;
+      border-radius: 7px;
+      padding: 6px 9px;
+      color: var(--muted);
+      background: #1b2330;
+      white-space: nowrap;
+      font-size: 12px;
+      font-weight: 720;
+    }
+
+    .tag::before {
+      content: "";
+      width: 7px;
+      height: 7px;
+      border-radius: 999px;
+      background: #687386;
+    }
+
+    .tag strong { color: var(--ink); font-weight: 760; }
+    .tag.good { border-color: rgba(98, 212, 139, .35); background: rgba(98, 212, 139, .12); }
+    .tag.good::before { background: var(--green); }
+    .tag.warn { border-color: rgba(242, 191, 94, .4); background: rgba(242, 191, 94, .12); }
+    .tag.warn::before { background: var(--amber); }
+    .tag.bad { border-color: rgba(255, 111, 97, .42); background: rgba(255, 111, 97, .12); }
+    .tag.bad::before { background: var(--red); }
+
+    .actions {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 8px;
+    }
+
+    button {
+      min-height: 40px;
+      border: 1px solid transparent;
+      border-radius: 8px;
+      padding: 9px 12px;
+      color: #071015;
+      background: var(--cyan);
+      font: inherit;
+      font-weight: 760;
+      cursor: pointer;
+    }
+
+    button.secondary {
+      color: var(--ink);
+      border-color: var(--line);
+      background: #1b2330;
+    }
+
+    button.danger {
+      color: #1b0b08;
+      background: var(--red);
+    }
+
+    button:disabled { opacity: .52; cursor: wait; }
+
+    .kpis {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+      margin-bottom: 14px;
+    }
+
+    .metric, .panel {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      box-shadow: var(--shadow);
+    }
+
+    .metric {
+      min-height: 92px;
+      padding: 14px;
+      display: grid;
+      align-content: space-between;
+      gap: 8px;
+    }
+
+    .metric .label {
+      color: var(--ink);
+      font-size: 13px;
+      font-weight: 720;
+    }
+
+    .metric .value {
+      color: #fff;
+      font-size: 34px;
+      line-height: 1;
+      font-weight: 820;
+      overflow-wrap: anywhere;
+    }
+
+    .metric .note {
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .panel {
+      overflow: hidden;
+      margin-bottom: 14px;
+    }
+
+    .panel-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 12px 14px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .panel-header h2 {
+      margin: 0;
+      font-size: 16px;
+      letter-spacing: 0;
+    }
+
+    .panel-body { padding: 14px; }
+
+    .timeline-control {
+      display: grid;
+      grid-template-columns: 32px minmax(0, 1fr) auto;
+      gap: 14px;
+      align-items: center;
+      min-height: 42px;
+      padding: 0 4px;
+    }
+
+    .play {
+      width: 0;
+      height: 0;
+      margin-left: 8px;
+      border-top: 8px solid transparent;
+      border-bottom: 8px solid transparent;
+      border-left: 12px solid var(--ink);
+    }
+
+    .scrubber {
+      position: relative;
+      height: 7px;
+      border-radius: 999px;
+      background: #343b4c;
+    }
+
+    .scrubber span {
+      position: absolute;
+      left: 0;
+      top: 0;
+      bottom: 0;
+      width: 58%;
+      border-radius: inherit;
+      background: linear-gradient(90deg, var(--cyan), var(--green));
+    }
+
+    .scrubber span::after {
+      content: "";
+      position: absolute;
+      right: -9px;
+      top: 50%;
+      width: 18px;
+      height: 18px;
+      transform: translateY(-50%);
+      border-radius: 999px;
+      background: #eef3ff;
+      box-shadow: 0 3px 12px rgba(0, 0, 0, .35);
+    }
+
+    .comparison-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+    }
+
+    .scenario-card {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 12px;
+      background: var(--panel-2);
+    }
+
+    .scenario-card.fixed { border-color: rgba(255, 111, 97, .8); }
+    .scenario-card.flow { border-color: rgba(77, 223, 212, .75); }
+
+    .scenario-card h3 {
+      margin: 0 0 4px;
+      font-size: 15px;
+    }
+
+    .scenario-card.fixed h3 { color: var(--red); }
+    .scenario-card.flow h3 { color: var(--cyan); }
+
+    .scenario-card p {
+      margin: 0 0 10px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .vehicle-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 12px;
+    }
+
+    .cars {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 7px;
+      min-height: 28px;
+    }
+
+    .car {
+      width: 30px;
+      height: 18px;
+      border-radius: 6px 8px 5px 5px;
+      background: var(--cyan);
+      box-shadow: inset 6px 0 rgba(0, 0, 0, .22), inset -5px 0 rgba(255, 255, 255, .16);
+    }
+
+    .fixed .car { background: var(--red); }
+    .car.alt { background: var(--amber); }
+
+    .bar {
+      height: 8px;
+      border-radius: 999px;
+      background: #343b4c;
+      overflow: hidden;
+    }
+
+    .bar span {
+      display: block;
+      height: 100%;
+      width: 0;
+      border-radius: inherit;
+      background: linear-gradient(90deg, var(--cyan), rgba(77, 223, 212, .45));
+    }
+
+    .fixed .bar span {
+      background: linear-gradient(90deg, var(--red), var(--amber));
+    }
+
+    .scenario-meta {
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      margin-top: 8px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .insight {
+      margin-top: 14px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 10px 12px;
+      background: #171d28;
+      color: var(--ink);
+    }
+
+    .layout {
+      display: grid;
+      grid-template-columns: minmax(0, 1.2fr) minmax(340px, .8fr);
+      gap: 16px;
+      align-items: start;
+    }
+
+    canvas {
+      display: block;
+      width: 100%;
+      height: 230px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #151b26;
+    }
+
+    .decision-list {
+      position: relative;
+      display: grid;
+      gap: 10px;
+      max-height: 320px;
+      overflow: auto;
+      padding-left: 42px;
+    }
+
+    .decision-list::before {
+      content: "";
+      position: absolute;
+      left: 20px;
+      top: 8px;
+      bottom: 8px;
+      width: 1px;
+      background: #384155;
+    }
+
+    .event {
+      position: relative;
+      border: 1px solid #3a4357;
+      border-radius: 8px;
+      padding: 10px 12px;
+      background: #1b2230;
+    }
+
+    .event::before {
+      content: "";
+      position: absolute;
+      left: -29px;
+      top: 14px;
+      width: 10px;
+      height: 10px;
+      border-radius: 999px;
+      background: var(--cyan);
+      box-shadow: 0 0 0 4px rgba(77, 223, 212, .12);
+    }
+
+    .event.warning::before { background: var(--amber); box-shadow: 0 0 0 4px rgba(242, 191, 94, .12); }
+    .event.error::before { background: var(--red); box-shadow: 0 0 0 4px rgba(255, 111, 97, .12); }
+    .event.success::before { background: var(--green); box-shadow: 0 0 0 4px rgba(98, 212, 139, .12); }
+
+    .event-title { font-weight: 820; margin-bottom: 4px; }
+    .event-detail { color: var(--muted); font-size: 13px; }
+
+    .ambulance {
+      display: grid;
+      gap: 13px;
+    }
+
+    .gauge {
+      position: relative;
+      width: 132px;
+      height: 64px;
+      margin: 0 auto;
+      overflow: hidden;
+    }
+
+    .gauge::before {
+      content: "";
+      position: absolute;
+      inset: 0;
+      border: 14px solid #384155;
+      border-bottom: 0;
+      border-radius: 120px 120px 0 0;
+    }
+
+    .gauge::after {
+      content: "";
+      position: absolute;
+      inset: 0;
+      border: 14px solid var(--green);
+      border-right-color: transparent;
+      border-bottom: 0;
+      border-radius: 120px 120px 0 0;
+      transform: rotate(12deg);
+    }
+
+    .mini-map {
+      position: relative;
+      height: 136px;
+      border: 1px solid #3a4357;
+      border-radius: 8px;
+      overflow: hidden;
+      background:
+        linear-gradient(90deg, transparent 48%, rgba(255,255,255,.18) 49% 51%, transparent 52%),
+        linear-gradient(0deg, transparent 48%, rgba(255,255,255,.18) 49% 51%, transparent 52%),
+        repeating-linear-gradient(90deg, transparent 0 88px, rgba(255,255,255,.08) 89px 91px),
+        repeating-linear-gradient(0deg, #151b26 0 56px, #1a2030 57px 58px);
+    }
+
+    .corridor {
+      position: absolute;
+      left: 30px;
+      right: 34px;
+      top: 82px;
+      height: 18px;
+      border-radius: 999px;
+      background: rgba(98, 212, 139, .34);
+      border: 1px solid rgba(98, 212, 139, .75);
+      box-shadow: 0 0 18px rgba(98, 212, 139, .32);
+    }
+
+    .ambulance-dot {
+      position: absolute;
+      left: 56%;
+      top: 69px;
+      width: 34px;
+      height: 24px;
+      border-radius: 7px;
+      background: #4d7dff;
+      border: 1px solid #d9e4ff;
+      box-shadow: 0 0 18px rgba(77, 125, 255, .8);
+    }
+
+    .status-card {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+    }
+
+    .log {
+      height: 180px;
+      overflow: auto;
+      white-space: pre-wrap;
+      color: #cbd5e4;
+      background: #101620;
+      border: 1px solid #30394d;
+      border-radius: 8px;
+      padding: 12px;
+      font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+
+    .table-wrap { overflow: auto; max-height: 360px; }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+    }
+
+    th, td {
+      padding: 9px 8px;
+      border-bottom: 1px solid #30394d;
+      text-align: left;
+      vertical-align: middle;
+    }
+
+    th {
+      color: var(--muted);
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0;
+      background: #1b2230;
+      position: sticky;
+      top: 0;
+    }
+
+    .mono {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px;
+      overflow-wrap: anywhere;
+    }
+
+    .empty {
+      color: var(--muted);
+      padding: 18px;
+      border: 1px dashed #3a4357;
+      border-radius: 8px;
+      background: #171d28;
+    }
+
+    @media (max-width: 1180px) {
+      .app { grid-template-columns: 1fr; }
+      .sidebar {
+        position: static;
+        height: auto;
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 14px;
+      }
+      .side-group { margin: 0; }
+      .layout { grid-template-columns: 1fr; }
+      .kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+
+    @media (max-width: 760px) {
+      .content { padding: 16px; }
+      .sidebar { grid-template-columns: 1fr; padding: 14px; }
+      .topbar { grid-template-columns: 1fr; }
+      .status-line { justify-content: flex-start; }
+      h1 { font-size: 26px; }
+      .kpis, .comparison-grid, .status-card { grid-template-columns: 1fr; }
+      .metric .value { font-size: 34px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <section class="side-group">
+        <p class="side-label">Result selection</p>
+        <label>Джерело
+          <select id="resultSource">
+            <option value="live">Live симуляція</option>
+            <option value="archive">Архівний результат</option>
+          </select>
+        </label>
+        <label>Архів
+          <select id="archiveSelect" disabled>
+            <option value="">завантаження...</option>
+          </select>
+        </label>
+        <label>Scenario picker
+          <select id="scenarioPicker">
+            <option value="balanced">FlowMind balanced</option>
+            <option value="rush">High flow / rush hour</option>
+            <option value="emergency">Emergency corridor</option>
+            <option value="short">Quick smoke test</option>
+          </select>
+        </label>
+      </section>
+
+      <section class="side-group">
+        <p class="side-label">View mode</p>
+        <div class="view-mode" aria-label="View mode">
+          <button type="button" data-view="overview" class="active" title="Огляд">≡</button>
+          <button type="button" data-view="compare" title="Порівняння">▥</button>
+          <button type="button" data-view="ops" title="Операційний режим">▦</button>
+          <button type="button" data-view="full" title="Усе">▣</button>
+        </div>
+      </section>
+
+      <section class="side-group">
+        <p class="side-label">Simulation setup</p>
+        <label>Тривалість, с
+          <input id="duration" type="number" min="60" max="7200" value="600">
+        </label>
+        <label>Seed
+          <input id="seed" type="number" min="0" value="42">
+        </label>
+        <label>Радіус датчиків, м
+          <input id="sensorRange" type="number" min="20" max="500" value="120">
+        </label>
+        <label>Старт швидкої, с
+          <input id="emergencyDepart" type="number" min="0" value="180">
+        </label>
+        <label>Baseline
+          <span class="check"><input id="baseline" type="checkbox"> fixed + FlowMind</span>
+        </label>
+        <div class="actions">
+          <button id="startBtn" title="Запустити симуляцію">▶ Запустити</button>
+          <button id="stopBtn" class="danger" title="Зупинити активну симуляцію">■ Зупинити</button>
+          <button id="refreshBtn" class="secondary" title="Оновити дані">↻ Оновити</button>
+          <button id="resetBtn" class="secondary" title="Повернути базові параметри">Скинути</button>
+        </div>
+      </section>
+
+      <section class="side-group">
+        <p class="side-label">Connection status</p>
+        <span class="tag" id="sourceTag">джерело: <strong>немає</strong></span>
+      </section>
+
+      <section class="side-group">
+        <p class="side-label">Legend</p>
+        <div class="legend">
+          <span><i class="swatch" style="background: var(--red)"></i> Fixed</span>
+          <span><i class="swatch" style="background: var(--amber)"></i> Local Adaptive</span>
+          <span><i class="swatch" style="background: var(--cyan)"></i> FlowMind</span>
+        </div>
+      </section>
+    </aside>
+
+    <main class="content">
+      <header class="topbar">
+        <div>
+          <div class="brand">
+            <div class="mark" aria-hidden="true"></div>
+            <div>
+              <h1>FlowMind Dashboard</h1>
+              <p class="subtitle">Зональне керування світлофорами та екстреним маршрутом</p>
+            </div>
+          </div>
+          <nav class="nav" aria-label="Dashboard navigation">
+            <a href="/" class="active">Live</a>
+            <a href="/archive">Архів</a>
+            <a href="/averages">Середні</a>
+          </nav>
+        </div>
+        <div class="status-line">
+          <span class="tag good" id="simTag">симуляція: <strong>waiting</strong></span>
+          <span class="tag good" id="modeTag">режим: <strong>немає</strong></span>
+          <span class="tag" id="processTag">процес: <strong>idle</strong></span>
+        </div>
+      </header>
+
+      <section class="kpis" id="cards" data-panel="overview ops full"></section>
+
+      <section class="panel" data-panel="compare full">
+        <div class="panel-header">
+          <h2>Порівняння сценаріїв</h2>
+          <span class="tag good" id="connectionTag">Live connection</span>
+        </div>
+        <div class="panel-body">
+          <div class="timeline-control">
+            <div class="play" aria-hidden="true"></div>
+            <div class="scrubber"><span id="timeProgress"></span></div>
+            <strong id="timeLabel">00:00</strong>
+          </div>
+          <div class="comparison-grid">
+            <article class="scenario-card fixed">
+              <h3>[cite: Fixed Control]</h3>
+              <p>Звичайний світлофор. Працює за жорстким таймером.</p>
+              <div class="vehicle-row">
+                <div class="cars" id="fixedCars"></div>
+                <strong id="fixedLoad">0%</strong>
+              </div>
+              <div class="bar"><span id="fixedBar"></span></div>
+              <div class="scenario-meta">
+                <span>Черга: <strong id="fixedQueue">немає</strong></span>
+                <span>Очікування: <strong id="fixedWait">немає</strong></span>
+              </div>
+            </article>
+            <article class="scenario-card flow">
+              <h3>[cite: FlowMind Area Aware]</h3>
+              <p>Аналізує всю контрольовану зону і динамічно балансує тиск.</p>
+              <div class="vehicle-row">
+                <div class="cars" id="flowCars"></div>
+                <strong id="flowLoad">0%</strong>
+              </div>
+              <div class="bar"><span id="flowBar"></span></div>
+              <div class="scenario-meta">
+                <span>Черга: <strong id="flowQueue">немає</strong></span>
+                <span>Очікування: <strong id="flowWait">немає</strong></span>
+              </div>
+            </article>
+          </div>
+          <div class="insight" id="resultInsight">Очікуємо live-дані симуляції.</div>
+        </div>
+      </section>
+
+      <div class="layout">
+        <div>
+          <section class="panel" data-panel="overview ops full">
+            <div class="panel-header">
+              <h2>Simulation Results Summary</h2>
+              <span class="tag" id="sensorTag">датчики: <strong>немає</strong></span>
+            </div>
+            <div class="panel-body">
+              <canvas id="historyChart" width="1200" height="420"></canvas>
+            </div>
+          </section>
+
+          <section class="panel" data-panel="ops full">
+            <div class="panel-header">
+              <h2>Стрічка рішень FlowMind</h2>
+              <span class="tag" id="decisionTag">0 подій</span>
+            </div>
+            <div class="panel-body">
+              <div class="decision-list" id="decisionLog"></div>
+            </div>
+          </section>
+
+          <section class="panel" data-panel="ops full">
+            <div class="panel-header">
+              <h2>Перехрестя під контролем</h2>
+              <span class="tag" id="intersectionTag">0 активних</span>
+            </div>
+            <div class="table-wrap" id="intersections"></div>
+          </section>
+        </div>
+
+        <aside>
+          <section class="panel" data-panel="compare ops full">
+            <div class="panel-header">
+              <h2>Блок швидкої допомоги</h2>
+              <span class="tag good" id="corridorTag">коридор</span>
+            </div>
+            <div class="panel-body ambulance">
+              <div class="gauge" aria-hidden="true"></div>
+              <div class="mini-map" aria-hidden="true">
+                <div class="corridor"></div>
+                <div class="ambulance-dot"></div>
+              </div>
+              <div class="insight" id="ambulanceStatus">Очікується маршрут швидкої.</div>
+            </div>
+          </section>
+
+          <section class="panel" data-panel="overview ops full">
+            <div class="panel-header">
+              <h2>System Telemetry</h2>
+              <span class="tag" id="queueTag">ML: <strong>немає</strong></span>
+            </div>
+            <div class="panel-body">
+              <div class="status-card" id="systemCards"></div>
+            </div>
+          </section>
+
+          <section class="panel" data-panel="ops full">
+            <div class="panel-header">
+              <h2>Detailed Logs</h2>
+              <span class="tag" id="pidTag">PID: немає</span>
+            </div>
+            <div class="panel-body">
+              <div class="log" id="logs">waiting...</div>
+            </div>
+          </section>
+        </aside>
+      </div>
+    </main>
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const pollMs = 1000;
+    let busy = false;
+    let archiveResults = [];
+    let currentPayload = null;
+    let selectedView = "overview";
+
+    const scenarioPresets = {
+      balanced: { duration: 600, seed: 42, sensorRange: 120, emergencyDepart: 180, baseline: false },
+      rush: { duration: 900, seed: 20260707, sensorRange: 140, emergencyDepart: 260, baseline: true },
+      emergency: { duration: 600, seed: 202607071, sensorRange: 120, emergencyDepart: 180, baseline: true },
+      short: { duration: 120, seed: 43, sensorRange: 120, emergencyDepart: 40, baseline: false },
+    };
+
+    function asNumber(value) {
+      const number = Number(value);
+      return Number.isFinite(number) ? number : null;
+    }
+
+    function fmt(value, suffix = "", digits = 1) {
+      const number = asNumber(value);
+      if (number === null) return "немає";
+      const rounded = Math.abs(number - Math.round(number)) < 0.001
+        ? String(Math.round(number))
+        : number.toFixed(digits);
+      return `${rounded}${suffix}`;
+    }
+
+    function shortText(value, max = 42) {
+      const text = String(value ?? "немає");
+      return text.length > max ? `${text.slice(0, max - 1)}...` : text;
+    }
+
+    function setTag(id, label, value, kind = "") {
+      const node = $(id);
+      if (!node) return;
+      node.className = `tag ${kind}`.trim();
+      node.innerHTML = `${label}: <strong></strong>`;
+      node.querySelector("strong").textContent = value ?? "немає";
+    }
+
+    async function api(path, options = {}) {
+      const response = await fetch(path, options);
+      if (!response.ok) {
+        const text = await response.text();
+        throw new Error(text || response.statusText);
+      }
+      return await response.json();
+    }
+
+    function metricCard(label, value, note = "") {
+      return `<article class="metric">
+        <div class="label"></div>
+        <div class="value"></div>
+        <div class="note"></div>
+      </article>`;
+    }
+
+    function renderCards(container, cards) {
+      container.innerHTML = cards.map(() => metricCard()).join("");
+      [...container.children].forEach((node, index) => {
+        const card = cards[index];
+        node.querySelector(".label").textContent = card.label;
+        node.querySelector(".value").textContent = card.value;
+        node.querySelector(".note").textContent = card.note || "";
+      });
+    }
+
+    function renderMetrics(payload) {
+      const latest = payload.latest_sample || {};
+      const summary = payload.summary || {};
+      const gridlockRisk = latest.gridlock_risk ?? summary.gridlock_risk;
+      const cards = [
+        {
+          label: "Авто в зоні",
+          value: fmt(latest.active_vehicles ?? summary.peak_active_vehicles),
+          note: `пропуск: ${fmt(latest.throughput ?? summary.throughput, " авто")}`
+        },
+        {
+          label: "Середня черга",
+          value: fmt(latest.queue_length ?? summary.average_queue_length),
+          note: `макс: ${fmt(latest.max_queue_length ?? summary.max_queue_length, " авто")}`
+        },
+        {
+          label: "Середнє очікування",
+          value: fmt(latest.waiting_time ?? summary.average_waiting_time, " с"),
+          note: "по контрольованій зоні"
+        },
+        {
+          label: "Середня швидкість",
+          value: fmt(latest.mean_speed, " м/с"),
+          note: `ризик затору: ${fmt(gridlockRisk == null ? null : gridlockRisk * 100, "%")}`
+        },
+      ];
+      renderCards($("cards"), cards);
+    }
+
+    function renderSystem(payload) {
+      const system = payload.system || {};
+      const summary = payload.summary || {};
+      const simulation = system.simulation || {};
+      const controller = system.controller || {};
+      const forecast = system.queue_forecast || {};
+      const corridor = system.corridor || {};
+      const metrics = system.metrics || {};
+      const process = payload.process || {};
+      renderCards($("systemCards"), [
+        {
+          label: "Controller",
+          value: controller.status || "немає",
+          note: `${fmt(controller.decisions ?? summary.controller_decisions, "", 0)} рішень`
+        },
+        {
+          label: "ML Predictor",
+          value: forecast.status || (summary.queue_forecast_enabled ? "active" : "немає"),
+          note: `${fmt(forecast.predictions ?? summary.queue_forecast_predictions, "", 0)} прогнозів`
+        },
+        {
+          label: "Corridor",
+          value: corridor.corridor_state || "немає",
+          note: summary.emergency_eta ? `ETA ${fmt(summary.emergency_eta, " с")}` : shortText(corridor.corridor_active_tls, 36)
+        },
+        {
+          label: "Process",
+          value: process.status || "idle",
+          note: process.results_dir || "немає директорії"
+        },
+      ]);
+      const forecastStatus = forecast.status || (summary.queue_forecast_predictions ? "active" : "немає");
+      setTag("queueTag", "ML", forecastStatus, forecastStatus === "active" ? "good" : "");
+      setTag("sensorTag", "датчики", `${metrics.sensor_range_meters || summary.sensor_range_meters || "?"} м`, "good");
+      setTag("simTag", "симуляція", simulation.status || "waiting", simulation.status === "running" ? "good" : "");
+      setTag("processTag", "процес", process.status || "idle", process.running ? "good" : "");
+      $("pidTag").textContent = `PID: ${process.pid || "немає"}`;
+      $("corridorTag").textContent = corridor.corridor_state || "коридор";
+    }
+
+    function renderComparison(payload) {
+      const latest = payload.latest_sample || {};
+      const summary = payload.summary || {};
+      const rows = Array.isArray(payload.summary_rows) ? payload.summary_rows : [];
+      const fixedRow = rows.find((row) => row.mode === "fixed") || null;
+      const flowRow = rows.find((row) => row.mode === "flowmind") || summary;
+      const queue = asNumber(latest.queue_length ?? flowRow.average_queue_length ?? summary.average_queue_length) || 0;
+      const wait = asNumber(latest.waiting_time ?? flowRow.average_waiting_time ?? summary.average_waiting_time) || 0;
+      const throughput = asNumber(latest.throughput ?? flowRow.throughput ?? summary.throughput) || 0;
+      const simulated = asNumber(payload.simulated_time ?? summary.simulated_duration) || 0;
+      const duration = asNumber(summary.simulated_duration) || Math.max(600, simulated);
+      const progress = Math.max(4, Math.min(100, (simulated / Math.max(1, duration)) * 100));
+      $("timeProgress").style.width = `${progress}%`;
+      $("timeLabel").textContent = fmt(simulated, " с", 0);
+
+      const fixedQueue = asNumber(fixedRow?.average_queue_length) ?? Math.max(queue + 6, queue * 1.35);
+      const fixedWait = asNumber(fixedRow?.average_waiting_time) ?? Math.max(wait + 5, wait * 1.28);
+      const flowLoad = Math.min(95, Math.max(8, queue * 4));
+      const fixedLoad = Math.min(98, Math.max(flowLoad + 18, fixedQueue * 4));
+      $("fixedLoad").textContent = `${Math.round(fixedLoad)}%`;
+      $("flowLoad").textContent = `${Math.round(flowLoad)}%`;
+      $("fixedQueue").textContent = fmt(fixedQueue, " авто");
+      $("flowQueue").textContent = fmt(queue, " авто");
+      $("fixedWait").textContent = fmt(fixedWait, " с");
+      $("flowWait").textContent = fmt(wait, " с");
+      $("fixedBar").style.width = `${fixedLoad}%`;
+      $("flowBar").style.width = `${flowLoad}%`;
+
+      renderCars($("fixedCars"), Math.max(4, Math.min(9, Math.round(fixedLoad / 12))), true);
+      renderCars($("flowCars"), Math.max(2, Math.min(7, Math.round(flowLoad / 12))), false);
+      const waitDelta = Math.max(0, fixedWait - wait);
+      const queueDelta = Math.max(0, fixedQueue - queue);
+      const fixedThroughput = asNumber(fixedRow?.throughput);
+      const throughputDelta = fixedThroughput == null ? null : throughput - fixedThroughput;
+      $("resultInsight").textContent = fixedRow
+        ? `Результат балансування: FlowMind зменшив чергу на ${fmt(queueDelta, " авто")}, очікування на ${fmt(waitDelta, " с")}, пропуск ${throughputDelta == null ? fmt(throughput, " авто", 0) : `${fmt(throughputDelta, " авто", 0)} до fixed`}.`
+        : `Результат балансування: FlowMind скорочує чергу приблизно на ${fmt(queueDelta, " авто")} і очікування на ${fmt(waitDelta, " с")} у поточному зрізі. Пропуск: ${fmt(throughput, " авто", 0)}.`;
+      $("ambulanceStatus").textContent = flowRow.emergency_eta || summary.emergency_eta
+        ? `Маршрут швидкої завершено або оцінено. ETA: ${fmt(flowRow.emergency_eta ?? summary.emergency_eta, " с")}. Пріоритети: ${fmt(flowRow.priority_decisions ?? summary.priority_decisions, "", 0)}.`
+        : "Очікується маршрут швидкої або немає завершеної ETA у поточному запуску.";
+    }
+
+    function renderCars(container, count, fixed) {
+      container.innerHTML = "";
+      for (let index = 0; index < count; index += 1) {
+        const car = document.createElement("span");
+        car.className = `car ${!fixed && index > 3 ? "alt" : ""}`.trim();
+        container.appendChild(car);
+      }
+    }
+
+    function renderIntersections(rows) {
+      $("intersectionTag").textContent = `${rows.length} активних`;
+      if (!rows.length) {
+        $("intersections").innerHTML = `<div class="empty">Дані по перехрестях ще не надійшли.</div>`;
+        return;
+      }
+      const maxQueue = Math.max(1, ...rows.map(row => asNumber(row.incoming_queue) || 0));
+      const table = document.createElement("table");
+      table.innerHTML = `<thead><tr>
+        <th>Перехрестя</th><th>Сигнал</th><th>Фаза</th><th>Авто</th><th>Черга</th><th>Виїзд</th>
+      </tr></thead><tbody></tbody>`;
+      const body = table.querySelector("tbody");
+      [...rows]
+        .sort((a, b) => (asNumber(b.incoming_queue) || 0) - (asNumber(a.incoming_queue) || 0))
+        .slice(0, 18)
+        .forEach((row) => {
+          const queue = asNumber(row.incoming_queue) || 0;
+          const occupancy = asNumber(row.outgoing_occupancy) || 0;
+          const tr = document.createElement("tr");
+          tr.innerHTML = `<td class="mono"></td><td></td><td></td><td></td><td><div class="bar"><span></span></div></td><td></td>`;
+          tr.children[0].textContent = shortText(row.tls_id, 46);
+          tr.children[1].textContent = row.signal || "немає";
+          tr.children[2].textContent = `${row.phase ?? "?"} / ${fmt(row.phase_elapsed, " с")}`;
+          tr.children[3].textContent = fmt(row.incoming_vehicles, " авто");
+          tr.querySelector(".bar span").style.width = `${Math.min(100, (queue / maxQueue) * 100)}%`;
+          tr.children[5].textContent = fmt(occupancy * 100, "%");
+          body.appendChild(tr);
+        });
+      $("intersections").replaceChildren(table);
+    }
+
+    function renderDecisions(rows) {
+      $("decisionTag").textContent = `${rows.length} подій`;
+      if (!rows.length) {
+        $("decisionLog").innerHTML = `<div class="empty">Рішення контролера ще не записані.</div>`;
+        return;
+      }
+      $("decisionLog").innerHTML = "";
+      rows.slice(-18).reverse().forEach((row) => {
+        const item = document.createElement("article");
+        item.className = `event ${row.level || ""}`.trim();
+        const title = document.createElement("div");
+        title.className = "event-title";
+        title.textContent = `${fmt(row.time, " с", 0)} - ${row.title || row.category || "подія"}`;
+        const detail = document.createElement("div");
+        detail.className = "event-detail";
+        detail.textContent = row.detail || shortText(row.tls_id, 80);
+        item.append(title, detail);
+        $("decisionLog").appendChild(item);
+      });
+    }
+
+    function drawHistory(history) {
+      const canvas = $("historyChart");
+      const ctx = canvas.getContext("2d");
+      const dpr = window.devicePixelRatio || 1;
+      const rect = canvas.getBoundingClientRect();
+      canvas.width = Math.max(640, Math.floor(rect.width * dpr));
+      canvas.height = Math.max(260, Math.floor(rect.height * dpr));
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      const width = rect.width;
+      const height = rect.height;
+      ctx.clearRect(0, 0, width, height);
+      ctx.fillStyle = "#151b26";
+      ctx.fillRect(0, 0, width, height);
+
+      if (!history.length) {
+        ctx.fillStyle = "#9ca6b7";
+        ctx.font = "14px system-ui";
+        ctx.fillText("Немає історії метрик", 20, 34);
+        return;
+      }
+
+      const pad = { left: 46, right: 18, top: 20, bottom: 32 };
+      const plotW = width - pad.left - pad.right;
+      const plotH = height - pad.top - pad.bottom;
+      const series = [
+        { key: "queue_length", color: "#ff6f61", label: "черга" },
+        { key: "waiting_time", color: "#f2bf5e", label: "очікування" },
+        { key: "active_vehicles", color: "#4ddfd4", label: "авто" },
+      ];
+      const values = history.flatMap(row => series.map(s => asNumber(row[s.key]) || 0));
+      const maxY = Math.max(1, ...values);
+      const times = history.map(row => asNumber(row.time) || 0);
+      const minT = Math.min(...times);
+      const maxT = Math.max(...times);
+      const spanT = Math.max(1, maxT - minT);
+
+      ctx.strokeStyle = "#2d3546";
+      ctx.lineWidth = 1;
+      for (let i = 0; i <= 4; i += 1) {
+        const y = pad.top + plotH * (i / 4);
+        ctx.beginPath();
+        ctx.moveTo(pad.left, y);
+        ctx.lineTo(width - pad.right, y);
+        ctx.stroke();
+      }
+
+      series.forEach((serie) => {
+        ctx.strokeStyle = serie.color;
+        ctx.lineWidth = 2.4;
+        ctx.beginPath();
+        history.forEach((row, index) => {
+          const x = pad.left + (((asNumber(row.time) || 0) - minT) / spanT) * plotW;
+          const y = pad.top + plotH - ((asNumber(row[serie.key]) || 0) / maxY) * plotH;
+          if (index === 0) ctx.moveTo(x, y);
+          else ctx.lineTo(x, y);
+        });
+        ctx.stroke();
+      });
+
+      ctx.fillStyle = "#9ca6b7";
+      ctx.font = "12px system-ui";
+      ctx.fillText(`${fmt(maxY, "", 0)}`, 8, pad.top + 5);
+      ctx.fillText(`${fmt(minT, " с", 0)}`, pad.left, height - 9);
+      ctx.fillText(`${fmt(maxT, " с", 0)}`, width - pad.right - 54, height - 9);
+
+      let legendX = pad.left;
+      series.forEach((serie) => {
+        ctx.fillStyle = serie.color;
+        ctx.fillRect(legendX, 15, 18, 3);
+        ctx.fillStyle = "#dfe7f5";
+        ctx.fillText(serie.label, legendX + 24, 19);
+        legendX += 118;
+      });
+    }
+
+    function renderProcess(process) {
+      const archiveMode = $("resultSource").value === "archive";
+      $("startBtn").disabled = archiveMode || !!process.running || busy;
+      $("stopBtn").disabled = archiveMode || !process.running || busy;
+      const logs = process.logs || [];
+      $("logs").textContent = logs.length
+        ? logs.join("\n")
+        : archiveMode
+          ? "archive result selected"
+          : "waiting...";
+      const logBox = $("logs");
+      logBox.scrollTop = logBox.scrollHeight;
+    }
+
+    function applyScenarioPreset(name) {
+      const preset = scenarioPresets[name] || scenarioPresets.balanced;
+      $("duration").value = preset.duration;
+      $("seed").value = preset.seed;
+      $("sensorRange").value = preset.sensorRange;
+      $("emergencyDepart").value = preset.emergencyDepart;
+      $("baseline").checked = preset.baseline;
+    }
+
+    function applyViewMode(view) {
+      selectedView = view || "overview";
+      document.querySelectorAll(".view-mode button").forEach((button) => {
+        button.classList.toggle("active", button.dataset.view === selectedView);
+      });
+      document.querySelectorAll("[data-panel]").forEach((panel) => {
+        panel.hidden = !panel.dataset.panel.split(/\s+/).includes(selectedView);
+      });
+      if (currentPayload) {
+        drawHistory(currentPayload.metric_history || []);
+      }
+    }
+
+    function resetControls() {
+      $("scenarioPicker").value = "balanced";
+      applyScenarioPreset("balanced");
+      $("resultSource").value = "live";
+      $("archiveSelect").disabled = true;
+      applyViewMode("overview");
+    }
+
+    async function loadArchiveOptions() {
+      try {
+        const payload = await api("/api/archive");
+        archiveResults = payload.results || [];
+        const select = $("archiveSelect");
+        select.innerHTML = "";
+        if (!archiveResults.length) {
+          select.append(new Option("немає архіву", ""));
+          return;
+        }
+        archiveResults.forEach((result) => {
+          const summary = result.summary || {};
+          const label = `${result.path || result.id} · ${summary.mode || result.mode || "unknown"} · wait ${fmt(summary.average_waiting_time, " с")}`;
+          select.append(new Option(label, result.id));
+        });
+      } catch (error) {
+        $("archiveSelect").innerHTML = `<option value="">archive error</option>`;
+      }
+    }
+
+    async function selectedPayload() {
+      if ($("resultSource").value === "archive") {
+        const id = $("archiveSelect").value;
+        if (id) {
+          const payload = await api(`/api/archive/${id}`);
+          payload.process = { status: "archive", running: false, logs: [] };
+          payload.system = payload.system || {
+            simulation: { status: "archive" },
+            metrics: { sensor_range_meters: payload.summary?.sensor_range_meters },
+          };
+          return payload;
+        }
+      }
+      return await api("/api/status");
+    }
+
+    async function refresh() {
+      try {
+        const payload = await selectedPayload();
+        currentPayload = payload;
+        const process = payload.process || {};
+        const source = payload._meta?.source || "немає";
+        const sourceKind = payload.available ? "good" : "warn";
+        setTag("sourceTag", "джерело", shortText(source, 48), sourceKind);
+        setTag("modeTag", "режим", payload.mode || payload.system?.simulation?.mode || "немає", payload.mode === "flowmind" ? "good" : "");
+        setTag("connectionTag", $("resultSource").value === "archive" ? "archive" : "live", $("resultSource").value === "archive" ? "loaded" : "connection", "good");
+        renderMetrics(payload);
+        renderSystem(payload);
+        renderComparison(payload);
+        renderIntersections(payload.intersections || []);
+        renderDecisions(payload.decision_log || []);
+        drawHistory(payload.metric_history || []);
+        renderProcess(process);
+      } catch (error) {
+        setTag("processTag", "процес", "api error", "bad");
+        $("logs").textContent = String(error);
+      }
+    }
+
+    async function startDemo() {
+      $("resultSource").value = "live";
+      $("archiveSelect").disabled = true;
+      busy = true;
+      renderProcess({ running: true, logs: ["starting..."] });
+      try {
+        await api("/api/start-demo", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            duration: $("duration").value,
+            seed: $("seed").value,
+            sensor_range: $("sensorRange").value,
+            emergency_depart: $("emergencyDepart").value,
+            baseline: $("baseline").checked,
+            gui: false
+          })
+        });
+      } finally {
+        busy = false;
+        await refresh();
+      }
+    }
+
+    async function stopDemo() {
+      busy = true;
+      try {
+        await api("/api/stop", { method: "POST" });
+      } finally {
+        busy = false;
+        await refresh();
+      }
+    }
+
+    $("startBtn").addEventListener("click", startDemo);
+    $("stopBtn").addEventListener("click", stopDemo);
+    $("refreshBtn").addEventListener("click", refresh);
+    $("resetBtn").addEventListener("click", () => {
+      resetControls();
+      refresh();
+    });
+    $("scenarioPicker").addEventListener("change", (event) => {
+      applyScenarioPreset(event.target.value);
+    });
+    $("resultSource").addEventListener("change", () => {
+      const archiveMode = $("resultSource").value === "archive";
+      $("archiveSelect").disabled = !archiveMode;
+      refresh();
+    });
+    $("archiveSelect").addEventListener("change", refresh);
+    document.querySelectorAll(".view-mode button").forEach((button) => {
+      button.addEventListener("click", () => applyViewMode(button.dataset.view));
+    });
+    window.addEventListener("resize", () => refresh());
+    resetControls();
+    loadArchiveOptions().then(refresh);
     setInterval(refresh, pollMs);
   </script>
 </body>
@@ -1430,16 +2935,19 @@ ARCHIVE_PAGE = r"""<!doctype html>
   <title>FlowMind Archive</title>
   <style>
     :root {
-      --bg: #f7f4ef;
-      --panel: #ffffff;
-      --ink: #1c1f23;
-      --muted: #626b76;
-      --line: #d9d3c8;
-      --green: #14866d;
-      --amber: #d8901f;
-      --red: #c94b4b;
-      --blue: #2f6f9f;
-      --shadow: 0 8px 28px rgba(28, 31, 35, 0.08);
+      color-scheme: dark;
+      --bg: #0d111b;
+      --panel: #1d2330;
+      --panel-soft: #171d28;
+      --panel-head: #1a202c;
+      --ink: #f7f8fb;
+      --muted: #9ca6b7;
+      --line: #31394a;
+      --green: #62d48b;
+      --amber: #f2bf5e;
+      --red: #ff6f61;
+      --blue: #4ddfd4;
+      --shadow: 0 10px 28px rgba(0, 0, 0, .18);
     }
     * { box-sizing: border-box; }
     body {
@@ -1456,6 +2964,22 @@ ARCHIVE_PAGE = r"""<!doctype html>
       align-items: start;
       margin-bottom: 16px;
     }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    .mark {
+      width: 32px;
+      height: 32px;
+      flex: 0 0 auto;
+      border-radius: 10px;
+      background:
+        linear-gradient(90deg, transparent 43%, var(--blue) 43% 57%, transparent 57%),
+        linear-gradient(0deg, transparent 43%, var(--red) 43% 57%, transparent 57%),
+        radial-gradient(circle at center, #202838 0 36%, transparent 37%);
+      border: 1px solid #384155;
+    }
     h1 { margin: 0 0 4px; font-size: 28px; letter-spacing: 0; }
     h2 { margin: 0; font-size: 15px; letter-spacing: 0; }
     .subtitle { color: var(--muted); margin: 0; max-width: 760px; }
@@ -1470,14 +2994,26 @@ ARCHIVE_PAGE = r"""<!doctype html>
       text-decoration: none;
       cursor: pointer;
     }
-    .nav a { color: var(--ink); background: #fffdf9; }
-    button { color: #fff; background: var(--green); border-color: transparent; }
+    .nav a { color: var(--muted); background: var(--panel-soft); }
+    .nav a[href="/archive"] {
+      color: var(--ink);
+      border-color: rgba(77, 223, 212, .55);
+      background: rgba(77, 223, 212, .12);
+    }
+    .status-line {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      justify-content: flex-end;
+      align-items: flex-start;
+    }
+    button { color: #071015; background: var(--blue); border-color: transparent; }
     input, select {
       border: 1px solid var(--line);
       border-radius: 6px;
       padding: 9px 10px;
       min-height: 38px;
-      background: #fffdf9;
+      background: var(--panel-soft);
       color: var(--ink);
       font: inherit;
       width: 100%;
@@ -1511,24 +3047,39 @@ ARCHIVE_PAGE = r"""<!doctype html>
       align-items: center;
       padding: 12px 14px;
       border-bottom: 1px solid var(--line);
-      background: #fffaf2;
+      background: var(--panel-head);
     }
     .section-body { padding: 14px; }
     .tag {
+      display: inline-flex;
+      gap: 6px;
+      align-items: center;
       border: 1px solid var(--line);
-      background: #fffaf2;
+      background: var(--panel-soft);
       padding: 6px 9px;
       border-radius: 6px;
       color: var(--muted);
       white-space: nowrap;
     }
+    .tag::before {
+      content: "";
+      width: 7px;
+      height: 7px;
+      border-radius: 999px;
+      background: #687386;
+    }
+    .tag.good {
+      border-color: rgba(98, 212, 139, .35);
+      background: rgba(98, 212, 139, .12);
+    }
+    .tag.good::before { background: var(--green); }
     .cards { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
     .metric {
       border: 1px solid var(--line);
       border-radius: 8px;
       padding: 11px;
       min-height: 82px;
-      background: #fffdf9;
+      background: var(--panel-soft);
       display: grid;
       gap: 6px;
     }
@@ -1537,24 +3088,24 @@ ARCHIVE_PAGE = r"""<!doctype html>
     .metric .note { color: var(--muted); font-size: 12px; }
     .table-wrap { overflow: auto; max-height: 680px; }
     table { width: 100%; border-collapse: collapse; font-size: 13px; }
-    th, td { padding: 9px 8px; border-bottom: 1px solid #ece6dc; text-align: left; vertical-align: middle; }
-    th { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0; position: sticky; top: 0; background: #fffaf2; }
+    th, td { padding: 9px 8px; border-bottom: 1px solid #30394d; text-align: left; vertical-align: middle; }
+    th { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0; position: sticky; top: 0; background: var(--panel-head); }
     tr { cursor: pointer; }
-    tr:hover td { background: #fffaf2; }
+    tr:hover td { background: rgba(77, 223, 212, .08); }
     .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; overflow-wrap: anywhere; }
-    canvas { display: block; width: 100%; height: 230px; border: 1px solid var(--line); border-radius: 8px; background: #fffdf9; }
+    canvas { display: block; width: 100%; height: 230px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel-soft); }
     .list { display: grid; gap: 8px; max-height: 360px; overflow: auto; }
     .event {
       border: 1px solid var(--line);
       border-left: 4px solid var(--blue);
       border-radius: 8px;
       padding: 9px;
-      background: #fffdf9;
+      background: var(--panel-soft);
     }
     .event.success { border-left-color: var(--green); }
     .event.warning { border-left-color: var(--amber); }
     .event.error { border-left-color: var(--red); }
-    .empty { color: var(--muted); padding: 18px; border: 1px dashed var(--line); border-radius: 8px; background: #fffdf9; }
+    .empty { color: var(--muted); padding: 18px; border: 1px dashed var(--line); border-radius: 8px; background: var(--panel-soft); }
     @media (max-width: 1050px) {
       .topbar, .grid, .filters { grid-template-columns: 1fr; }
       .cards { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -1570,15 +3121,23 @@ ARCHIVE_PAGE = r"""<!doctype html>
   <main class="page">
     <header class="topbar">
       <div>
-        <h1>Архів симуляцій</h1>
-        <p class="subtitle">Усі збережені прогони з results: можна обрати симуляцію, прокрутити метрики, подивитися рішення і стан перехресть.</p>
+        <div class="brand">
+          <div class="mark" aria-hidden="true"></div>
+          <div>
+            <h1>FlowMind Archive</h1>
+            <p class="subtitle">Збережені прогони, метрики, рішення контролера і стан перехресть.</p>
+          </div>
+        </div>
         <nav class="nav" aria-label="Archive navigation">
           <a href="/">Live</a>
           <a href="/archive">Архів</a>
           <a href="/averages">Середні</a>
         </nav>
       </div>
-      <span class="tag" id="totalTag">0 результатів</span>
+      <div class="status-line">
+        <span class="tag good">Archive</span>
+        <span class="tag" id="totalTag">0 результатів</span>
+      </div>
     </header>
 
     <section class="filters">
@@ -1743,10 +3302,10 @@ ARCHIVE_PAGE = r"""<!doctype html>
       canvas.height = Math.max(230, Math.floor(rect.height * dpr));
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       ctx.clearRect(0, 0, rect.width, rect.height);
-      ctx.fillStyle = "#fffdf9";
+      ctx.fillStyle = "#171d28";
       ctx.fillRect(0, 0, rect.width, rect.height);
       if (!history.length) {
-        ctx.fillStyle = "#626b76";
+        ctx.fillStyle = "#9ca6b7";
         ctx.fillText("Немає історії для цього запуску", 18, 30);
         return;
       }
@@ -1763,7 +3322,7 @@ ARCHIVE_PAGE = r"""<!doctype html>
       const spanT = Math.max(1, maxT - minT);
       const plotW = rect.width - pad.left - pad.right;
       const plotH = rect.height - pad.top - pad.bottom;
-      ctx.strokeStyle = "#e8dfd1";
+      ctx.strokeStyle = "#2d3546";
       for (let i = 0; i <= 4; i += 1) {
         const y = pad.top + plotH * (i / 4);
         ctx.beginPath();
@@ -1832,13 +3391,17 @@ AVERAGES_PAGE = r"""<!doctype html>
   <title>FlowMind Averages</title>
   <style>
     :root {
-      --bg: #f7f4ef;
-      --panel: #ffffff;
-      --ink: #1c1f23;
-      --muted: #626b76;
-      --line: #d9d3c8;
-      --green: #14866d;
-      --shadow: 0 8px 28px rgba(28, 31, 35, 0.08);
+      color-scheme: dark;
+      --bg: #0d111b;
+      --panel: #1d2330;
+      --panel-soft: #171d28;
+      --panel-head: #1a202c;
+      --ink: #f7f8fb;
+      --muted: #9ca6b7;
+      --line: #31394a;
+      --green: #62d48b;
+      --cyan: #4ddfd4;
+      --shadow: 0 10px 28px rgba(0, 0, 0, .18);
     }
     * { box-sizing: border-box; }
     body {
@@ -1855,27 +3418,70 @@ AVERAGES_PAGE = r"""<!doctype html>
       align-items: start;
       margin-bottom: 16px;
     }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    .mark {
+      width: 32px;
+      height: 32px;
+      flex: 0 0 auto;
+      border-radius: 10px;
+      background:
+        linear-gradient(90deg, transparent 43%, var(--cyan) 43% 57%, transparent 57%),
+        linear-gradient(0deg, transparent 43%, #ff6f61 43% 57%, transparent 57%),
+        radial-gradient(circle at center, #202838 0 36%, transparent 37%);
+      border: 1px solid #384155;
+    }
     h1 { margin: 0 0 4px; font-size: 28px; letter-spacing: 0; }
     h2 { margin: 0; font-size: 16px; letter-spacing: 0; }
     .subtitle { color: var(--muted); margin: 0; max-width: 760px; }
     .nav { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
     .nav a {
-      color: var(--ink);
+      color: var(--muted);
       text-decoration: none;
       border: 1px solid var(--line);
-      background: #fffdf9;
+      background: var(--panel-soft);
       padding: 7px 10px;
       border-radius: 6px;
       font-weight: 750;
     }
+    .nav a[href="/averages"] {
+      color: var(--ink);
+      border-color: rgba(77, 223, 212, .55);
+      background: rgba(77, 223, 212, .12);
+    }
+    .status-line {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      justify-content: flex-end;
+      align-items: flex-start;
+    }
     .tag {
+      display: inline-flex;
+      gap: 6px;
+      align-items: center;
       border: 1px solid var(--line);
-      background: #fffaf2;
+      background: var(--panel-soft);
       padding: 6px 9px;
       border-radius: 6px;
       color: var(--muted);
       white-space: nowrap;
     }
+    .tag::before {
+      content: "";
+      width: 7px;
+      height: 7px;
+      border-radius: 999px;
+      background: #687386;
+    }
+    .tag.good {
+      border-color: rgba(98, 212, 139, .35);
+      background: rgba(98, 212, 139, .12);
+    }
+    .tag.good::before { background: var(--green); }
     .cards {
       display: grid;
       grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -1887,7 +3493,7 @@ AVERAGES_PAGE = r"""<!doctype html>
       border-radius: 8px;
       padding: 11px;
       min-height: 86px;
-      background: #fffdf9;
+      background: var(--panel-soft);
       display: grid;
       gap: 6px;
     }
@@ -1909,13 +3515,13 @@ AVERAGES_PAGE = r"""<!doctype html>
       align-items: center;
       padding: 12px 14px;
       border-bottom: 1px solid var(--line);
-      background: #fffaf2;
+      background: var(--panel-head);
     }
     .section-body { padding: 14px; overflow: auto; }
     table { width: 100%; border-collapse: collapse; font-size: 13px; }
-    th, td { padding: 9px 8px; border-bottom: 1px solid #ece6dc; text-align: left; vertical-align: middle; }
+    th, td { padding: 9px 8px; border-bottom: 1px solid #30394d; text-align: left; vertical-align: middle; }
     th { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0; }
-    .empty { color: var(--muted); padding: 18px; border: 1px dashed var(--line); border-radius: 8px; background: #fffdf9; }
+    .empty { color: var(--muted); padding: 18px; border: 1px dashed var(--line); border-radius: 8px; background: var(--panel-soft); }
     @media (max-width: 900px) {
       .topbar { grid-template-columns: 1fr; }
       .cards { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -1931,15 +3537,23 @@ AVERAGES_PAGE = r"""<!doctype html>
   <main class="page">
     <header class="topbar">
       <div>
-        <h1>Середні значення</h1>
-        <p class="subtitle">Агрегація всіх збережених summary.csv по режимах керування.</p>
+        <div class="brand">
+          <div class="mark" aria-hidden="true"></div>
+          <div>
+            <h1>FlowMind Averages</h1>
+            <p class="subtitle">Агрегація збережених summary.csv по режимах керування.</p>
+          </div>
+        </div>
         <nav class="nav" aria-label="Averages navigation">
           <a href="/">Live</a>
           <a href="/archive">Архів</a>
           <a href="/averages">Середні</a>
         </nav>
       </div>
-      <span class="tag" id="totalTag">0 результатів</span>
+      <div class="status-line">
+        <span class="tag good">Metrics</span>
+        <span class="tag" id="totalTag">0 результатів</span>
+      </div>
     </header>
 
     <section class="cards" id="overview"></section>
@@ -2044,7 +3658,7 @@ else:
 
     @app.get("/", response_class=HTMLResponse)
     def dashboard_page() -> Any:
-        return HTML_PAGE
+        return DESIGN_PAGE
 
     @app.get("/archive", response_class=HTMLResponse)
     def archive_page() -> Any:
