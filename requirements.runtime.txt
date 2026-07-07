@@ -4,6 +4,7 @@ anyio==4.14.1
 click==8.4.2
 eclipse-sumo==1.27.1
 fastapi==0.125.0
+google-genai
 h11==0.16.0
 httptools==0.8.0
 idna==3.18

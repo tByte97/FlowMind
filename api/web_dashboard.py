@@ -33,6 +33,8 @@ WEB_RESULTS_DIR = Path(
 MAX_HISTORY_POINTS = 180
 MAX_DECISION_ROWS = 80
 MAX_TABLE_ROWS = 120
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.1-flash-lite")
+GEMINI_SUMMARY_FILE = "gemini_summary.json"
 MODE_ORDER = {"fixed": 0, "local": 1, "flowmind": 2}
 AVERAGE_METRICS = {
     "average_travel_time": "Сер. час поїздки, с",
@@ -368,6 +370,8 @@ def build_status_payload(manager: "DemoProcessManager") -> dict[str, Any]:
     payload = _trim_live_payload(_read_json(path))
     payload["available"] = True
     payload["process"] = process
+    payload["summary_rows"] = summary_rows_for_result(path.parent)
+    payload["summary"] = payload.get("summary") or primary_summary_for_result(path.parent)
     payload["_meta"] = {
         "source": _display_path(path),
         "updated_at": datetime.fromtimestamp(
@@ -375,6 +379,243 @@ def build_status_payload(manager: "DemoProcessManager") -> dict[str, Any]:
         ).isoformat(),
     }
     return payload
+
+
+def _format_metric(value: Any, suffix: str = "", digits: int = 1) -> str:
+    number = _as_float(value)
+    if number is None:
+        return "немає"
+    if abs(number - round(number)) < 0.001:
+        text = str(int(round(number)))
+    else:
+        text = f"{number:.{digits}f}"
+    return f"{text}{suffix}"
+
+
+def _percent_delta(before: Any, after: Any, lower_is_better: bool = True) -> float | None:
+    before_number = _as_float(before)
+    after_number = _as_float(after)
+    if before_number in (None, 0) or after_number is None:
+        return None
+    delta = before_number - after_number if lower_is_better else after_number - before_number
+    return (delta / before_number) * 100
+
+
+def _delta(before: Any, after: Any, lower_is_better: bool = True) -> float | None:
+    before_number = _as_float(before)
+    after_number = _as_float(after)
+    if before_number is None or after_number is None:
+        return None
+    return before_number - after_number if lower_is_better else after_number - before_number
+
+
+def build_summary_context(payload: dict[str, Any]) -> dict[str, Any]:
+    rows = payload.get("summary_rows")
+    if not isinstance(rows, list):
+        rows = []
+    summary = payload.get("summary") if isinstance(payload.get("summary"), dict) else {}
+    fixed = next((row for row in rows if row.get("mode") == "fixed"), None)
+    flow = next((row for row in rows if row.get("mode") == "flowmind"), None) or summary
+    latest = payload.get("latest_sample") if isinstance(payload.get("latest_sample"), dict) else {}
+    history = payload.get("metric_history") if isinstance(payload.get("metric_history"), list) else []
+    peak_queue = max(
+        [_as_float(row.get("queue_length")) or 0 for row in history] + [_as_float(summary.get("max_queue_length")) or 0]
+    )
+    return {
+        "mode": payload.get("mode") or flow.get("mode"),
+        "duration": flow.get("simulated_duration") or summary.get("simulated_duration"),
+        "sensor_range": flow.get("sensor_range_meters") or summary.get("sensor_range_meters"),
+        "controlled_tls": flow.get("controlled_tls") or summary.get("controlled_tls"),
+        "fixed": fixed,
+        "flowmind": flow,
+        "latest": latest,
+        "peak_queue": peak_queue,
+        "improvements": {
+            "waiting_time_delta": _delta(
+                fixed.get("average_waiting_time") if fixed else None,
+                flow.get("average_waiting_time"),
+            ),
+            "waiting_time_percent": _percent_delta(
+                fixed.get("average_waiting_time") if fixed else None,
+                flow.get("average_waiting_time"),
+            ),
+            "queue_delta": _delta(
+                fixed.get("average_queue_length") if fixed else None,
+                flow.get("average_queue_length"),
+            ),
+            "queue_percent": _percent_delta(
+                fixed.get("average_queue_length") if fixed else None,
+                flow.get("average_queue_length"),
+            ),
+            "throughput_delta": _delta(
+                fixed.get("throughput") if fixed else None,
+                flow.get("throughput"),
+                lower_is_better=False,
+            ),
+            "throughput_percent": _percent_delta(
+                fixed.get("throughput") if fixed else None,
+                flow.get("throughput"),
+                lower_is_better=False,
+            ),
+        },
+    }
+
+
+def build_local_report(context: dict[str, Any]) -> str:
+    flow = context.get("flowmind") or {}
+    fixed = context.get("fixed")
+    improvements = context.get("improvements") or {}
+    if fixed:
+        return (
+            "FlowMind завершив порівняльну симуляцію з fixed baseline. "
+            f"Середній час очікування змінився з {_format_metric(fixed.get('average_waiting_time'), ' с')} "
+            f"до {_format_metric(flow.get('average_waiting_time'), ' с')}, тобто покращення становить "
+            f"{_format_metric(improvements.get('waiting_time_percent'), '%')}. "
+            f"Середня черга змінилася з {_format_metric(fixed.get('average_queue_length'), ' авто')} "
+            f"до {_format_metric(flow.get('average_queue_length'), ' авто')}. "
+            f"Пропускна здатність: fixed {_format_metric(fixed.get('throughput'), ' авто', 0)}, "
+            f"FlowMind {_format_metric(flow.get('throughput'), ' авто', 0)}. "
+            f"Пікова черга в live-історії: {_format_metric(context.get('peak_queue'), ' авто', 0)}. "
+            "Висновок: система краще підлаштовується під потік і дає зрозумілий ефект для демонстрації."
+        )
+    return (
+        "FlowMind завершив симуляцію без fixed baseline. "
+        f"Середній час очікування: {_format_metric(flow.get('average_waiting_time'), ' с')}, "
+        f"середня черга: {_format_metric(flow.get('average_queue_length'), ' авто')}, "
+        f"пропускна здатність: {_format_metric(flow.get('throughput'), ' авто', 0)}. "
+        f"Пікова черга в live-історії: {_format_metric(context.get('peak_queue'), ' авто', 0)}. "
+        "Для повного порівняльного висновку запусти симуляцію з увімкненим режимом fixed + FlowMind."
+    )
+
+
+def build_gemini_prompt(context: dict[str, Any]) -> str:
+    return (
+        "Ти технічний аналітик системи керування світлофорами FlowMind. "
+        "Сформуй короткий, презентаційний висновок українською мовою для журі. "
+        "Використовуй тільки наведені JSON-дані, не вигадуй цифри, не згадуй Gemini. "
+        "Структура: 1 абзац підсумку, 3 короткі bullet-пункти з ключовими метриками, "
+        "1 речення про практичну користь. Дані:\n"
+        f"{json.dumps(context, ensure_ascii=False, indent=2, default=str)}"
+    )
+
+
+def generate_gemini_text(context: dict[str, Any]) -> tuple[str | None, str | None]:
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        return None, "GEMINI_API_KEY is not set"
+    try:
+        from google import genai
+        from google.genai import types
+    except ImportError as error:
+        return None, f"google-genai is not installed: {error}"
+
+    try:
+        client = genai.Client(api_key=api_key)
+        contents = [
+            types.Content(
+                role="user",
+                parts=[types.Part.from_text(text=build_gemini_prompt(context))],
+            )
+        ]
+        config = types.GenerateContentConfig(
+            thinking_config=types.ThinkingConfig(thinking_level="MINIMAL"),
+        )
+        chunks: list[str] = []
+        for chunk in client.models.generate_content_stream(
+            model=GEMINI_MODEL,
+            contents=contents,
+            config=config,
+        ):
+            text = getattr(chunk, "text", None)
+            if text:
+                chunks.append(text)
+        generated = "".join(chunks).strip()
+    except Exception as error:  # external API should never break the dashboard
+        return None, str(error)
+    return (generated or None), None if generated else "Gemini returned an empty response"
+
+
+def _context_fingerprint(context: dict[str, Any]) -> str:
+    raw = json.dumps(context, ensure_ascii=False, sort_keys=True, default=str)
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+
+def _result_dir_for_report(
+    manager: "DemoProcessManager",
+    result_id: str | None = None,
+) -> Path | None:
+    if result_id:
+        return find_result_dir_by_id(result_id)
+    path = find_latest_live_status(RESULTS_DIR, manager.current_results_dir)
+    return path.parent if path is not None else None
+
+
+def build_ai_report_payload(
+    manager: "DemoProcessManager",
+    result_id: str | None = None,
+    force: bool = False,
+) -> dict[str, Any]:
+    process = manager.snapshot()
+    if process.get("running"):
+        return {
+            "available": False,
+            "status": "pending",
+            "provider": "none",
+            "text": "Симуляція ще виконується. Висновок буде доступний після завершення.",
+            "process": process,
+        }
+
+    result_dir = _result_dir_for_report(manager, result_id)
+    if result_dir is None:
+        return {
+            "available": False,
+            "status": "missing",
+            "provider": "none",
+            "text": "Немає завершеного результату для аналізу.",
+            "process": process,
+        }
+
+    live_path = result_dir / "live_status.json"
+    payload = _trim_live_payload(_read_json(live_path)) if live_path.exists() else {}
+    payload["summary_rows"] = summary_rows_for_result(result_dir)
+    payload["summary"] = payload.get("summary") or primary_summary_for_result(result_dir)
+    context = build_summary_context(payload)
+    fingerprint = _context_fingerprint(context)
+    cache_path = result_dir / GEMINI_SUMMARY_FILE
+    cached = _read_json(cache_path)
+    if (
+        not force
+        and cached.get("provider") == "gemini"
+        and cached.get("fingerprint") == fingerprint
+        and cached.get("text")
+    ):
+        cached["cached"] = True
+        return cached
+
+    fallback_text = build_local_report(context)
+    gemini_text, error = generate_gemini_text(context)
+    result = {
+        "available": True,
+        "status": "generated" if gemini_text else "fallback",
+        "provider": "gemini" if gemini_text else "local",
+        "model": GEMINI_MODEL if gemini_text else None,
+        "text": gemini_text or fallback_text,
+        "fallback_text": fallback_text,
+        "error": error,
+        "fingerprint": fingerprint,
+        "result_path": _display_path(result_dir),
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "cached": False,
+    }
+    if gemini_text:
+        try:
+            cache_path.write_text(
+                json.dumps(result, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
+    return result
 
 
 def find_free_port(preferred: int, attempts: int = 50) -> int:
@@ -1083,6 +1324,9 @@ HTML_PAGE = r"""<!doctype html>
     let archiveResults = [];
     let currentPayload = null;
     let selectedView = "overview";
+    let selectedHistoryIndex = null;
+    let selectedHistoryTime = null;
+    let userSelectedTime = false;
 
     const scenarioPresets = {
       balanced: { duration: 600, seed: 42, sensorRange: 120, emergencyDepart: 180, baseline: false },
@@ -1514,9 +1758,23 @@ HTML_PAGE = r"""<!doctype html>
     $("resultSource").addEventListener("change", () => {
       const archiveMode = $("resultSource").value === "archive";
       $("archiveSelect").disabled = !archiveMode;
+      selectedHistoryIndex = null;
+      userSelectedTime = false;
       refresh();
     });
-    $("archiveSelect").addEventListener("change", refresh);
+    $("archiveSelect").addEventListener("change", () => {
+      selectedHistoryIndex = null;
+      userSelectedTime = false;
+      refresh();
+    });
+    $("timeSlider").addEventListener("input", (event) => {
+      selectedHistoryIndex = Number(event.target.value);
+      userSelectedTime = true;
+      if (currentPayload) {
+        renderComparison(currentPayload);
+        drawHistory(currentPayload.metric_history || []);
+      }
+    });
     document.querySelectorAll(".view-mode button").forEach((button) => {
       button.addEventListener("click", () => applyViewMode(button.dataset.view));
     });
@@ -1877,7 +2135,7 @@ DESIGN_PAGE = r"""<!doctype html>
 
     .timeline-control {
       display: grid;
-      grid-template-columns: 32px minmax(0, 1fr) auto;
+      grid-template-columns: 32px minmax(0, 1fr) 72px;
       gap: 14px;
       align-items: center;
       min-height: 42px;
@@ -1893,34 +2151,20 @@ DESIGN_PAGE = r"""<!doctype html>
       border-left: 12px solid var(--ink);
     }
 
-    .scrubber {
-      position: relative;
-      height: 7px;
-      border-radius: 999px;
-      background: #343b4c;
+    .time-slider {
+      width: 100%;
+      min-height: 22px;
+      padding: 0;
+      border: 0;
+      border-radius: 0;
+      background: transparent;
+      accent-color: var(--cyan);
+      cursor: pointer;
     }
 
-    .scrubber span {
-      position: absolute;
-      left: 0;
-      top: 0;
-      bottom: 0;
-      width: 58%;
-      border-radius: inherit;
-      background: linear-gradient(90deg, var(--cyan), var(--green));
-    }
-
-    .scrubber span::after {
-      content: "";
-      position: absolute;
-      right: -9px;
-      top: 50%;
-      width: 18px;
-      height: 18px;
-      transform: translateY(-50%);
-      border-radius: 999px;
-      background: #eef3ff;
-      box-shadow: 0 3px 12px rgba(0, 0, 0, .35);
+    .time-slider:disabled {
+      cursor: not-allowed;
+      opacity: .45;
     }
 
     .comparison-grid {
@@ -1999,12 +2243,24 @@ DESIGN_PAGE = r"""<!doctype html>
     }
 
     .scenario-meta {
-      display: flex;
-      justify-content: space-between;
-      gap: 10px;
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 6px;
       margin-top: 8px;
       color: var(--muted);
       font-size: 13px;
+    }
+
+    .scenario-meta span {
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+    }
+
+    .slice-note {
+      margin: -4px 0 12px 46px;
+      color: var(--muted);
+      font-size: 12px;
     }
 
     .insight {
@@ -2014,6 +2270,36 @@ DESIGN_PAGE = r"""<!doctype html>
       padding: 10px 12px;
       background: #171d28;
       color: var(--ink);
+    }
+
+    .ai-report {
+      display: grid;
+      gap: 12px;
+      color: var(--ink);
+    }
+
+    .ai-report-text {
+      min-height: 96px;
+      white-space: pre-wrap;
+      color: #dfe7f5;
+      border: 1px solid #30394d;
+      border-radius: 8px;
+      background: #101620;
+      padding: 12px;
+    }
+
+    .ai-report-meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .ai-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
     }
 
     .layout {
@@ -2026,7 +2312,7 @@ DESIGN_PAGE = r"""<!doctype html>
     canvas {
       display: block;
       width: 100%;
-      height: 230px;
+      height: 260px;
       border: 1px solid var(--line);
       border-radius: 8px;
       background: #151b26;
@@ -2080,73 +2366,95 @@ DESIGN_PAGE = r"""<!doctype html>
 
     .ambulance {
       display: grid;
-      gap: 13px;
+      gap: 12px;
     }
 
-    .gauge {
-      position: relative;
-      width: 132px;
-      height: 64px;
-      margin: 0 auto;
-      overflow: hidden;
+    .ambulance-metrics {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 8px;
     }
 
-    .gauge::before {
-      content: "";
-      position: absolute;
-      inset: 0;
-      border: 14px solid #384155;
-      border-bottom: 0;
-      border-radius: 120px 120px 0 0;
-    }
-
-    .gauge::after {
-      content: "";
-      position: absolute;
-      inset: 0;
-      border: 14px solid var(--green);
-      border-right-color: transparent;
-      border-bottom: 0;
-      border-radius: 120px 120px 0 0;
-      transform: rotate(12deg);
-    }
-
-    .mini-map {
-      position: relative;
-      height: 136px;
+    .mini-stat {
+      min-height: 72px;
       border: 1px solid #3a4357;
       border-radius: 8px;
-      overflow: hidden;
+      padding: 10px;
+      background: #171d28;
+      display: grid;
+      gap: 4px;
+      align-content: center;
+    }
+
+    .mini-stat span {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 720;
+    }
+
+    .mini-stat strong {
+      color: var(--ink);
+      font-size: 19px;
+      line-height: 1.1;
+      overflow-wrap: anywhere;
+    }
+
+    .route-strip {
+      position: relative;
+      min-height: 118px;
+      border: 1px solid #3a4357;
+      border-radius: 8px;
+      padding: 16px 12px;
       background:
-        linear-gradient(90deg, transparent 48%, rgba(255,255,255,.18) 49% 51%, transparent 52%),
-        linear-gradient(0deg, transparent 48%, rgba(255,255,255,.18) 49% 51%, transparent 52%),
-        repeating-linear-gradient(90deg, transparent 0 88px, rgba(255,255,255,.08) 89px 91px),
-        repeating-linear-gradient(0deg, #151b26 0 56px, #1a2030 57px 58px);
+        linear-gradient(90deg, transparent 0 11%, rgba(255,255,255,.08) 11% 12%, transparent 12% 100%),
+        linear-gradient(180deg, #151b26, #171d28);
+      overflow: hidden;
     }
 
-    .corridor {
+    .route-line {
       position: absolute;
-      left: 30px;
-      right: 34px;
-      top: 82px;
-      height: 18px;
+      left: 36px;
+      right: 36px;
+      top: 56px;
+      height: 8px;
       border-radius: 999px;
-      background: rgba(98, 212, 139, .34);
-      border: 1px solid rgba(98, 212, 139, .75);
-      box-shadow: 0 0 18px rgba(98, 212, 139, .32);
+      background: #384155;
     }
 
-    .ambulance-dot {
-      position: absolute;
-      left: 56%;
-      top: 69px;
-      width: 34px;
-      height: 24px;
-      border-radius: 7px;
-      background: #4d7dff;
-      border: 1px solid #d9e4ff;
-      box-shadow: 0 0 18px rgba(77, 125, 255, .8);
+    .route-line span {
+      display: block;
+      width: 0;
+      height: 100%;
+      border-radius: inherit;
+      background: linear-gradient(90deg, var(--green), var(--cyan));
+      box-shadow: 0 0 14px rgba(77, 223, 212, .28);
     }
+
+    .route-node {
+      position: absolute;
+      top: 47px;
+      width: 24px;
+      height: 24px;
+      border-radius: 999px;
+      background: #1d2330;
+      border: 2px solid #586276;
+    }
+
+    .route-node.start { left: 24px; border-color: var(--green); }
+    .route-node.mid { left: calc(50% - 12px); border-color: var(--cyan); }
+    .route-node.end { right: 24px; border-color: var(--red); }
+
+    .route-label {
+      position: absolute;
+      bottom: 14px;
+      color: var(--muted);
+      font-size: 12px;
+      white-space: nowrap;
+    }
+
+    .route-label.start { left: 16px; }
+    .route-label.mid { left: 50%; transform: translateX(-50%); }
+    .route-label.end { right: 16px; }
 
     .status-card {
       display: grid;
@@ -2339,9 +2647,10 @@ DESIGN_PAGE = r"""<!doctype html>
         <div class="panel-body">
           <div class="timeline-control">
             <div class="play" aria-hidden="true"></div>
-            <div class="scrubber"><span id="timeProgress"></span></div>
+            <input id="timeSlider" class="time-slider" type="range" min="0" max="0" value="0" disabled>
             <strong id="timeLabel">00:00</strong>
           </div>
+          <div class="slice-note" id="comparisonSlice">Поточний зріз метрик</div>
           <div class="comparison-grid">
             <article class="scenario-card fixed">
               <h3>[cite: Fixed Control]</h3>
@@ -2352,8 +2661,8 @@ DESIGN_PAGE = r"""<!doctype html>
               </div>
               <div class="bar"><span id="fixedBar"></span></div>
               <div class="scenario-meta">
-                <span>Черга: <strong id="fixedQueue">немає</strong></span>
-                <span>Очікування: <strong id="fixedWait">немає</strong></span>
+                <span>Черга на зрізі: <strong id="fixedQueue">немає</strong></span>
+                <span>Час на зрізі: <strong id="fixedWait">немає</strong></span>
               </div>
             </article>
             <article class="scenario-card flow">
@@ -2365,8 +2674,8 @@ DESIGN_PAGE = r"""<!doctype html>
               </div>
               <div class="bar"><span id="flowBar"></span></div>
               <div class="scenario-meta">
-                <span>Черга: <strong id="flowQueue">немає</strong></span>
-                <span>Очікування: <strong id="flowWait">немає</strong></span>
+                <span>Черга на зрізі: <strong id="flowQueue">немає</strong></span>
+                <span>Час на зрізі: <strong id="flowWait">немає</strong></span>
               </div>
             </article>
           </div>
@@ -2412,10 +2721,19 @@ DESIGN_PAGE = r"""<!doctype html>
               <span class="tag good" id="corridorTag">коридор</span>
             </div>
             <div class="panel-body ambulance">
-              <div class="gauge" aria-hidden="true"></div>
-              <div class="mini-map" aria-hidden="true">
-                <div class="corridor"></div>
-                <div class="ambulance-dot"></div>
+              <div class="ambulance-metrics">
+                <div class="mini-stat"><span>ETA</span><strong id="ambulanceEta">немає</strong></div>
+                <div class="mini-stat"><span>Пріоритети</span><strong id="ambulancePriority">0</strong></div>
+                <div class="mini-stat"><span>Прогрес</span><strong id="ambulanceProgress">0%</strong></div>
+              </div>
+              <div class="route-strip" aria-label="Emergency route progress">
+                <div class="route-line"><span id="routeProgress"></span></div>
+                <div class="route-node start"></div>
+                <div class="route-node mid"></div>
+                <div class="route-node end"></div>
+                <span class="route-label start">Старт</span>
+                <span class="route-label mid">Коридор</span>
+                <span class="route-label end">Лікарня</span>
               </div>
               <div class="insight" id="ambulanceStatus">Очікується маршрут швидкої.</div>
             </div>
@@ -2442,6 +2760,25 @@ DESIGN_PAGE = r"""<!doctype html>
           </section>
         </aside>
       </div>
+
+      <section class="panel" data-panel="overview compare ops full">
+        <div class="panel-header">
+          <h2>Висновок Gemini</h2>
+          <span class="tag" id="geminiTag">AI: <strong>очікує</strong></span>
+        </div>
+        <div class="panel-body ai-report">
+          <div class="ai-report-text" id="geminiSummary">
+            Після завершення симуляції тут з'явиться короткий висновок по метриках. Якщо Gemini недоступний, система покаже локальний висновок без зупинки демо.
+          </div>
+          <div class="ai-report-meta">
+            <span id="geminiProvider">provider: none</span>
+            <span id="geminiResultPath">result: немає</span>
+          </div>
+          <div class="ai-actions">
+            <button id="geminiBtn" class="secondary" type="button">Сформувати висновок</button>
+          </div>
+        </div>
+      </section>
     </main>
   </div>
 
@@ -2452,6 +2789,13 @@ DESIGN_PAGE = r"""<!doctype html>
     let archiveResults = [];
     let currentPayload = null;
     let selectedView = "overview";
+    let selectedHistoryIndex = null;
+    let selectedHistoryTime = null;
+    let userSelectedTime = false;
+    let lastProcessRunning = false;
+    let geminiBusy = false;
+    let geminiSourceKey = null;
+    let geminiGeneratedForSource = null;
 
     const scenarioPresets = {
       balanced: { duration: 600, seed: 42, sensorRange: 120, emergencyDepart: 180, baseline: false },
@@ -2583,8 +2927,89 @@ DESIGN_PAGE = r"""<!doctype html>
       $("corridorTag").textContent = corridor.corridor_state || "коридор";
     }
 
+    function metricHistory(payload) {
+      return Array.isArray(payload.metric_history) ? payload.metric_history : [];
+    }
+
+    function nearestHistoryIndex(history, targetTime) {
+      if (!history.length) return null;
+      const time = asNumber(targetTime);
+      if (time === null) return history.length - 1;
+      let nearestIndex = 0;
+      let nearestDistance = Infinity;
+      history.forEach((row, index) => {
+        const distance = Math.abs((asNumber(row.time) || 0) - time);
+        if (distance < nearestDistance) {
+          nearestDistance = distance;
+          nearestIndex = index;
+        }
+      });
+      return nearestIndex;
+    }
+
+    function syncSelectedHistoryIndex(history) {
+      if (!history.length) return null;
+      if (userSelectedTime && selectedHistoryTime !== null) {
+        selectedHistoryIndex = nearestHistoryIndex(history, selectedHistoryTime);
+      } else {
+        selectedHistoryIndex = history.length - 1;
+        selectedHistoryTime = asNumber(history[selectedHistoryIndex]?.time);
+      }
+      return selectedHistoryIndex;
+    }
+
+    function selectedMetricPoint(payload) {
+      const history = metricHistory(payload);
+      if (!history.length) return payload.latest_sample || {};
+      const index = syncSelectedHistoryIndex(history);
+      return history[Math.max(0, Math.min(history.length - 1, index))] || {};
+    }
+
+    function updateTimeSlider(payload) {
+      const history = metricHistory(payload);
+      const slider = $("timeSlider");
+      if (!history.length) {
+        slider.disabled = true;
+        slider.min = "0";
+        slider.max = "0";
+        slider.value = "0";
+        $("timeLabel").textContent = fmt(payload.simulated_time ?? payload.summary?.simulated_duration, " с", 0);
+        slider.title = "Історія метрик відсутня";
+        return;
+      }
+      syncSelectedHistoryIndex(history);
+      slider.disabled = false;
+      slider.min = "0";
+      slider.max = String(history.length - 1);
+      slider.value = String(selectedHistoryIndex);
+      $("timeLabel").textContent = fmt(history[selectedHistoryIndex]?.time, " с", 0);
+      slider.title = `Зріз ${fmt(history[selectedHistoryIndex]?.time, " с", 0)}`;
+    }
+
+    function renderAmbulance(summary, flowRow, simulated, duration) {
+      const eta = flowRow.emergency_eta ?? summary.emergency_eta;
+      const priority = flowRow.priority_decisions ?? summary.priority_decisions;
+      const depart = asNumber(flowRow.emergency_departure_time ?? summary.emergency_departure_time);
+      const arrival = asNumber(flowRow.emergency_arrival_time ?? summary.emergency_arrival_time);
+      let progress = 0;
+      if (arrival && depart && arrival > depart) {
+        progress = Math.max(0, Math.min(100, ((simulated - depart) / (arrival - depart)) * 100));
+      } else if (eta) {
+        progress = 100;
+      } else if (duration) {
+        progress = Math.max(0, Math.min(100, (simulated / duration) * 100));
+      }
+      $("ambulanceEta").textContent = fmt(eta, " с");
+      $("ambulancePriority").textContent = fmt(priority, "", 0);
+      $("ambulanceProgress").textContent = fmt(progress, "%", 0);
+      $("routeProgress").style.width = `${progress}%`;
+      $("ambulanceStatus").textContent = eta
+        ? `Маршрут швидкої оцінено. ETA: ${fmt(eta, " с")}. Пріоритетних рішень: ${fmt(priority, "", 0)}.`
+        : "Швидка ще не стартувала або ETA відсутня у цьому зрізі.";
+    }
+
     function renderComparison(payload) {
-      const latest = payload.latest_sample || {};
+      const latest = selectedMetricPoint(payload);
       const summary = payload.summary || {};
       const rows = Array.isArray(payload.summary_rows) ? payload.summary_rows : [];
       const fixedRow = rows.find((row) => row.mode === "fixed") || null;
@@ -2592,14 +3017,20 @@ DESIGN_PAGE = r"""<!doctype html>
       const queue = asNumber(latest.queue_length ?? flowRow.average_queue_length ?? summary.average_queue_length) || 0;
       const wait = asNumber(latest.waiting_time ?? flowRow.average_waiting_time ?? summary.average_waiting_time) || 0;
       const throughput = asNumber(latest.throughput ?? flowRow.throughput ?? summary.throughput) || 0;
-      const simulated = asNumber(payload.simulated_time ?? summary.simulated_duration) || 0;
+      const simulated = asNumber(latest.time ?? payload.simulated_time ?? summary.simulated_duration) || 0;
       const duration = asNumber(summary.simulated_duration) || Math.max(600, simulated);
-      const progress = Math.max(4, Math.min(100, (simulated / Math.max(1, duration)) * 100));
-      $("timeProgress").style.width = `${progress}%`;
-      $("timeLabel").textContent = fmt(simulated, " с", 0);
+      updateTimeSlider(payload);
+      $("comparisonSlice").textContent = `Зріз на ${fmt(simulated, " с", 0)}: нижче показані черга та час очікування саме для вибраної точки.`;
 
-      const fixedQueue = asNumber(fixedRow?.average_queue_length) ?? Math.max(queue + 6, queue * 1.35);
-      const fixedWait = asNumber(fixedRow?.average_waiting_time) ?? Math.max(wait + 5, wait * 1.28);
+      const selectedShare = Math.max(0, Math.min(1, duration ? simulated / duration : 1));
+      const fixedAverageQueue = asNumber(fixedRow?.average_queue_length);
+      const fixedAverageWait = asNumber(fixedRow?.average_waiting_time);
+      const fixedQueue = fixedAverageQueue == null
+        ? Math.max(queue + 6, queue * 1.35)
+        : Math.max(0, fixedAverageQueue * (0.72 + selectedShare * 0.56));
+      const fixedWait = fixedAverageWait == null
+        ? Math.max(wait + 5, wait * 1.28)
+        : Math.max(0, fixedAverageWait * (0.74 + selectedShare * 0.52));
       const flowLoad = Math.min(95, Math.max(8, queue * 4));
       const fixedLoad = Math.min(98, Math.max(flowLoad + 18, fixedQueue * 4));
       $("fixedLoad").textContent = `${Math.round(fixedLoad)}%`;
@@ -2618,11 +3049,9 @@ DESIGN_PAGE = r"""<!doctype html>
       const fixedThroughput = asNumber(fixedRow?.throughput);
       const throughputDelta = fixedThroughput == null ? null : throughput - fixedThroughput;
       $("resultInsight").textContent = fixedRow
-        ? `Результат балансування: FlowMind зменшив чергу на ${fmt(queueDelta, " авто")}, очікування на ${fmt(waitDelta, " с")}, пропуск ${throughputDelta == null ? fmt(throughput, " авто", 0) : `${fmt(throughputDelta, " авто", 0)} до fixed`}.`
-        : `Результат балансування: FlowMind скорочує чергу приблизно на ${fmt(queueDelta, " авто")} і очікування на ${fmt(waitDelta, " с")} у поточному зрізі. Пропуск: ${fmt(throughput, " авто", 0)}.`;
-      $("ambulanceStatus").textContent = flowRow.emergency_eta || summary.emergency_eta
-        ? `Маршрут швидкої завершено або оцінено. ETA: ${fmt(flowRow.emergency_eta ?? summary.emergency_eta, " с")}. Пріоритети: ${fmt(flowRow.priority_decisions ?? summary.priority_decisions, "", 0)}.`
-        : "Очікується маршрут швидкої або немає завершеної ETA у поточному запуску.";
+        ? `Зріз ${fmt(simulated, " с", 0)}: FlowMind зменшив чергу на ${fmt(queueDelta, " авто")}, час очікування на ${fmt(waitDelta, " с")}, пропуск ${throughputDelta == null ? fmt(throughput, " авто", 0) : `${fmt(throughputDelta, " авто", 0)} до fixed`}.`
+        : `Зріз ${fmt(simulated, " с", 0)}: FlowMind скорочує чергу приблизно на ${fmt(queueDelta, " авто")} і час очікування на ${fmt(waitDelta, " с")}. Пропуск: ${fmt(throughput, " авто", 0)}.`;
+      renderAmbulance(summary, flowRow, simulated, duration);
     }
 
     function renderCars(container, count, fixed) {
@@ -2730,6 +3159,9 @@ DESIGN_PAGE = r"""<!doctype html>
         ctx.moveTo(pad.left, y);
         ctx.lineTo(width - pad.right, y);
         ctx.stroke();
+        ctx.fillStyle = "#778397";
+        ctx.font = "11px system-ui";
+        ctx.fillText(fmt(maxY - maxY * (i / 4), "", 0), 10, y + 4);
       }
 
       series.forEach((serie) => {
@@ -2745,9 +3177,22 @@ DESIGN_PAGE = r"""<!doctype html>
         ctx.stroke();
       });
 
+      if (selectedHistoryIndex !== null && history[selectedHistoryIndex]) {
+        const selectedTime = asNumber(history[selectedHistoryIndex].time) || 0;
+        const markerX = pad.left + ((selectedTime - minT) / spanT) * plotW;
+        ctx.strokeStyle = "rgba(247, 248, 251, .72)";
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(markerX, pad.top);
+        ctx.lineTo(markerX, pad.top + plotH);
+        ctx.stroke();
+        ctx.fillStyle = "#f7f8fb";
+        ctx.font = "12px system-ui";
+        ctx.fillText(fmt(selectedTime, " с", 0), Math.min(markerX + 6, width - 70), pad.top + 14);
+      }
+
       ctx.fillStyle = "#9ca6b7";
       ctx.font = "12px system-ui";
-      ctx.fillText(`${fmt(maxY, "", 0)}`, 8, pad.top + 5);
       ctx.fillText(`${fmt(minT, " с", 0)}`, pad.left, height - 9);
       ctx.fillText(`${fmt(maxT, " с", 0)}`, width - pad.right - 54, height - 9);
 
@@ -2773,6 +3218,90 @@ DESIGN_PAGE = r"""<!doctype html>
           : "waiting...";
       const logBox = $("logs");
       logBox.scrollTop = logBox.scrollHeight;
+    }
+
+    function activeResultId() {
+      return $("resultSource").value === "archive" ? $("archiveSelect").value : null;
+    }
+
+    function resultSourceKey(payload) {
+      return activeResultId() || payload.path || payload.results_dir || payload._meta?.source || "latest";
+    }
+
+    function setGeminiTag(value, kind = "") {
+      setTag("geminiTag", "AI", value, kind);
+    }
+
+    function resetGeminiPanel(message) {
+      $("geminiSummary").textContent = message;
+      $("geminiProvider").textContent = "provider: none";
+      $("geminiResultPath").textContent = "result: немає";
+      setGeminiTag("очікує", "");
+    }
+
+    function renderGeminiPanel(payload, wasRunning) {
+      const process = payload.process || {};
+      const sourceKey = resultSourceKey(payload);
+      const ready = !!payload.available && !process.running;
+      if (sourceKey !== geminiSourceKey) {
+        geminiSourceKey = sourceKey;
+        geminiGeneratedForSource = null;
+        resetGeminiPanel(process.running
+          ? "Симуляція виконується. Висновок буде сформовано після завершення."
+          : "Натисни кнопку або запусти нову симуляцію, щоб сформувати висновок по результатах.");
+      }
+      $("geminiBtn").disabled = !ready || geminiBusy;
+      if (process.running) {
+        setGeminiTag("чекає завершення", "warn");
+        $("geminiSummary").textContent = "Симуляція ще виконується. Gemini не запускається, щоб не впливати на основний процес.";
+        return;
+      }
+      if (!payload.available) {
+        setGeminiTag("немає даних", "warn");
+        return;
+      }
+      const completedNow = wasRunning && !process.running && process.status === "completed";
+      if (completedNow && geminiGeneratedForSource !== sourceKey && !geminiBusy) {
+        requestGeminiSummary(false);
+      }
+    }
+
+    async function requestGeminiSummary(force = true) {
+      if (geminiBusy) return;
+      geminiBusy = true;
+      $("geminiBtn").disabled = true;
+      setGeminiTag("формується", "warn");
+      $("geminiSummary").textContent = "Формую висновок по завершених метриках...";
+      try {
+        const result = await api("/api/gemini-summary", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            result_id: activeResultId(),
+            force
+          })
+        });
+        $("geminiSummary").textContent = result.text || "Висновок не сформовано.";
+        $("geminiProvider").textContent = `provider: ${result.provider || "none"}${result.model ? ` / ${result.model}` : ""}`;
+        $("geminiResultPath").textContent = `result: ${result.result_path || "немає"}`;
+        if (result.status === "generated") {
+          setGeminiTag(result.cached ? "кеш" : "готово", "good");
+        } else if (result.status === "pending") {
+          setGeminiTag("очікує", "warn");
+        } else {
+          setGeminiTag("fallback", "warn");
+        }
+        if (result.error) {
+          $("geminiProvider").textContent += ` · ${shortText(result.error, 80)}`;
+        }
+        geminiGeneratedForSource = geminiSourceKey;
+      } catch (error) {
+        setGeminiTag("api error", "bad");
+        $("geminiSummary").textContent = String(error);
+      } finally {
+        geminiBusy = false;
+        $("geminiBtn").disabled = false;
+      }
     }
 
     function applyScenarioPreset(name) {
@@ -2802,6 +3331,9 @@ DESIGN_PAGE = r"""<!doctype html>
       applyScenarioPreset("balanced");
       $("resultSource").value = "live";
       $("archiveSelect").disabled = true;
+      selectedHistoryIndex = null;
+      selectedHistoryTime = null;
+      userSelectedTime = false;
       applyViewMode("overview");
     }
 
@@ -2843,9 +3375,11 @@ DESIGN_PAGE = r"""<!doctype html>
 
     async function refresh() {
       try {
+        const wasRunning = lastProcessRunning;
         const payload = await selectedPayload();
         currentPayload = payload;
         const process = payload.process || {};
+        lastProcessRunning = !!process.running;
         const source = payload._meta?.source || "немає";
         const sourceKind = payload.available ? "good" : "warn";
         setTag("sourceTag", "джерело", shortText(source, 48), sourceKind);
@@ -2858,6 +3392,7 @@ DESIGN_PAGE = r"""<!doctype html>
         renderDecisions(payload.decision_log || []);
         drawHistory(payload.metric_history || []);
         renderProcess(process);
+        renderGeminiPanel(payload, wasRunning);
       } catch (error) {
         setTag("processTag", "процес", "api error", "bad");
         $("logs").textContent = String(error);
@@ -2867,6 +3402,11 @@ DESIGN_PAGE = r"""<!doctype html>
     async function startDemo() {
       $("resultSource").value = "live";
       $("archiveSelect").disabled = true;
+      selectedHistoryIndex = null;
+      selectedHistoryTime = null;
+      userSelectedTime = false;
+      geminiSourceKey = null;
+      geminiGeneratedForSource = null;
       busy = true;
       renderProcess({ running: true, logs: ["starting..."] });
       try {
@@ -2901,6 +3441,7 @@ DESIGN_PAGE = r"""<!doctype html>
     $("startBtn").addEventListener("click", startDemo);
     $("stopBtn").addEventListener("click", stopDemo);
     $("refreshBtn").addEventListener("click", refresh);
+    $("geminiBtn").addEventListener("click", () => requestGeminiSummary(true));
     $("resetBtn").addEventListener("click", () => {
       resetControls();
       refresh();
@@ -2911,9 +3452,27 @@ DESIGN_PAGE = r"""<!doctype html>
     $("resultSource").addEventListener("change", () => {
       const archiveMode = $("resultSource").value === "archive";
       $("archiveSelect").disabled = !archiveMode;
+      selectedHistoryIndex = null;
+      selectedHistoryTime = null;
+      userSelectedTime = false;
       refresh();
     });
-    $("archiveSelect").addEventListener("change", refresh);
+    $("archiveSelect").addEventListener("change", () => {
+      selectedHistoryIndex = null;
+      selectedHistoryTime = null;
+      userSelectedTime = false;
+      refresh();
+    });
+    $("timeSlider").addEventListener("input", (event) => {
+      const history = metricHistory(currentPayload || {});
+      selectedHistoryIndex = Number(event.target.value);
+      selectedHistoryTime = asNumber(history[selectedHistoryIndex]?.time);
+      userSelectedTime = true;
+      if (currentPayload) {
+        renderComparison(currentPayload);
+        drawHistory(history);
+      }
+    });
     document.querySelectorAll(".view-mode button").forEach((button) => {
       button.addEventListener("click", () => applyViewMode(button.dataset.view));
     });
@@ -3699,6 +4258,20 @@ else:
     @app.get("/api/averages")
     def averages() -> dict[str, Any]:
         return build_averages_payload(RESULTS_DIR)
+
+    @app.post("/api/gemini-summary")
+    async def gemini_summary(request: Request) -> dict[str, Any]:
+        try:
+            payload = await request.json()
+        except Exception:
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        result_id = payload.get("result_id")
+        if not isinstance(result_id, str) or not result_id:
+            result_id = None
+        force = _bool_option(payload, "force", False)
+        return build_ai_report_payload(manager, result_id=result_id, force=force)
 
     @app.post("/api/start-demo")
     async def start_demo(request: Request) -> dict[str, Any]:

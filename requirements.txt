@@ -17,6 +17,7 @@ folium==0.20.0
 fonttools==4.63.0
 gitdb==4.0.12
 GitPython==3.1.50
+google-genai
 h11==0.16.0
 httptools==0.8.0
 idna==3.18
