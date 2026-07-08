@@ -1,0 +1,47 @@
+{
+  "id": "berlin_area_demo",
+  "name": "Berlin demo corridor",
+  "description": "Route-connected six-light corridor for FlowMind demo",
+  "intersections": [
+    {
+      "tls_id": "cluster_10314597249_11389528570_29216569_29216576_#8more",
+      "name": "Berlin corridor TLS 1",
+      "corridors": ["berlin_corridor"]
+    },
+    {
+      "tls_id": "cluster_10679440270_11389780293_29210909_357384481_#7more",
+      "name": "Berlin corridor TLS 2",
+      "corridors": ["berlin_corridor"]
+    },
+    {
+      "tls_id": "cluster_26936200_26936201_3368196437_3368196438_#2more",
+      "name": "Berlin corridor TLS 3",
+      "corridors": ["berlin_corridor"]
+    },
+    {
+      "tls_id": "cluster_10285489997_11388639955_11393418976_26960766_#7more",
+      "name": "Berlin corridor TLS 4",
+      "corridors": ["berlin_corridor"]
+    },
+    {
+      "tls_id": "cluster_29208253_6199322140_6199322141_6199322142_#1more",
+      "name": "Berlin corridor TLS 5",
+      "corridors": ["berlin_corridor"]
+    },
+    {
+      "tls_id": "cluster_10696643261_12145041015_12884320325_13296211510_#10more",
+      "name": "Berlin corridor TLS 6",
+      "corridors": ["berlin_corridor"]
+    }
+  ],
+  "corridors": {
+    "berlin_corridor": [
+      "cluster_10314597249_11389528570_29216569_29216576_#8more",
+      "cluster_10679440270_11389780293_29210909_357384481_#7more",
+      "cluster_26936200_26936201_3368196437_3368196438_#2more",
+      "cluster_10285489997_11388639955_11393418976_26960766_#7more",
+      "cluster_29208253_6199322140_6199322141_6199322142_#1more",
+      "cluster_10696643261_12145041015_12884320325_13296211510_#10more"
+    ]
+  }
+}

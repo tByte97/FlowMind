@@ -1,0 +1,10 @@
+services:
+  web:
+    networks:
+      - default
+      - myhaven_proxy
+
+networks:
+  myhaven_proxy:
+    external: true
+    name: myhaven_default

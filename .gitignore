@@ -1,1 +1,12 @@
 .venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.streamlit/
+results/
+.env
+.env.*
+!.env.example
+venv/

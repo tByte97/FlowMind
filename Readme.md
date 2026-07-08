@@ -1,466 +1,259 @@
-# FlowMind Rivne
+# FlowMind
 
-**FlowMind Rivne** — AI-система зонального балансування світлофорів для розвантаження міських транспортних ділянок.
+FlowMind - система адаптивного керування світлофорами для міської зони на базі SUMO, TraCI, FastAPI та ML-прогнозу черг.
 
-Проєкт моделює частину дорожньої мережі міста Рівне та показує, як група світлофорів може працювати не ізольовано, а як єдина система. Основна ідея полягає в тому, що AI не керує одним окремим перехрестям, а аналізує перевантажену область міста й координує світлофори так, щоб уся зона стала більш збалансованою.
+## Трек проєкту
 
----
+**Smart City + AI**
 
-## Ідея проєкту
+Проєкт належить до Smart City, тому що вирішує задачу міської транспортної інфраструктури: неефективну роботу світлофорів, поширення заторів між пов'язаними перехрестями та відсутність координованого пріоритету для екстреного транспорту.
 
-У звичайних умовах світлофори часто працюють за фіксованим таймером або реагують лише на ситуацію біля конкретного перехрестя. Це може створювати проблему: одне перехрестя розвантажується, але потік транспорту просто переноситься на наступне, де виникає новий затор.
+AI використовується як технологічна складова для аналізу транспортної ситуації, прогнозування черг і вибору світлофорних фаз. Додатково проєкт можна віднести до напряму **AI / Intelligent Transport Systems**.
 
-**FlowMind Rivne** вирішує цю проблему через зональний підхід:
+## Що робить система
 
-> AI бачить не одне перехрестя, а цілу ділянку міста з кількома пов’язаними світлофорами, прогнозує поширення затору та керує фазами так, щоб розвантажити всю область.
+- запускає SUMO-симуляцію дорожньої мережі Рівного;
+- читає трафік через TraCI з контрольованих перехресть;
+- збирає дані тільки в межах sensor range біля перехресть, за замовчуванням 120 м;
+- порівнює режими `fixed`, `local`, `flowmind`;
+- керує фазами світлофорів через Python-контролер;
+- прогнозує майбутню чергу на 30, 60 і 90 секунд;
+- враховує зайнятість вихідних смуг, щоб не випускати авто в заблоковану ділянку;
+- підтримує сценарій швидкої допомоги та green corridor;
+- записує `live_status.json`, `summary.csv`, ML samples і trace-файли;
+- має FastAPI web dashboard для запуску симуляцій, перегляду live-метрик, архіву, середніх значень і Gemini-звіту після ручного натискання кнопки.
 
----
+## Режими керування
 
-## Основна проблема
-
-Локальне керування світлофором може виглядати ефективним лише на перший погляд.
-
-```text
-Перехрестя A бачить велику чергу
-↓
-Дає довше зелене світло
-↓
-Машини проїжджають далі
-↓
-Наступне перехрестя B не готове прийняти потік
-↓
-Утворюється новий затор
-↓
-Уся область стає менш прохідною
-```
-
-FlowMind не просто збільшує зелений сигнал там, де найбільше машин. Система враховує, чи є місце після перехрестя, чи не заблокується наступна ділянка дороги та як зміна одного світлофора вплине на всю область.
-
----
-
-## Рішення
-
-FlowMind Rivne працює як цифровий диспетчер світлофорної області.
-
-Система:
-
-* аналізує стан кількох перехресть одночасно;
-* визначає перевантажені ділянки;
-* прогнозує, куди буде поширюватися затор;
-* координує фази світлофорів;
-* балансує в’їзд і виїзд із перевантаженої зони;
-* не дозволяє “заливати” транспортом уже заблоковану ділянку;
-* порівнює результат із фіксованим і локальним керуванням;
-* у спеціальному режимі створює пріоритетний проїзд для швидкої, ДСНС, поліції або планової колони.
-
----
-
-## Режими роботи
-
-### 1. Fixed Mode
-
-Базовий режим для порівняння.
-
-Світлофори працюють за фіксованим таймером, незалежно від фактичного навантаження.
-
-Приклад:
-
-```text
-30 секунд зелений
-5 секунд жовтий
-30 секунд зелений для іншого напрямку
-```
-
----
-
-### 2. Local Adaptive Mode
-
-Кожне перехрестя реагує лише на власну чергу.
-
-Цей режим показує обмеження локальної оптимізації: одне перехрестя може покращити свій стан, але погіршити ситуацію на сусідньому.
-
----
-
-### 3. FlowMind Area Balance
-
-Основний режим проєкту.
-
-AI аналізує всю область і керує групою світлофорів як єдиною системою.
-
-Система може:
-
-* продовжити зелений сигнал, якщо після перехрестя є вільна ділянка;
-* скоротити зелений, якщо напрямок майже порожній;
-* стримати в’їзд у перевантажену зону;
-* пріоритизувати виїзд із заблокованої області;
-* синхронізувати кілька світлофорів;
-* запобігати повному блокуванню перехресть.
-
----
-
-### 4. Priority Flow
-
-Додатковий сценарій для спецтранспорту.
-
-Коли з’являється швидка, ДСНС, поліція або плановий пріоритетний проїзд, система:
-
-* будує кілька маршрутів;
-* перевіряє, де можна підготувати світлофори;
-* обирає маршрут із найменшою реальною втратою часу;
-* завчасно перемикає світлофори;
-* після проїзду повертає область до збалансованого режиму.
-
-Цей режим не є основою системи, а працює поверх звичайного зонального балансування.
-
----
-
-## Чому це AI
-
-У цьому проєкті AI не генерує текстову відповідь. Він виконує дію: аналізує стан області, приймає рішення та змінює роботу світлофорів у симуляції.
-
-FlowMind використовує модель прийняття рішень:
-
-```text
-Стан руху → Аналіз області → Вибір фаз → Керування світлофорами → Оцінка результату
-```
-
-Основний підхід для MVP:
-
-**Area Pressure Balancing Controller**
-
-Ідея контролера:
-
-```text
-Тиск дороги = черга перед перехрестям - доступна місткість після перехрестя
-```
-
-AI не просто шукає найбільшу чергу. Він перевіряє, чи безпечно випускати транспорт далі, чи не створить це ще більший затор на наступній ділянці.
-
----
+| Режим | Опис |
+| --- | --- |
+| `fixed` | SUMO/fixed-plan baseline без адаптації до поточного трафіку |
+| `local` | адаптивне керування окремим перехрестям за локальною чергою |
+| `flowmind` | зональне керування з урахуванням черги, downstream occupancy, area pressure, demand timer, ML forecast і priority override |
 
 ## Архітектура
 
 ```text
-OpenStreetMap
-      ↓
-SUMO Network
-      ↓
-SUMO Simulation
-      ↓
-Python + TraCI
-      ↓
-FlowMind Controller
-      ↓
-Traffic Light Control
-      ↓
-Metrics + Dashboard
+SUMO network / focused.sumocfg
+        ↓
+SUMO simulation
+        ↓
+TraCI
+        ↓
+TrafficStateReader
+        ↓
+AreaSignalController
+        ↓
+signal_policy + queue_forecast + safety_validator
+        ↓
+traffic light phase updates
+        ↓
+MetricsCollector
+        ↓
+results/* + FastAPI dashboard
 ```
 
----
+## Основні модулі
+
+| Файл | Призначення |
+| --- | --- |
+| `flowmind/area_model.py` | модель контрольованої зони, світлофорів, фаз і lane links |
+| `flowmind/traffic_state.py` | читання стану смуг у sensor range |
+| `flowmind/signal_policy.py` | scoring фаз для `local` і `flowmind` |
+| `flowmind/controller.py` | прийняття рішень і керування світлофорами через TraCI |
+| `flowmind/safety_validator.py` | перевірка min-green, yellow/all-red і безпечних переходів |
+| `flowmind/queue_forecast.py` | LightGBM-прогноз черг на 30/60/90 секунд |
+| `flowmind/emergency_router.py` | маршрути для швидкої та оцінка альтернатив |
+| `flowmind/corridor_manager.py` | стан green corridor для екстреного транспорту |
+| `flowmind/metrics.py` | KPI, history, emergency trace, summary |
+| `experiments/run_demo.py` | demo-запуск FlowMind з опціональним fixed baseline |
+| `experiments/run_dataset.py` | генерація ML dataset через багато симуляцій |
+| `experiments/train_queue_ensemble.py` | тренування моделей 30/60/90 секунд |
+| `api/web_dashboard.py` | FastAPI dashboard, API, archive, averages, Gemini summary |
+
+## AI / ML
+
+Поточні runtime-моделі:
+
+```text
+models/queue_lgbm_30s_current.joblib
+models/queue_lgbm_60s_current.joblib
+models/queue_lgbm_90s_current.joblib
+```
+
+Модельний стек:
+
+- LightGBM;
+- 3 горизонти прогнозу: 30, 60, 90 секунд;
+- target: `target_incoming_queue_30s`, `target_incoming_queue_60s`, `target_incoming_queue_90s`;
+- input features: стан фази, elapsed time, incoming/outgoing queue, occupancy, speed, free slots, signal state, TLS id, movement hashes, control parameters.
+
+Прогноз не замінює контролер. Він додається як один із факторів у scoring фази.
+
+## Green corridor
+
+Система підтримує demo-сценарій швидкої:
+
+- створення emergency vehicle у SUMO;
+- вибір маршруту до лікарні;
+- визначення світлофорів на маршруті;
+- priority override для потрібних фаз;
+- метрики `emergency_departure_time`, `emergency_arrival_time`, `emergency_eta`, `priority_decisions`;
+- повернення контролера до нормального режиму після проїзду.
+
+## Dashboard
+
+FastAPI dashboard:
+
+- `/` - live dashboard;
+- `/archive` - архів запусків;
+- `/averages` - порівняння середніх значень `fixed` / `local` / `flowmind`;
+- `/api/status` - поточний live status;
+- `/api/start-demo` - запуск demo-симуляції;
+- `/api/stop` - зупинка процесу;
+- `/api/archive` - список результатів;
+- `/api/averages` - агреговані середні;
+- `/api/gemini-summary` - ручна генерація текстового висновку після симуляції.
+
+Gemini не запускається автоматично. Висновок формується тільки після натискання кнопки в UI. Якщо `GEMINI_API_KEY` не заданий або API недоступний, dashboard показує локальний fallback-звіт.
+
+## Метрики
+
+Основні KPI:
+
+| Метрика | Джерело |
+| --- | --- |
+| `average_travel_time` | `summary.csv` |
+| `average_waiting_time` | `summary.csv` |
+| `average_queue_length` | `summary.csv` |
+| `max_queue_length` | `summary.csv` |
+| `throughput` | `summary.csv` / `live_status.json` |
+| `departed_vehicles` | `summary.csv` |
+| `peak_active_vehicles` | `summary.csv` |
+| `stops_count` | `summary.csv` |
+| `gridlock_risk` | `summary.csv` / live samples |
+| `queue_forecast_predictions` | controller stats |
+| `priority_decisions` | emergency priority stats |
 
 ## Технології
 
-### Simulation
+| Рівень | Технології |
+| --- | --- |
+| Traffic simulation | Eclipse SUMO, sumolib, TraCI |
+| Backend / control | Python 3.12, FastAPI, Uvicorn |
+| ML | LightGBM, scikit-learn, pandas, joblib |
+| Graph / routing | networkx |
+| Data | CSV, JSON, SUMO XML |
+| Dashboard | FastAPI HTML/CSS/JS без frontend framework |
+| Deployment | Docker, Docker Compose, nginx reverse proxy |
+| Optional report | Google Gemini API через `google-genai` |
 
-* **SUMO** — симуляція дорожнього руху;
-* **sumo-gui** — візуальна демонстрація руху;
-* **netconvert** — конвертація OpenStreetMap у SUMO-мережу;
-* **netedit** — редагування дорожньої мережі;
-* **duarouter** — генерація маршрутів;
-* **randomTrips.py** — генерація тестового трафіку.
-
-### Python
-
-* **traci** — керування SUMO-симуляцією з Python;
-* **sumolib** — робота з SUMO-мережами;
-* **numpy** — числові розрахунки;
-* **pandas** — збір і аналіз метрик;
-* **networkx** — модель області як графа;
-* **lxml** — робота з XML-файлами SUMO.
-
-### Dashboard
-
-* **Streamlit** — веб-дашборд;
-* **Plotly** — графіки та KPI;
-* **Folium / PyDeck** — інтерактивна карта;
-* **Matplotlib** — базова візуалізація результатів.
-
----
-
-## Структура проєкту
-
-```text
-flowmind-rivne/
-├── data/
-│   ├── rivne.osm.xml
-│   ├── area.net.xml
-│   ├── routes.rou.xml
-│   └── detectors.add.xml
-│
-├── simulation/
-│   ├── fixed.sumocfg
-│   ├── local_adaptive.sumocfg
-│   ├── flowmind.sumocfg
-│   └── scenarios/
-│
-├── flowmind/
-│   ├── controller.py
-│   ├── area_model.py
-│   ├── traffic_state.py
-│   ├── signal_policy.py
-│   ├── metrics.py
-│   └── priority_flow.py
-│
-├── dashboard/
-│   └── app.py
-│
-├── experiments/
-│   ├── run_fixed.py
-│   ├── run_local_adaptive.py
-│   └── run_flowmind.py
-│
-├── requirements.txt
-└── README.md
-```
-
----
-
-## MVP
-
-Для хакатону проєкт фокусується не на всьому місті, а на одній транспортній області Рівного.
-
-MVP включає:
-
-* одну ділянку міста з 4–6 світлофорними перехрестями;
-* симуляцію звичайного транспортного потоку;
-* режим фіксованих світлофорів;
-* режим локального адаптивного керування;
-* режим FlowMind Area Balance;
-* порівняння результатів між режимами;
-* окремий сценарій пріоритетного проїзду швидкої або ДСНС;
-* дашборд із метриками.
-
----
-
-## Основні метрики
-
-Система порівнює режими за такими показниками:
-
-| Метрика              | Що показує                         |
-| -------------------- | ---------------------------------- |
-| Average Travel Time  | середній час проїзду через область |
-| Average Waiting Time | середній час очікування            |
-| Queue Length         | довжина черг                       |
-| Max Queue Length     | найбільша критична черга           |
-| Throughput           | скільки авто пройшло через область |
-| Stops Count          | кількість повних зупинок           |
-| Gridlock Risk        | ризик блокування області           |
-| Emergency ETA        | час проїзду спецтранспорту         |
-
----
-
-## Приклад сценарію
-
-### Початковий стан
-
-У центральній частині області формується затор. Фіксовані світлофори продовжують впускати транспорт у вже перевантажену ділянку.
-
-### Local Adaptive Mode
-
-Окремі перехрестя бачать власні черги та намагаються їх зменшити. Але частина потоку переноситься на сусідні перехрестя, і область усе одно залишається перевантаженою.
-
-### FlowMind Area Balance
-
-FlowMind бачить, що центр області заблокований, тому:
-
-1. тимчасово обмежує в’їзд у перевантажену ділянку;
-2. збільшує пропуск транспорту з центру назовні;
-3. синхронізує сусідні світлофори;
-4. не дозволяє транспорту блокувати перехрестя;
-5. поступово повертає область до нормального режиму.
-
----
-
-## Очікуваний результат
-
-Після застосування FlowMind очікується:
-
-* менший середній час проїзду;
-* менше накопичення транспорту в центрі області;
-* нижчий ризик повного блокування перехресть;
-* більш рівномірний розподіл черг;
-* менше повних зупинок;
-* швидший і стабільніший проїзд спецтранспорту в Priority Flow.
-
----
-
-## Встановлення
-
-### 1. Клонування репозиторію
-
-```bash
-git clone https://github.com/your-username/flowmind-rivne.git
-cd flowmind-rivne
-```
-
-### 2. Створення віртуального середовища
+## Запуск локально
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
+pip install -r requirements.runtime.txt
+python -m uvicorn api.web_dashboard:app --host 127.0.0.1 --port 8011
 ```
 
-Для Windows:
+Dashboard:
+
+```text
+http://127.0.0.1:8011/
+```
+
+## Запуск demo без UI
 
 ```bash
-.venv\Scripts\activate
+python experiments/run_demo.py --duration 600 --seed 42 --headless --no-dashboard
 ```
 
-### 3. Встановлення залежностей
+З fixed baseline + FlowMind:
 
 ```bash
-pip install -r requirements.txt
+python experiments/run_demo.py --duration 600 --seed 42 --headless --no-dashboard
 ```
 
-### 4. Встановлення SUMO
-
-Потрібно встановити Eclipse SUMO та додати змінну середовища `SUMO_HOME`.
-
-Linux:
+Тільки FlowMind без baseline:
 
 ```bash
-sudo apt install sumo sumo-tools sumo-doc
+python experiments/run_demo.py --duration 600 --seed 42 --headless --no-dashboard --no-baseline
 ```
 
-Fedora:
+## Docker
 
 ```bash
-sudo dnf install sumo sumo-tools
+docker compose -f compose.yaml -f compose.server.yaml up -d --build web
 ```
 
-Windows:
+Основні env-змінні:
 
-1. Завантажити SUMO з офіційного сайту.
-2. Встановити програму.
-3. Додати шлях до SUMO у змінні середовища.
-4. Перевірити встановлення:
+```text
+FLOWMIND_RESULTS_DIR=/app/results
+FLOWMIND_WEB_RESULTS_DIR=/app/results/web_demo
+FLOWMIND_CPU_THREADS=4
+GEMINI_API_KEY=
+GEMINI_MODEL=gemini-3.1-flash-lite
+```
+
+`/app/results` винесено в persistent Docker volume `flowmind_results`.
+
+## Dataset і тренування
+
+Генерація dataset:
 
 ```bash
-sumo --version
-sumo-gui --version
+python experiments/run_dataset.py --full-real --resume --keep-going --output-dir results/dataset
 ```
 
----
-
-## Запуск симуляції
-
-### Fixed Mode
+Тренування ensemble:
 
 ```bash
-python experiments/run_fixed.py
+python experiments/train_queue_ensemble.py \
+  --dataset-dir results/dataset \
+  --output-dir models \
+  --rows-per-file 5000 \
+  --jobs 4
 ```
 
-### Local Adaptive Mode
+## Структура
 
-```bash
-python experiments/run_local_adaptive.py
+```text
+FlowMind/
+├── api/                         # FastAPI dashboard/API
+├── flowmind/                    # control logic, metrics, ML forecast, emergency corridor
+├── experiments/                 # demo, dataset, training, comparison scripts
+├── models/                      # current LightGBM queue models
+├── simulation/rivne_area/       # SUMO map/config/routes
+├── tools/                       # SUMO map and focused traffic generation
+├── tests/                       # unit tests
+├── docs/                        # project documentation
+├── Dockerfile
+├── compose.yaml
+├── compose.server.yaml
+└── requirements.runtime.txt
 ```
 
-### FlowMind Area Balance
+## Поточний статус
 
-```bash
-python experiments/run_flowmind.py
-```
+Реалізовано:
 
-### Запуск дашборду
+- SUMO-сценарій Рівного;
+- fixed/local/flowmind режими;
+- sensor-window traffic reader;
+- area pressure controller;
+- safety validator;
+- ML queue forecast ensemble;
+- emergency vehicle + green corridor demo;
+- FastAPI dashboard;
+- archive and averages pages;
+- manual Gemini summary;
+- Docker deployment with persistent results volume.
 
-```bash
-streamlit run dashboard/app.py
-```
+Обмеження:
 
----
-
-## Основний алгоритм
-
-Спрощена логіка FlowMind:
-
-```python
-while simulation_is_running:
-    state = read_area_state()
-    pressure_map = calculate_area_pressure(state)
-    blocked_segments = detect_blocked_segments(state)
-    signal_plan = choose_best_signal_phases(
-        pressure_map,
-        blocked_segments,
-        area_graph
-    )
-    apply_signal_plan(signal_plan)
-    collect_metrics()
-```
-
----
-
-## Порівняння режимів
-
-FlowMind порівнюється з двома базовими підходами:
-
-1. **Fixed Control** — фіксовані таймери.
-2. **Local Adaptive Control** — кожне перехрестя працює окремо.
-3. **Area Balance Control** — група світлофорів працює як єдина система.
-
-Головна мета — показати, що зональне керування краще за локальну оптимізацію, бо воно не переносить затор з одного перехрестя на інше.
-
----
-
-## Обмеження MVP
-
-У поточній версії проєкт:
-
-* не керує реальними світлофорами;
-* не використовує камери;
-* не використовує YOLO;
-* не потребує фізичних датчиків;
-* не інтегрується напряму з Waze або Google Maps;
-* працює як симуляція та цифровий двійник дорожньої області.
-
----
-
-## Можливий розвиток
-
-У майбутньому FlowMind можна розширити:
-
-* додати реальні дані з камер або дорожніх датчиків;
-* інтегрувати прогнозування транспортного потоку;
-* використати reinforcement learning;
-* додати громадський транспорт;
-* реалізувати маршрути для спецтранспорту;
-* створити API для міських служб;
-* протестувати різні ділянки Рівного;
-* додати сценарії ремонтів, ДТП і перекриттів.
-
----
-
-## Команда
-
-Проєкт створюється в межах хакатону двома студентами.
-
-Основні ролі:
-
-* **Python / Simulation / AI Controller**
-* **Dashboard / Visualization / Presentation**
-
----
-
-## Короткий пітч
-
-**FlowMind Rivne** перетворює групу світлофорів на єдину адаптивну систему. Замість того щоб керувати одним перехрестям, AI аналізує всю перевантажену область, прогнозує поширення заторів і координує світлофори так, щоб розвантажити місто збалансовано. У звичайний час система зменшує затримки, а в критичних ситуаціях може створювати пріоритетний проїзд для спецтранспорту.
-
----
-
-## Статус
-
-Проєкт перебуває на стадії MVP.
-
-Поточна ціль:
-
-> Побудувати симуляцію однієї транспортної області Рівного та довести, що зональне AI-керування світлофорами ефективніше за фіксовані таймери й локальну адаптацію.
+- це simulation MVP, не production-система для міського контролера;
+- для реального впровадження потрібні дані з камер/радарів/індукційних петель;
+- ML-моделі бажано перенавчати або fine-tune під конкретне місто і зону;
+- pedestrian demand може бути доданий як окремий шар попиту, але зараз не є production-ready частиною логіки.

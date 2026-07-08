@@ -1,0 +1,123 @@
+name: flowmind
+
+services:
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: flowmind:local
+    container_name: flowmind-web
+    init: true
+    restart: unless-stopped
+    environment:
+      FLOWMIND_RESULTS_DIR: /app/results
+      FLOWMIND_WEB_RESULTS_DIR: /app/results/web_demo
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.1-flash-lite}
+      OMP_NUM_THREADS: ${FLOWMIND_CPU_THREADS:-4}
+      OPENBLAS_NUM_THREADS: ${FLOWMIND_CPU_THREADS:-4}
+      MKL_NUM_THREADS: ${FLOWMIND_CPU_THREADS:-4}
+    ports:
+      - "${FLOWMIND_BIND_IP:-127.0.0.1}:${FLOWMIND_PORT:-8010}:8000"
+    volumes:
+      - flowmind_results:/app/results
+    read_only: true
+    tmpfs:
+      - /tmp:size=512m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 512
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import pathlib, sumolib, urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=5).read(); sumolib.checkBinary('sumo'); p=pathlib.Path('/app/results/.healthcheck'); p.write_text('ok'); p.unlink()"
+      interval: 30s
+      timeout: 10s
+      start_period: 60s
+      retries: 3
+
+  dataset:
+    image: flowmind:local
+    container_name: flowmind-dataset
+    profiles:
+      - dataset
+    init: true
+    restart: "no"
+    environment:
+      FLOWMIND_RESULTS_DIR: /app/results
+      OMP_NUM_THREADS: ${FLOWMIND_CPU_THREADS:-4}
+      OPENBLAS_NUM_THREADS: ${FLOWMIND_CPU_THREADS:-4}
+      MKL_NUM_THREADS: ${FLOWMIND_CPU_THREADS:-4}
+    volumes:
+      - flowmind_results:/app/results
+    read_only: true
+    tmpfs:
+      - /tmp:size=512m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 512
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+    command:
+      - python
+      - -u
+      - experiments/run_dataset.py
+      - --full-real
+      - --resume
+      - --keep-going
+      - --output-dir
+      - /app/results/dataset
+
+  trainer:
+    image: flowmind:local
+    container_name: flowmind-trainer
+    profiles:
+      - training
+    init: true
+    restart: "no"
+    environment:
+      OMP_NUM_THREADS: ${FLOWMIND_CPU_THREADS:-4}
+      OPENBLAS_NUM_THREADS: ${FLOWMIND_CPU_THREADS:-4}
+      MKL_NUM_THREADS: ${FLOWMIND_CPU_THREADS:-4}
+    volumes:
+      - flowmind_results:/app/results
+    read_only: true
+    tmpfs:
+      - /tmp:size=1g,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 512
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+    command:
+      - python
+      - -u
+      - experiments/train_queue_ensemble.py
+      - --dataset-dir
+      - /app/results/dataset
+      - --output-dir
+      - /app/results/trained_models
+      - --rows-per-file
+      - ${FLOWMIND_TRAIN_ROWS_PER_FILE:-5000}
+      - --jobs
+      - ${FLOWMIND_CPU_THREADS:-4}
+
+volumes:
+  flowmind_results:
+    name: flowmind_results
