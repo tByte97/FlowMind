@@ -28,6 +28,9 @@ except ImportError:
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 PROJECT_RESULTS_DIR = PROJECT_ROOT / "results"
 CAR_ICON_PATH = PROJECT_ROOT / "icon_car.png"
+DASHBOARD_ASSETS_DIR = PROJECT_ROOT / "dashboard" / "assets"
+ZONE_SIMULATION_CSS_PATH = DASHBOARD_ASSETS_DIR / "zone_simulation.css"
+ZONE_SIMULATION_JS_PATH = DASHBOARD_ASSETS_DIR / "zone_simulation.js"
 RESULTS_DIR = Path(os.environ.get("FLOWMIND_RESULTS_DIR", PROJECT_RESULTS_DIR))
 WEB_RESULTS_DIR = Path(
     os.environ.get("FLOWMIND_WEB_RESULTS_DIR", PROJECT_RESULTS_DIR / "web_demo")
@@ -671,6 +674,46 @@ def _bool_option(options: dict[str, Any], key: str, default: bool) -> bool:
     return bool(value)
 
 
+def mark_live_snapshot_inactive(
+    results_dir: Path | None,
+    status: str = "stopped",
+) -> None:
+    """Immediately disable the live-only map after this dashboard stops a run."""
+
+    if results_dir is None:
+        return
+    output_path = results_dir / "live_status.json"
+    payload = _read_json(output_path)
+    if not payload:
+        return
+    system = payload.get("system")
+    if not isinstance(system, dict):
+        system = {}
+    simulation = system.get("simulation")
+    if not isinstance(simulation, dict):
+        simulation = {}
+    simulation["status"] = status
+    system["simulation"] = simulation
+    payload["system"] = system
+    zone = payload.get("zone_simulation")
+    if isinstance(zone, dict):
+        zone["status"] = status
+        zone["active"] = False
+    payload["emitted_at"] = datetime.now(timezone.utc).isoformat()
+    temporary_path = output_path.with_suffix(".json.tmp")
+    try:
+        temporary_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        temporary_path.replace(output_path)
+    except OSError:
+        try:
+            temporary_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 class DemoProcessManager:
     def __init__(self) -> None:
         self._process: subprocess.Popen[str] | None = None
@@ -761,7 +804,10 @@ class DemoProcessManager:
             self._exit_code = process.poll()
             self._finished_at = time.time()
             self._status = "stopped"
-            return self.snapshot_unlocked()
+            snapshot = self.snapshot_unlocked()
+            results_dir = self._results_dir
+        mark_live_snapshot_inactive(results_dir)
+        return snapshot
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
@@ -1436,10 +1482,20 @@ HTML_PAGE = r"""<!doctype html>
         if (id) {
           const payload = await api(`/api/archive/${id}`);
           payload.process = { status: "archive", running: false, logs: [] };
-          payload.system = payload.system || {
-            simulation: { status: "archive" },
-            metrics: { sensor_range_meters: payload.summary?.sensor_range_meters },
+          const system = payload.system && typeof payload.system === "object" ? payload.system : {};
+          const simulation = system.simulation && typeof system.simulation === "object" ? system.simulation : {};
+          payload.system = {
+            ...system,
+            simulation: { ...simulation, status: "archive" },
+            metrics: system.metrics || { sensor_range_meters: payload.summary?.sensor_range_meters },
           };
+          if (payload.zone_simulation && typeof payload.zone_simulation === "object") {
+            payload.zone_simulation = {
+              ...payload.zone_simulation,
+              status: "archive",
+              active: false,
+            };
+          }
           return payload;
         }
       }
@@ -1796,6 +1852,7 @@ DESIGN_PAGE = r"""<!doctype html>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>FlowMind Dashboard</title>
+  <link rel="stylesheet" href="/assets/zone-simulation.css">
   <style>
     :root {
       color-scheme: dark;
@@ -2642,6 +2699,76 @@ DESIGN_PAGE = r"""<!doctype html>
 
       <section class="kpis" id="cards" data-panel="overview ops full"></section>
 
+      <section class="panel zone-simulation" id="zoneSimulation" data-panel="overview compare ops full" aria-labelledby="zoneSimulationTitle">
+        <div class="panel-header zone-sim-header">
+          <div class="zone-sim-heading">
+            <span class="zone-sim-eyebrow">SUMO LIVE · INTERSECTION MONITOR</span>
+            <h2 id="zoneSimulationTitle">Симуляція зони перехресть</h2>
+          </div>
+          <div class="zone-sim-header-actions">
+            <span class="tag warn" id="zoneSimulationSource">очікує SUMO snapshot</span>
+          </div>
+        </div>
+        <div class="zone-sim-body">
+          <div class="zone-sim-intro">
+            <p class="zone-sim-intro-copy">
+              Кожне контрольоване SUMO-перехрестя показане окремо зі своїми машинами, чергою, зайнятістю виходу та сигналом. Натисніть на потрібний вузол, щоб відстежувати його live. Mock-режим вимкнено.
+            </p>
+            <span class="zone-sim-readonly-mode" id="zoneSimulationMode">Режим: очікує дані</span>
+          </div>
+
+          <div class="zone-sim-layout">
+            <div class="zone-sim-map-wrap">
+              <div class="zone-sim-map" id="zoneSimulationMap" aria-live="polite" aria-label="Live-монітор окремих SUMO-перехресть"></div>
+              <div class="zone-sim-flow-status" aria-live="polite">
+                <div class="zone-sim-direction-card">
+                  <span class="zone-sim-direction-icon" id="zoneSimulationDirectionIcon" aria-hidden="true">⌁</span>
+                  <div>
+                    <span>Вибране перехрестя SUMO</span>
+                    <strong id="zoneSimulationDirection">—</strong>
+                  </div>
+                </div>
+                <p class="zone-sim-message" id="zoneSimulationMessage">Очікуємо активну SUMO-симуляцію та live snapshot.</p>
+              </div>
+            </div>
+
+            <aside class="zone-sim-sidebar" aria-label="Стан зони">
+              <div class="zone-sim-stat-grid">
+                <div class="zone-sim-stat">
+                  <span class="zone-sim-stat-label">Вузли зони</span>
+                  <strong id="zoneSimulationPressure">—</strong>
+                </div>
+                <div class="zone-sim-stat zone-sim-stat--free">
+                  <span class="zone-sim-stat-label">Авто у кадрі</span>
+                  <strong id="zoneSimulationFreeSpace">—</strong>
+                </div>
+                <div class="zone-sim-stat zone-sim-stat--queue">
+                  <span class="zone-sim-stat-label">Сумарна черга</span>
+                  <strong id="zoneSimulationQueue">—</strong>
+                </div>
+              </div>
+              <p class="zone-sim-phases-heading">Активні світлофори SUMO</p>
+              <div class="zone-sim-phases" id="zoneSimulationPhases"></div>
+              <div class="zone-sim-legend" aria-label="Легенда світлофорів">
+                <span><i class="green"></i> Зелений</span>
+                <span><i class="yellow"></i> Жовтий</span>
+                <span><i class="red"></i> Червоний</span>
+              </div>
+              <div class="zone-sim-legend zone-sim-load-legend" aria-label="Легенда завантаження автомобілів">
+                <span><i class="car-free"></i> Авто: &lt;5</span>
+                <span><i class="car-busy"></i> Авто: 5–9</span>
+                <span><i class="car-critical"></i> Авто: ≥10</span>
+              </div>
+            </aside>
+          </div>
+        </div>
+        <div class="zone-sim-footer">
+          <span><strong>Джерело:</strong> `zone_simulation` у live SUMO snapshot.</span>
+          <span>Колір авто враховує навантаження вибраного перехрестя та його смуг.</span>
+          <span>За межами активної SUMO-симуляції карта навмисно вимкнена.</span>
+        </div>
+      </section>
+
       <section class="panel" data-panel="compare full">
         <div class="panel-header">
           <h2>Порівняння сценаріїв</h2>
@@ -2785,6 +2912,7 @@ DESIGN_PAGE = r"""<!doctype html>
     </main>
   </div>
 
+  <script src="/assets/zone-simulation.js"></script>
   <script>
     const $ = (id) => document.getElementById(id);
     const pollMs = 1000;
@@ -3362,10 +3490,20 @@ DESIGN_PAGE = r"""<!doctype html>
         if (id) {
           const payload = await api(`/api/archive/${id}`);
           payload.process = { status: "archive", running: false, logs: [] };
-          payload.system = payload.system || {
-            simulation: { status: "archive" },
-            metrics: { sensor_range_meters: payload.summary?.sensor_range_meters },
+          const system = payload.system && typeof payload.system === "object" ? payload.system : {};
+          const simulation = system.simulation && typeof system.simulation === "object" ? system.simulation : {};
+          payload.system = {
+            ...system,
+            simulation: { ...simulation, status: "archive" },
+            metrics: system.metrics || { sensor_range_meters: payload.summary?.sensor_range_meters },
           };
+          if (payload.zone_simulation && typeof payload.zone_simulation === "object") {
+            payload.zone_simulation = {
+              ...payload.zone_simulation,
+              status: "archive",
+              active: false,
+            };
+          }
           return payload;
         }
       }
@@ -3385,12 +3523,14 @@ DESIGN_PAGE = r"""<!doctype html>
         renderMetrics(payload);
         renderSystem(payload);
         renderComparison(payload);
+        window.FlowMindZoneSimulation?.setSnapshot(payload);
         renderIntersections(payload.intersections || []);
         renderDecisions(payload.decision_log || []);
         drawHistory(payload.metric_history || []);
         renderProcess(process);
         renderGeminiPanel(payload);
       } catch (error) {
+        window.FlowMindZoneSimulation?.setSnapshot(null);
         setTag("processTag", "процес", "api error", "bad");
         $("logs").textContent = String(error);
       }
@@ -4439,6 +4579,17 @@ else:
     @app.get("/assets/icon_car.png")
     def car_icon() -> Any:
         return FileResponse(CAR_ICON_PATH, media_type="image/png")
+
+    @app.get("/assets/zone-simulation.css")
+    def zone_simulation_css() -> Any:
+        return FileResponse(ZONE_SIMULATION_CSS_PATH, media_type="text/css")
+
+    @app.get("/assets/zone-simulation.js")
+    def zone_simulation_js() -> Any:
+        return FileResponse(
+            ZONE_SIMULATION_JS_PATH,
+            media_type="application/javascript",
+        )
 
     @app.get("/api/health")
     def health() -> dict[str, Any]:

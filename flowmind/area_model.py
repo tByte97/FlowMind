@@ -14,6 +14,8 @@ class ControlledLink:
     incoming_lane: str
     outgoing_lane: str
     signal_index: int
+    incoming_shape: tuple[tuple[float, float], ...] = ()
+    outgoing_shape: tuple[tuple[float, float], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -63,6 +65,63 @@ class AreaModel:
     def intersection(self, tls_id: str) -> Intersection:
         return next(item for item in self.intersections if item.tls_id == tls_id)
 
+    @property
+    def visual_lanes(self) -> tuple[dict[str, object], ...]:
+        """Static SUMO lane geometry for a map view of this controlled area."""
+
+        lanes: dict[str, dict[str, object]] = {}
+
+        def add_lane(
+            lane_id: str,
+            shape: tuple[tuple[float, float], ...],
+            direction: str,
+            tls_id: str,
+        ) -> None:
+            if len(shape) < 2:
+                return
+            entry = lanes.setdefault(
+                lane_id,
+                {
+                    "lane_id": lane_id,
+                    "shape": [
+                        [round(float(x), 3), round(float(y), 3)]
+                        for x, y in shape
+                    ],
+                    "directions": set(),
+                    "tls_ids": set(),
+                },
+            )
+            directions = entry["directions"]
+            tls_ids = entry["tls_ids"]
+            if isinstance(directions, set):
+                directions.add(direction)
+            if isinstance(tls_ids, set):
+                tls_ids.add(tls_id)
+
+        for intersection in self.intersections:
+            for link in intersection.links:
+                add_lane(
+                    link.incoming_lane,
+                    link.incoming_shape,
+                    "incoming",
+                    intersection.tls_id,
+                )
+                add_lane(
+                    link.outgoing_lane,
+                    link.outgoing_shape,
+                    "outgoing",
+                    intersection.tls_id,
+                )
+
+        return tuple(
+            {
+                "lane_id": lane_id,
+                "shape": entry["shape"],
+                "directions": sorted(entry["directions"]),
+                "tls_ids": sorted(entry["tls_ids"]),
+            }
+            for lane_id, entry in sorted(lanes.items())
+        )
 
 def load_zone_tls_ids(zone_path: str | Path) -> tuple[str, ...]:
     payload = json.loads(Path(zone_path).read_text(encoding="utf-8"))
@@ -96,6 +155,14 @@ def _intersection_from_tls(tls: object) -> Intersection | None:
             incoming_lane=connection[0].getID(),
             outgoing_lane=connection[1].getID(),
             signal_index=int(connection[2]),
+            incoming_shape=tuple(
+                (float(point[0]), float(point[1]))
+                for point in connection[0].getShape(includeJunctions=True)
+            ),
+            outgoing_shape=tuple(
+                (float(point[0]), float(point[1]))
+                for point in connection[1].getShape(includeJunctions=True)
+            ),
         )
         for connection in tls.getConnections()
     )

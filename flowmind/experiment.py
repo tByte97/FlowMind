@@ -50,7 +50,11 @@ def _sumo_log_tail(command: list[str], max_lines: int = 20) -> str:
         return ""
     return "\n".join(lines[-max_lines:])
 
-from .area_model import AreaModel, discover_area, load_zone_tls_ids
+from .area_model import (
+    AreaModel,
+    discover_area,
+    load_zone_tls_ids,
+)
 from .config import RunConfig
 from .controller import AreaSignalController
 from .corridor_manager import CorridorManager
@@ -470,6 +474,11 @@ def write_live_run_status(
         },
     )
     payload["system"] = system
+    zone_simulation = payload.get("zone_simulation")
+    if isinstance(zone_simulation, dict):
+        zone_simulation["status"] = status
+        zone_simulation["active"] = False
+        payload["zone_simulation"] = zone_simulation
 
     temporary_path = output_path.with_suffix(".json.tmp")
     temporary_path.write_text(

@@ -77,6 +77,7 @@ class MetricsCollector:
         self.emergency_trace: list[EmergencyTraceSample] = []
         self._last_live_status: dict[str, Any] | None = None
         self._publisher: LiveTelemetryPublisher | None = None
+        self._visual_lanes = area.visual_lanes
 
     def collect(self, simulation_time: float) -> None:
         departed = self._traci.simulation.getDepartedIDList()
@@ -275,6 +276,7 @@ class MetricsCollector:
         intersection_status = self._intersection_status(lane_status)
         vehicles = self._vehicle_positions()
         active_network = len(self._departed_at)
+        normalized_system_status = system_status or {}
         payload = {
             "schema_version": 2,
             "mode": mode,
@@ -316,7 +318,15 @@ class MetricsCollector:
             "lanes": lane_status,
             "intersections": intersection_status,
             "vehicles": vehicles,
-            "system": system_status or {},
+            "zone_simulation": self._zone_simulation_payload(
+                mode,
+                simulation_time,
+                intersection_status,
+                lane_status,
+                vehicles,
+                normalized_system_status,
+            ),
+            "system": normalized_system_status,
             "decision_log": list(decision_log or ())[-120:],
             "emergency_trace": [
                 asdict(item) for item in self.emergency_trace[-20:]
@@ -340,6 +350,20 @@ class MetricsCollector:
             # Live diagnostics must never stop the simulation when an entity
             # disappears between two TraCI calls.
             return default
+
+    @staticmethod
+    def _color_hex(value: Any, fallback: str = "#4ddfd4") -> str:
+        try:
+            values = list(value) if isinstance(value, (list, tuple)) else []
+            if len(values) < 3:
+                return fallback
+            return "#{:02x}{:02x}{:02x}".format(
+                max(0, min(255, int(values[0]))),
+                max(0, min(255, int(values[1]))),
+                max(0, min(255, int(values[2]))),
+            )
+        except (TypeError, ValueError, OverflowError):
+            return fallback
 
     def _lane_status(self) -> list[dict[str, Any]]:
         incoming = set(self._area.incoming_lanes)
@@ -386,11 +410,17 @@ class MetricsCollector:
                     intersection.tls_id,
                 )
             )
-            state = (
+            fallback_state = (
                 intersection.phases[phase]
                 if 0 <= phase < len(intersection.phases)
                 else ""
             )
+            state_value = self._safe_call(
+                getattr(trafficlight, "getRedYellowGreenState", None),
+                fallback_state,
+                intersection.tls_id,
+            )
+            state = state_value if isinstance(state_value, str) else fallback_state
             state_lower = state.lower()
             signal = (
                 "yellow"
@@ -402,6 +432,8 @@ class MetricsCollector:
             rows.append(
                 {
                     "tls_id": intersection.tls_id,
+                    "x": round(float(intersection.position[0]), 3),
+                    "y": round(float(intersection.position[1]), 3),
                     "phase": phase,
                     "phase_elapsed": round(
                         max(
@@ -428,9 +460,71 @@ class MetricsCollector:
                         else 0.0,
                         4,
                     ),
+                    "active_now": any(
+                        int(item["vehicle_count"]) > 0
+                        for item in [*incoming_rows, *outgoing_rows]
+                    ),
+                    "movements": [
+                        {
+                            "incoming_lane": link.incoming_lane,
+                            "outgoing_lane": link.outgoing_lane,
+                            "signal_index": link.signal_index,
+                            "state": (
+                                state[link.signal_index]
+                                if 0 <= link.signal_index < len(state)
+                                else "r"
+                            ),
+                        }
+                        for link in intersection.links
+                    ],
                 }
             )
         return rows
+
+    def _zone_simulation_payload(
+        self,
+        mode: str,
+        simulation_time: float,
+        intersections: list[dict[str, Any]],
+        lane_status: list[dict[str, Any]],
+        vehicles: list[dict[str, Any]],
+        system_status: dict[str, Any],
+    ) -> dict[str, Any]:
+        simulation_value = system_status.get("simulation")
+        simulation = (
+            simulation_value if isinstance(simulation_value, dict) else {}
+        )
+        status = str(simulation.get("status", "waiting"))
+        controlled_intersections = list(intersections)
+        traffic_by_lane = {
+            str(row.get("lane_id", "")): row
+            for row in lane_status
+            if row.get("lane_id")
+        }
+        visual_lanes = []
+        for lane in self._visual_lanes:
+            traffic = traffic_by_lane.get(str(lane.get("lane_id", "")), {})
+            visual_lanes.append(
+                {
+                    **lane,
+                    "vehicle_count": int(traffic.get("vehicle_count", 0)),
+                    "queue": int(traffic.get("queue", 0)),
+                    "occupancy": round(float(traffic.get("occupancy", 0.0)), 4),
+                    "mean_speed": round(float(traffic.get("mean_speed", 0.0)), 3),
+                }
+            )
+        return {
+            "schema_version": 1,
+            "source": "sumo",
+            "status": status,
+            "active": status == "running" and bool(controlled_intersections),
+            "mode": mode,
+            "simulated_time": round(float(simulation_time), 3),
+            "sensor_range_meters": self._control.sensor_range_meters,
+            "intersections": controlled_intersections,
+            "lanes": visual_lanes,
+            "vehicles": vehicles,
+        }
 
     def _vehicle_positions(self, limit: int = 250) -> list[dict[str, Any]]:
         traffic = self._reader.read()
@@ -440,14 +534,41 @@ class MetricsCollector:
         vehicle_ids: set[str] = set()
         for lane_id in lane_ids:
             vehicle_ids.update(traffic.lane(lane_id).vehicle_ids)
+        controlled_vehicle_ids = set(vehicle_ids)
+        network_vehicle_ids = self._safe_call(
+            getattr(self._traci.vehicle, "getIDList", None),
+            (),
+        )
+        if isinstance(network_vehicle_ids, (list, tuple, set)):
+            vehicle_ids.update(str(vehicle_id) for vehicle_id in network_vehicle_ids)
 
         rows: list[dict[str, Any]] = []
-        for vehicle_id in sorted(vehicle_ids)[:limit]:
+        ordered_vehicle_ids = sorted(
+            vehicle_ids,
+            key=lambda vehicle_id: (
+                vehicle_id != self._priority_vehicle,
+                vehicle_id,
+            ),
+        )
+        for vehicle_id in ordered_vehicle_ids:
             position = self._safe_call(
                 getattr(self._traci.vehicle, "getPosition", None),
                 (0.0, 0.0),
                 vehicle_id,
             )
+            point = (float(position[0]), float(position[1]))
+            if (
+                vehicle_id not in controlled_vehicle_ids
+                and vehicle_id != self._priority_vehicle
+                and not self._near_controlled_intersection(point)
+            ):
+                continue
+            color_value = self._safe_call(
+                getattr(self._traci.vehicle, "getColor", None),
+                (77, 223, 212, 255),
+                vehicle_id,
+            )
+            color = self._color_hex(color_value)
             rows.append(
                 {
                     "vehicle_id": vehicle_id,
@@ -466,6 +587,24 @@ class MetricsCollector:
                         ),
                         3,
                     ),
+                    "angle": round(
+                        float(
+                            self._safe_call(
+                                getattr(self._traci.vehicle, "getAngle", None),
+                                0.0,
+                                vehicle_id,
+                            )
+                        ),
+                        2,
+                    ),
+                    "lane_id": str(
+                        self._safe_call(
+                            getattr(self._traci.vehicle, "getLaneID", None),
+                            "",
+                            vehicle_id,
+                        )
+                    ),
+                    "color": color,
                     "edge_id": str(
                         self._safe_call(
                             getattr(self._traci.vehicle, "getRoadID", None),
@@ -476,7 +615,22 @@ class MetricsCollector:
                     "is_priority": vehicle_id == self._priority_vehicle,
                 }
             )
+            if len(rows) >= limit:
+                break
         return rows
+
+    def _near_controlled_intersection(self, point: tuple[float, float]) -> bool:
+        if not self._area.intersections:
+            return False
+        maximum_distance = max(float(self._control.sensor_range_meters), 90.0)
+        maximum_squared = maximum_distance * maximum_distance
+        px, py = point
+        return any(
+            (px - intersection.position[0]) ** 2
+            + (py - intersection.position[1]) ** 2
+            <= maximum_squared
+            for intersection in self._area.intersections
+        )
 
     def write(self, results_dir: Path, summary: dict[str, object]) -> None:
         results_dir.mkdir(parents=True, exist_ok=True)

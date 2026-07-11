@@ -75,6 +75,32 @@ class ExperimentEnvironmentTest(unittest.TestCase):
         self.assertEqual(payload["system"]["websocket"]["port"], 9876)
         self.assertEqual(payload["metric_history"], [])
 
+    def test_failed_run_marker_disables_existing_zone_snapshot(self) -> None:
+        with TemporaryDirectory() as directory:
+            config = RunConfig(
+                mode="flowmind",
+                results_dir=Path(directory),
+            )
+            live_status = config.results_dir / "live_status.json"
+            live_status.write_text(
+                json.dumps(
+                    {
+                        "zone_simulation": {
+                            "status": "running",
+                            "active": True,
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            path = experiment.write_live_run_status(config, "failed", "test error")
+            payload = json.loads(path.read_text(encoding="utf-8"))
+
+        self.assertEqual(payload["system"]["simulation"]["status"], "failed")
+        self.assertEqual(payload["zone_simulation"]["status"], "failed")
+        self.assertFalse(payload["zone_simulation"]["active"])
+
 
 if __name__ == "__main__":
     unittest.main()

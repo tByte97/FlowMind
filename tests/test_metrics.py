@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from flowmind.area_model import AreaModel
+from flowmind.area_model import AreaModel, ControlledLink, Intersection
 from flowmind.config import ControlConfig
 from flowmind.metrics import MetricsCollector
 
@@ -69,6 +69,53 @@ class FakeTraci:
         self.simulation = FakeSimulation()
         self.lane = FakeLane()
         self.vehicle = FakeVehicle()
+
+
+class ActiveFakeLane(FakeLane):
+    def getLength(self, _lane_id: str) -> float:
+        return 200.0
+
+    def getLastStepVehicleIDs(self, lane_id: str) -> tuple[str, ...]:
+        return ("veh1",) if lane_id == "in_0" else ()
+
+
+class ActiveFakeVehicle(FakeVehicle):
+    def getSpeed(self, _vehicle_id: str) -> float:
+        return 0.0
+
+    def getLanePosition(self, _vehicle_id: str) -> float:
+        return 180.0
+
+    def getPosition(self, _vehicle_id: str) -> tuple[float, float]:
+        return (11.0, 22.0)
+
+    def getLaneID(self, _vehicle_id: str) -> str:
+        return "in_0"
+
+    def getAngle(self, _vehicle_id: str) -> float:
+        return 90.0
+
+    def getColor(self, _vehicle_id: str) -> tuple[int, int, int, int]:
+        return (12, 34, 56, 255)
+
+
+class ActiveFakeTrafficLight:
+    def getPhase(self, _tls_id: str) -> int:
+        return 0
+
+    def getSpentDuration(self, _tls_id: str) -> float:
+        return 7.5
+
+    def getRedYellowGreenState(self, _tls_id: str) -> str:
+        return "Gr"
+
+
+class ActiveFakeTraci(FakeTraci):
+    def __init__(self) -> None:
+        super().__init__()
+        self.lane = ActiveFakeLane()
+        self.vehicle = ActiveFakeVehicle()
+        self.trafficlight = ActiveFakeTrafficLight()
 
 
 class MetricsCollectorTest(unittest.TestCase):
@@ -142,11 +189,64 @@ class MetricsCollectorTest(unittest.TestCase):
             self.assertEqual(payload["traffic_flow"]["inflow_per_minute"], 0.0)
             self.assertEqual(payload["intersections"], [])
             self.assertEqual(payload["vehicles"], [])
+            self.assertFalse(payload["zone_simulation"]["active"])
             self.assertEqual(
                 payload["decision_log"][0]["title"],
                 "Продовжено зелену фазу",
             )
             self.assertFalse(output_path.with_suffix(".json.tmp").exists())
+
+    def test_live_status_contains_active_sumo_map_snapshot(self) -> None:
+        area = AreaModel(
+            (
+                Intersection(
+                    tls_id="tls_1",
+                    position=(10.0, 20.0),
+                    phases=("Gr",),
+                    links=(
+                        ControlledLink(
+                            "in_0",
+                            "out_0",
+                            0,
+                            incoming_shape=((0.0, 20.0), (10.0, 20.0)),
+                            outgoing_shape=((10.0, 20.0), (20.0, 20.0)),
+                        ),
+                    ),
+                ),
+            )
+        )
+        collector = MetricsCollector(
+            ActiveFakeTraci(),
+            area,
+            ControlConfig(decision_interval=3),
+        )
+        collector.collect(3.0)
+
+        with TemporaryDirectory() as temp_dir:
+            output_path = collector.write_live_status(
+                Path(temp_dir),
+                "flowmind",
+                3.0,
+                system_status={"simulation": {"status": "running"}},
+            )
+            payload = json.loads(output_path.read_text(encoding="utf-8"))
+
+        intersection = payload["intersections"][0]
+        self.assertEqual((intersection["x"], intersection["y"]), (10.0, 20.0))
+        self.assertTrue(intersection["active_now"])
+        self.assertEqual(intersection["movements"][0]["state"], "G")
+        vehicle = payload["vehicles"][0]
+        self.assertEqual(vehicle["lane_id"], "in_0")
+        self.assertEqual(vehicle["angle"], 90.0)
+        self.assertEqual(vehicle["color"], "#0c2238")
+        zone = payload["zone_simulation"]
+        self.assertTrue(zone["active"])
+        self.assertEqual(zone["source"], "sumo")
+        self.assertEqual(zone["intersections"][0]["tls_id"], "tls_1")
+        self.assertEqual(zone["lanes"][0]["shape"], [[0.0, 20.0], [10.0, 20.0]])
+        self.assertEqual(zone["lanes"][0]["vehicle_count"], 1)
+        self.assertEqual(zone["lanes"][0]["queue"], 1)
+        self.assertEqual(zone["lanes"][0]["occupancy"], 0.0625)
 
     def test_live_flow_rates_use_changes_between_samples(self) -> None:
         traci = FakeTraci()

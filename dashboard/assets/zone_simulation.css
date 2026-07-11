@@ -1,0 +1,591 @@
+/* Live SUMO zone map. All selectors are scoped to the dashboard widget. */
+.zone-simulation {
+  border-color: rgba(77, 223, 212, .38);
+  background:
+    radial-gradient(circle at 12% 0%, rgba(77, 223, 212, .1), transparent 30%),
+    linear-gradient(135deg, rgba(29, 35, 48, .98), rgba(19, 25, 36, .98));
+}
+
+.zone-simulation .zone-sim-header {
+  align-items: flex-start;
+  background: linear-gradient(90deg, rgba(77, 223, 212, .08), transparent 42%);
+}
+
+.zone-sim-heading {
+  display: grid;
+  gap: 3px;
+}
+
+.zone-sim-eyebrow {
+  color: var(--cyan);
+  font-size: 10px;
+  font-weight: 830;
+  letter-spacing: .13em;
+}
+
+.zone-sim-header-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.zone-sim-body { padding: 14px; }
+
+.zone-sim-intro {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 0 0 13px;
+}
+
+.zone-sim-intro-copy {
+  max-width: 700px;
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.zone-sim-readonly-mode {
+  display: inline-flex;
+  align-items: center;
+  min-height: 31px;
+  padding: 6px 9px;
+  color: #c9fffa;
+  border: 1px solid rgba(77, 223, 212, .42);
+  border-radius: 7px;
+  background: rgba(77, 223, 212, .09);
+  font-size: 12px;
+  font-weight: 780;
+}
+
+.zone-sim-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(230px, .3fr);
+  gap: 14px;
+  align-items: stretch;
+}
+
+.zone-sim-map-wrap { min-width: 0; }
+
+.zone-sim-map {
+  position: relative;
+  min-height: 410px;
+  overflow: hidden;
+  isolation: isolate;
+  cursor: default;
+  touch-action: manipulation;
+  user-select: none;
+  border: 1px solid #364154;
+  border-radius: 11px;
+  background:
+    linear-gradient(rgba(77, 223, 212, .035) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(77, 223, 212, .035) 1px, transparent 1px),
+    radial-gradient(circle at 50% 48%, #202a39, #111721 72%);
+  background-size: 24px 24px, 24px 24px, auto;
+  box-shadow: inset 0 0 55px rgba(0, 0, 0, .34);
+}
+
+.zone-sim-junction-grid {
+  position: relative;
+  z-index: 2;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  min-height: 410px;
+  padding: 10px;
+}
+
+.zone-sim-junction-card {
+  position: relative;
+  display: grid;
+  grid-template-rows: auto minmax(88px, 1fr) auto auto;
+  gap: 6px;
+  min-width: 0;
+  min-height: 188px;
+  padding: 9px;
+  overflow: hidden;
+  color: #dce7f6;
+  border: 1px solid #3c495d;
+  border-radius: 9px;
+  background: linear-gradient(145deg, rgba(35, 45, 60, .96), rgba(19, 27, 38, .98));
+  box-shadow: 0 6px 16px rgba(0, 0, 0, .2);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: border-color .2s ease, box-shadow .2s ease, transform .2s ease;
+}
+
+.zone-sim-junction-card:hover {
+  border-color: #667891;
+  transform: translateY(-1px);
+}
+
+.zone-sim-junction-card.is-selected {
+  border-color: var(--cyan);
+  box-shadow: 0 0 0 2px rgba(77, 223, 212, .17), 0 8px 20px rgba(0, 0, 0, .28);
+}
+
+.zone-sim-junction-card[data-load="busy"] { border-left: 3px solid var(--amber); }
+.zone-sim-junction-card[data-load="critical"] { border-left: 3px solid var(--red); }
+.zone-sim-junction-card[data-load="free"] { border-left: 3px solid var(--green); }
+
+.zone-sim-junction-header,
+.zone-sim-junction-stats {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+
+.zone-sim-junction-header strong { font-size: 12px; letter-spacing: .04em; }
+
+.zone-sim-junction-load {
+  padding: 2px 6px;
+  color: #dce7f6;
+  border: 1px solid #536176;
+  border-radius: 999px;
+  background: rgba(13, 20, 29, .65);
+  font-size: 9px;
+  text-transform: uppercase;
+}
+
+.zone-sim-junction-card[data-load="free"] .zone-sim-junction-load { color: var(--green); }
+.zone-sim-junction-card[data-load="busy"] .zone-sim-junction-load { color: var(--amber); }
+.zone-sim-junction-card[data-load="critical"] .zone-sim-junction-load { color: var(--red); }
+
+.zone-sim-mini-map {
+  position: relative;
+  display: block;
+  min-height: 88px;
+  overflow: hidden;
+  border: 1px solid rgba(77, 91, 111, .55);
+  border-radius: 7px;
+  background: #18212e;
+}
+
+.zone-sim-mini-map::before,
+.zone-sim-mini-map::after {
+  position: absolute;
+  z-index: 1;
+  content: "";
+  background-color: #3c4858;
+  box-shadow: 0 0 0 4px #111821;
+}
+
+.zone-sim-mini-map::before {
+  top: calc(50% - 11px);
+  right: -5px;
+  left: -5px;
+  height: 22px;
+  background-image: linear-gradient(90deg, transparent 48%, rgba(236, 241, 248, .52) 48% 52%, transparent 52%);
+  background-size: 18px 1px;
+  background-repeat: repeat-x;
+  background-position: center;
+}
+
+.zone-sim-mini-map::after {
+  top: -5px;
+  bottom: -5px;
+  left: calc(50% - 11px);
+  width: 22px;
+  background-image: linear-gradient(0deg, transparent 48%, rgba(236, 241, 248, .52) 48% 52%, transparent 52%);
+  background-size: 1px 18px;
+  background-repeat: repeat-y;
+  background-position: center;
+}
+
+.zone-sim-mini-centre {
+  position: absolute;
+  z-index: 3;
+  top: 50%;
+  left: 50%;
+  width: 25px;
+  height: 25px;
+  transform: translate(-50%, -50%);
+  border: 1px dashed rgba(238, 243, 250, .45);
+  background: #465365;
+}
+
+.zone-sim-mini-cars { position: absolute; z-index: 5; inset: 0; }
+
+.zone-sim-mini-car[data-approach="0"] {
+  top: calc(5px + var(--car-shift));
+  left: calc(50% - 4px);
+  transform: rotate(90deg);
+}
+.zone-sim-mini-car[data-approach="1"] {
+  top: calc(50% - 3px);
+  right: calc(5px + var(--car-shift));
+  transform: rotate(180deg);
+}
+.zone-sim-mini-car[data-approach="2"] {
+  right: calc(50% - 4px);
+  bottom: calc(5px + var(--car-shift));
+  transform: rotate(270deg);
+}
+.zone-sim-mini-car[data-approach="3"] {
+  top: calc(50% + 4px);
+  left: calc(5px + var(--car-shift));
+}
+
+.zone-sim-car-overflow {
+  position: absolute;
+  z-index: 8;
+  right: 4px;
+  bottom: 3px;
+  padding: 1px 4px;
+  color: #f4f7fc;
+  border-radius: 999px;
+  background: rgba(10, 15, 23, .84);
+  font-size: 8px;
+}
+
+.zone-sim-light--tile { z-index: 7; top: 5px; right: 5px; }
+
+.zone-sim-junction-stats {
+  color: #9eacbf;
+  font-size: 9px;
+}
+
+.zone-sim-tracking-label {
+  color: #7f8da2;
+  font-size: 9px;
+  text-align: center;
+}
+
+.zone-sim-junction-card.is-selected .zone-sim-tracking-label { color: var(--cyan); }
+
+.zone-sim-map::before {
+  position: absolute;
+  z-index: 0;
+  inset: 9px;
+  content: "";
+  border: 1px solid rgba(156, 166, 183, .09);
+  border-radius: 8px;
+  pointer-events: none;
+}
+
+.zone-sim-map.is-inactive {
+  display: grid;
+  place-items: center;
+  min-height: 272px;
+  background:
+    linear-gradient(135deg, rgba(25, 32, 44, .92), rgba(16, 22, 31, .96)),
+    repeating-linear-gradient(45deg, transparent 0 14px, rgba(156, 166, 183, .035) 14px 28px);
+}
+
+.zone-sim-empty {
+  position: relative;
+  z-index: 1;
+  display: grid;
+  max-width: 400px;
+  gap: 6px;
+  padding: 18px 20px;
+  text-align: center;
+  color: var(--muted);
+}
+
+.zone-sim-empty::before {
+  width: 30px;
+  height: 30px;
+  margin: 0 auto 4px;
+  content: "";
+  border: 2px solid #59657a;
+  border-radius: 9px;
+  background:
+    linear-gradient(90deg, transparent 43%, rgba(77, 223, 212, .85) 43% 57%, transparent 57%),
+    linear-gradient(0deg, transparent 43%, rgba(255, 111, 97, .78) 43% 57%, transparent 57%);
+}
+
+.zone-sim-empty strong { color: #dce7f6; }
+.zone-sim-empty span { font-size: 12px; }
+
+.zone-sim-light {
+  position: absolute;
+  z-index: 8;
+  display: grid;
+  gap: 1px;
+  width: 10px;
+  padding: 2px;
+  border: 1px solid #5c687c;
+  border-radius: 4px;
+  background: #10151e;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, .35);
+}
+
+.zone-sim-light--live { top: -8px; right: -8px; }
+
+.zone-sim-lamp {
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: #4a5160;
+}
+
+.zone-sim-light[data-state="red"] .zone-sim-lamp--red {
+  background: #ff6f61;
+  box-shadow: 0 0 7px rgba(255, 111, 97, .95);
+}
+
+.zone-sim-light[data-state="yellow"] .zone-sim-lamp--yellow {
+  background: #f2bf5e;
+  box-shadow: 0 0 7px rgba(242, 191, 94, .95);
+}
+
+.zone-sim-light[data-state="green"] .zone-sim-lamp--green {
+  background: #62d48b;
+  box-shadow: 0 0 7px rgba(98, 212, 139, .95);
+}
+
+/* The supplied white RGBA icon is used as the car texture/mask and tinted per SUMO state. */
+.zone-sim-car {
+  position: absolute;
+  z-index: 6;
+  width: 12px;
+  height: 7px;
+  background: var(--car-color, #4ddfd4);
+  -webkit-mask: url("/assets/icon_car.png") center / contain no-repeat;
+  mask: url("/assets/icon_car.png") center / contain no-repeat;
+  filter: drop-shadow(0 1px 1px rgba(0, 0, 0, .62));
+  transition: left .85s linear, top .85s linear, transform .85s linear, opacity .22s ease, filter .22s ease;
+}
+
+.zone-sim-car.is-waiting {
+  opacity: .84;
+  filter: drop-shadow(0 0 6px var(--car-glow, rgba(242, 191, 94, .42)));
+}
+
+.zone-sim-car.is-priority {
+  z-index: 7;
+  filter: drop-shadow(0 0 7px rgba(111, 197, 255, .75));
+}
+
+.zone-sim-flow-status {
+  display: grid;
+  grid-template-columns: minmax(0, 1.05fr) minmax(0, .95fr);
+  gap: 10px;
+  margin-top: 11px;
+}
+
+.zone-sim-direction-card,
+.zone-sim-message {
+  min-width: 0;
+  border: 1px solid #343f52;
+  border-radius: 8px;
+  background: rgba(17, 23, 33, .72);
+}
+
+.zone-sim-direction-card {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 10px 11px;
+}
+
+.zone-sim-direction-icon {
+  display: grid;
+  flex: 0 0 auto;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  color: #041416;
+  border-radius: 7px;
+  background: var(--cyan);
+  font-size: 15px;
+  font-weight: 900;
+}
+
+.zone-sim-direction-card span,
+.zone-sim-stat-label {
+  display: block;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 720;
+}
+
+.zone-sim-direction-card strong {
+  display: block;
+  margin-top: 1px;
+  color: var(--ink);
+  font-size: 13px;
+}
+
+.zone-sim-message {
+  display: flex;
+  align-items: center;
+  margin: 0;
+  padding: 10px 11px;
+  color: #c8d4e3;
+  font-size: 12px;
+}
+
+.zone-sim-sidebar {
+  display: grid;
+  align-content: start;
+  gap: 10px;
+  padding: 11px;
+  border: 1px solid #343f52;
+  border-radius: 10px;
+  background: rgba(14, 20, 29, .68);
+}
+
+.zone-sim-stat-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 7px;
+}
+
+.zone-sim-stat {
+  min-width: 0;
+  padding: 8px;
+  border: 1px solid #303a4b;
+  border-radius: 7px;
+  background: #1a2230;
+}
+
+.zone-sim-stat strong {
+  display: block;
+  margin-top: 4px;
+  color: #f4f7fc;
+  font-size: 16px;
+  line-height: 1;
+  overflow-wrap: anywhere;
+}
+
+.zone-sim-stat--free strong { color: var(--green); }
+.zone-sim-stat--queue strong { color: var(--amber); }
+
+.zone-sim-phases-heading {
+  margin: 3px 0 0;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 780;
+  letter-spacing: .05em;
+  text-transform: uppercase;
+}
+
+.zone-sim-phases {
+  display: grid;
+  gap: 6px;
+}
+
+.zone-sim-phase {
+  display: grid;
+  grid-template-columns: 7px minmax(0, 1fr) auto;
+  gap: 7px;
+  align-items: center;
+  padding: 7px;
+  border: 1px solid #303a4b;
+  border-radius: 6px;
+  background: #1a2230;
+  color: #c8d4e3;
+  width: 100%;
+  font-size: 11px;
+  font-family: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.zone-sim-phase:hover { border-color: #526179; }
+.zone-sim-phase.is-selected {
+  border-color: rgba(77, 223, 212, .72);
+  background: rgba(77, 223, 212, .08);
+}
+
+.zone-sim-phase i {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #687386;
+}
+
+.zone-sim-phase[data-state="green"] i { background: var(--green); box-shadow: 0 0 7px rgba(98, 212, 139, .78); }
+.zone-sim-phase[data-state="yellow"] i { background: var(--amber); box-shadow: 0 0 7px rgba(242, 191, 94, .7); }
+.zone-sim-phase[data-state="red"] i { background: var(--red); box-shadow: 0 0 7px rgba(255, 111, 97, .65); }
+.zone-sim-phase strong { color: #f1f5fb; font-size: 11px; }
+.zone-sim-phase span:last-child { color: var(--muted); font-size: 10px; }
+
+.zone-sim-phase--empty {
+  display: block;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.zone-sim-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  padding-top: 2px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.zone-sim-legend span {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.zone-sim-legend i {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+}
+
+.zone-sim-legend .green { background: var(--green); }
+.zone-sim-legend .yellow { background: var(--amber); }
+.zone-sim-legend .red { background: var(--red); }
+.zone-sim-legend .mixed { background: #ba8ee8; }
+
+.zone-sim-load-legend {
+  padding-top: 7px;
+  border-top: 1px solid rgba(67, 80, 100, .55);
+}
+
+.zone-sim-load-legend i {
+  width: 16px;
+  height: 9px;
+  border-radius: 0;
+  -webkit-mask: url("/assets/icon_car.png") center / contain no-repeat;
+  mask: url("/assets/icon_car.png") center / contain no-repeat;
+}
+
+.zone-sim-load-legend .car-free { background: var(--green); }
+.zone-sim-load-legend .car-busy { background: var(--amber); }
+.zone-sim-load-legend .car-critical { background: var(--red); }
+
+.zone-sim-footer {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px 16px;
+  padding: 0 14px 13px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.zone-sim-footer strong { color: #ccd8e7; }
+
+@media (max-width: 1060px) {
+  .zone-sim-layout { grid-template-columns: 1fr; }
+  .zone-sim-sidebar { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+  .zone-sim-phases-heading, .zone-sim-phases, .zone-sim-legend { grid-column: 1 / -1; }
+}
+
+@media (max-width: 860px) {
+  .zone-sim-junction-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+@media (max-width: 680px) {
+  .zone-sim-header-actions { justify-content: flex-start; }
+  .zone-sim-map { min-height: 286px; }
+  .zone-sim-intro { align-items: start; }
+  .zone-sim-flow-status, .zone-sim-sidebar { grid-template-columns: 1fr; }
+  .zone-sim-phases-heading, .zone-sim-phases, .zone-sim-legend { grid-column: auto; }
+  .zone-sim-stat-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .zone-sim-stat { padding: 7px 6px; }
+  .zone-sim-stat strong { font-size: 14px; }
+  .zone-sim-car { width: 11px; height: 6px; }
+  .zone-sim-junction-grid { grid-template-columns: 1fr; }
+}

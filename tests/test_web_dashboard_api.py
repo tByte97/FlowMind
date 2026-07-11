@@ -9,6 +9,41 @@ from api import web_dashboard
 
 
 class WebDashboardApiTests(unittest.TestCase):
+    def test_dashboard_includes_live_only_sumo_zone_simulation(self) -> None:
+        page = web_dashboard.DESIGN_PAGE
+
+        self.assertIn('id="zoneSimulation"', page)
+        self.assertIn('/assets/zone-simulation.css', page)
+        self.assertIn('/assets/zone-simulation.js', page)
+        self.assertIn('FlowMindZoneSimulation?.setSnapshot(payload)', page)
+        self.assertIn('Mock-режим вимкнено.', page)
+        self.assertIn('Кожне контрольоване SUMO-перехрестя показане окремо', page)
+        self.assertIn('щоб відстежувати його live', page)
+        self.assertIn('Авто: &lt;5', page)
+        self.assertIn('Авто: ≥10', page)
+
+    def test_stop_marker_disables_live_sumo_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            result_dir = Path(directory)
+            status_path = result_dir / "live_status.json"
+            status_path.write_text(
+                json.dumps(
+                    {
+                        "system": {"simulation": {"status": "running"}},
+                        "zone_simulation": {"status": "running", "active": True},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            web_dashboard.mark_live_snapshot_inactive(result_dir)
+
+            payload = json.loads(status_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(payload["system"]["simulation"]["status"], "stopped")
+        self.assertEqual(payload["zone_simulation"]["status"], "stopped")
+        self.assertFalse(payload["zone_simulation"]["active"])
+
     def test_discover_result_sets_reads_live_status_and_summary(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
