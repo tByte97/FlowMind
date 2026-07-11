@@ -435,6 +435,11 @@ class MetricsCollector:
                     "x": round(float(intersection.position[0]), 3),
                     "y": round(float(intersection.position[1]), 3),
                     "phase": phase,
+                    "program_id": intersection.program_id,
+                    "program_type": intersection.program_type,
+                    "phase_duration": intersection.default_phase_duration(phase),
+                    "phase_min_duration": intersection.phase_min_duration(phase),
+                    "phase_max_duration": intersection.phase_max_duration(phase),
                     "phase_elapsed": round(
                         max(
                             float(

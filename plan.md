@@ -248,7 +248,7 @@
   - [x] Створити справжню static fixed-time TLS-програму для baseline.
   - [x] Явно розділити режими static_fixed, sumo_actuated, local, flowmind.
   - [x] На старті логувати active SUMO program ID і type для кожного TLS.
-  - [ ] Додати в Intersection program_id, program_type, minDur, maxDur.
+  - [x] Додати в Intersection program_id, program_type, minDur, maxDur.
   - [ ] Заборонити transition раніше SUMO minDur.
   - [ ] Узгодити clearance_seconds із реальними yellow/all-red фазами.
   - [ ] Додати hard gate для blocked downstream.

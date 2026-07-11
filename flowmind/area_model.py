@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from math import hypot
+from math import hypot, isfinite
 from pathlib import Path
 from statistics import median
 
@@ -25,6 +25,22 @@ class Intersection:
     phases: tuple[str, ...]
     links: tuple[ControlledLink, ...]
     phase_durations: tuple[float, ...] = ()
+    program_id: str = ""
+    program_type: str = ""
+    phase_min_durations: tuple[float | None, ...] = ()
+    phase_max_durations: tuple[float | None, ...] = ()
+
+    def __post_init__(self) -> None:
+        for name, values in (
+            ("phase_durations", self.phase_durations),
+            ("phase_min_durations", self.phase_min_durations),
+            ("phase_max_durations", self.phase_max_durations),
+        ):
+            if values and len(values) != len(self.phases):
+                raise ValueError(
+                    f"Intersection {self.tls_id}: {name} has {len(values)} "
+                    f"values for {len(self.phases)} phases"
+                )
 
     @property
     def green_phase_indices(self) -> tuple[int, ...]:
@@ -40,6 +56,25 @@ class Intersection:
             if duration > 0:
                 return duration
         return None
+
+    def phase_min_duration(self, phase_index: int) -> float | None:
+        return self._phase_bound(self.phase_min_durations, phase_index)
+
+    def phase_max_duration(self, phase_index: int) -> float | None:
+        return self._phase_bound(self.phase_max_durations, phase_index)
+
+    @staticmethod
+    def _phase_bound(
+        values: tuple[float | None, ...],
+        phase_index: int,
+    ) -> float | None:
+        if not 0 <= phase_index < len(values):
+            return None
+        value = values[phase_index]
+        if value is None:
+            return None
+        bound = float(value)
+        return bound if isfinite(bound) and bound >= 0 else None
 
 
 @dataclass(frozen=True)
@@ -147,9 +182,16 @@ def _intersection_from_tls(tls: object) -> Intersection | None:
     if not programs:
         return None
 
-    program = next(iter(programs.values()))
-    phases = tuple(phase.state for phase in program.getPhases())
-    phase_durations = tuple(float(phase.duration) for phase in program.getPhases())
+    program_id, program = next(iter(programs.items()))
+    program_phases = tuple(program.getPhases())
+    phases = tuple(phase.state for phase in program_phases)
+    phase_durations = tuple(float(phase.duration) for phase in program_phases)
+    phase_min_durations = tuple(
+        _optional_phase_bound(phase.minDur) for phase in program_phases
+    )
+    phase_max_durations = tuple(
+        _optional_phase_bound(phase.maxDur) for phase in program_phases
+    )
     links = tuple(
         ControlledLink(
             incoming_lane=connection[0].getID(),
@@ -180,7 +222,27 @@ def _intersection_from_tls(tls: object) -> Intersection | None:
         sum(point[0] for point in edge_centres) / len(edge_centres),
         sum(point[1] for point in edge_centres) / len(edge_centres),
     )
-    return Intersection(str(tls.getID()), position, phases, links, phase_durations)
+    return Intersection(
+        tls_id=str(tls.getID()),
+        position=position,
+        phases=phases,
+        links=links,
+        phase_durations=phase_durations,
+        program_id=str(program_id),
+        program_type=str(program.getType()),
+        phase_min_durations=phase_min_durations,
+        phase_max_durations=phase_max_durations,
+    )
+
+
+def _optional_phase_bound(value: object) -> float | None:
+    if value is None:
+        return None
+    try:
+        bound = float(value)
+    except (TypeError, ValueError):
+        return None
+    return bound if isfinite(bound) and bound >= 0 else None
 
 
 def discover_area(

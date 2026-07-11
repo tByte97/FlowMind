@@ -232,6 +232,11 @@ class MetricsCollectorTest(unittest.TestCase):
                             outgoing_shape=((10.0, 20.0), (20.0, 20.0)),
                         ),
                     ),
+                    phase_durations=(39.0,),
+                    program_id="0",
+                    program_type="actuated",
+                    phase_min_durations=(13.0,),
+                    phase_max_durations=(50.0,),
                 ),
             )
         )
@@ -255,6 +260,11 @@ class MetricsCollectorTest(unittest.TestCase):
         self.assertEqual((intersection["x"], intersection["y"]), (10.0, 20.0))
         self.assertTrue(intersection["active_now"])
         self.assertEqual(intersection["movements"][0]["state"], "G")
+        self.assertEqual(intersection["program_id"], "0")
+        self.assertEqual(intersection["program_type"], "actuated")
+        self.assertEqual(intersection["phase_duration"], 39.0)
+        self.assertEqual(intersection["phase_min_duration"], 13.0)
+        self.assertEqual(intersection["phase_max_duration"], 50.0)
         vehicle = payload["vehicles"][0]
         self.assertEqual(vehicle["lane_id"], "in_0")
         self.assertEqual(vehicle["angle"], 90.0)

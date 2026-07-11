@@ -8,6 +8,7 @@ from xml.etree import ElementTree as ET
 
 from flowmind.area_model import load_zone_tls_ids
 from flowmind.config import PROJECT_ROOT, RunConfig
+from flowmind.experiment import load_area
 from tools.generate_focused_traffic import write_sumo_config
 
 
@@ -19,6 +20,34 @@ class FocusedScenarioTest(unittest.TestCase):
         config = RunConfig(mode="fixed")
         self.assertEqual(config.config_path.name, "focused.sumocfg")
         self.assertEqual(config.zone_path.name, "central_zone.json")
+
+    def test_area_preserves_tls_program_and_phase_safety_metadata(self) -> None:
+        area = load_area(RunConfig(mode="sumo_actuated"))
+
+        self.assertEqual(len(area.intersections), 6)
+        for intersection in area.intersections:
+            self.assertEqual(intersection.program_id, "0")
+            self.assertEqual(intersection.program_type, "actuated")
+            self.assertEqual(len(intersection.phase_durations), len(intersection.phases))
+            self.assertEqual(
+                len(intersection.phase_min_durations),
+                len(intersection.phases),
+            )
+            self.assertEqual(
+                len(intersection.phase_max_durations),
+                len(intersection.phases),
+            )
+        self.assertTrue(
+            any(
+                minimum == 13.0 and maximum == 50.0
+                for intersection in area.intersections
+                for minimum, maximum in zip(
+                    intersection.phase_min_durations,
+                    intersection.phase_max_durations,
+                    strict=True,
+                )
+            )
+        )
 
     def test_manifest_covers_a_connected_six_light_zone(self) -> None:
         zone_tls = load_zone_tls_ids(SCENARIO_DIR / "central_zone.json")

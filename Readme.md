@@ -64,7 +64,7 @@ results/* + FastAPI dashboard
 
 | Файл | Призначення |
 | --- | --- |
-| `flowmind/area_model.py` | модель контрольованої зони, світлофорів, фаз і lane links |
+| `flowmind/area_model.py` | модель зони, TLS program ID/type, фазових duration/minDur/maxDur і lane links |
 | `flowmind/tls_programs.py` | static fixed-time програма й startup-аудит активних SUMO TLS-програм |
 | `flowmind/traffic_state.py` | читання стану смуг у sensor range |
 | `flowmind/signal_policy.py` | scoring фаз для `local` і `flowmind` |
