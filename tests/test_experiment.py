@@ -10,11 +10,31 @@ from unittest.mock import patch
 import traci
 
 import flowmind.experiment as experiment
-from flowmind.config import RunConfig
+from experiments.run_experiment import build_parser
+from flowmind.config import CONTROL_MODES, RunConfig
 from flowmind.experiment import configure_projection_data
 
 
 class ExperimentEnvironmentTest(unittest.TestCase):
+    def test_all_explicit_control_modes_are_accepted(self) -> None:
+        self.assertEqual(
+            tuple(RunConfig(mode=mode).mode for mode in CONTROL_MODES),
+            CONTROL_MODES,
+        )
+
+    def test_legacy_fixed_mode_is_normalized_to_static_fixed(self) -> None:
+        self.assertEqual(RunConfig(mode="fixed").mode, "static_fixed")
+
+    def test_unknown_control_mode_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "Expected one of"):
+            RunConfig(mode="automatic")
+
+    def test_cli_exposes_all_canonical_modes_and_legacy_alias(self) -> None:
+        parser = build_parser()
+        for mode in (*CONTROL_MODES, "fixed"):
+            with self.subTest(mode=mode):
+                self.assertEqual(parser.parse_args([mode]).mode, mode)
+
     def test_packaged_projection_database_is_configured(self) -> None:
         with patch.dict(os.environ, {}, clear=True):
             projection_dir = configure_projection_data()
@@ -100,6 +120,33 @@ class ExperimentEnvironmentTest(unittest.TestCase):
         self.assertEqual(payload["system"]["simulation"]["status"], "failed")
         self.assertEqual(payload["zone_simulation"]["status"], "failed")
         self.assertFalse(payload["zone_simulation"]["active"])
+
+    def test_live_status_distinguishes_non_adaptive_baselines(self) -> None:
+        class Simulation:
+            @staticmethod
+            def getMinExpectedNumber() -> int:
+                return 12
+
+        class Connection:
+            simulation = Simulation()
+
+        class Publisher:
+            client_count = 0
+
+        for mode in ("static_fixed", "sumo_actuated"):
+            with self.subTest(mode=mode):
+                status = experiment.build_live_system_status(
+                    config=RunConfig(mode=mode),
+                    connection=Connection(),
+                    controller=None,
+                    corridor_manager=None,
+                    publisher=Publisher(),
+                    queue_forecast=None,
+                    running=True,
+                )
+
+                self.assertEqual(status["controller"]["status"], mode)
+                self.assertEqual(status["controller"]["mode"], mode)
 
 
 if __name__ == "__main__":

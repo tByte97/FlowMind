@@ -97,7 +97,7 @@ class DashboardAppTests(unittest.TestCase):
         summary = pd.DataFrame(
             [
                 {
-                    "mode": "fixed",
+                    "mode": "static_fixed",
                     "average_waiting_time": 40.0,
                     "average_queue_length": 20.0,
                     "stops_count": 100,
@@ -122,6 +122,16 @@ class DashboardAppTests(unittest.TestCase):
         self.assertEqual(rows[0]["after"], 20.0)
         self.assertEqual(rows[0]["improvement"], 50.0)
         self.assertEqual(rows[3]["improvement"], 20.0)
+
+    def test_legacy_fixed_results_remain_available_as_baseline(self) -> None:
+        self.assertEqual(
+            app.select_baseline_mode(("fixed", "local", "flowmind")),
+            "fixed",
+        )
+        self.assertEqual(
+            app.select_baseline_mode(("fixed", "static_fixed", "flowmind")),
+            "static_fixed",
+        )
 
     def test_decision_and_corridor_helpers_read_live_payload(self) -> None:
         payload = {

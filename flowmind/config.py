@@ -7,11 +7,34 @@ from .emergency_vehicle import EmergencyVehicleConfig
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+STATIC_FIXED_MODE = "static_fixed"
+SUMO_ACTUATED_MODE = "sumo_actuated"
+LOCAL_MODE = "local"
+FLOWMIND_MODE = "flowmind"
+CONTROL_MODES = (
+    STATIC_FIXED_MODE,
+    SUMO_ACTUATED_MODE,
+    LOCAL_MODE,
+    FLOWMIND_MODE,
+)
+ADAPTIVE_CONTROL_MODES = (LOCAL_MODE, FLOWMIND_MODE)
+LEGACY_CONTROL_MODE_ALIASES = {"fixed": STATIC_FIXED_MODE}
 DEFAULT_QUEUE_MODEL_PATHS = (
     PROJECT_ROOT / "models" / "queue_lgbm_30s_current.joblib",
     PROJECT_ROOT / "models" / "queue_lgbm_60s_current.joblib",
     PROJECT_ROOT / "models" / "queue_lgbm_90s_current.joblib",
 )
+
+
+def normalize_control_mode(mode: str) -> str:
+    """Return the canonical control mode while accepting old run commands."""
+
+    requested = str(mode).strip().lower()
+    canonical = LEGACY_CONTROL_MODE_ALIASES.get(requested, requested)
+    if canonical not in CONTROL_MODES:
+        supported = ", ".join(CONTROL_MODES)
+        raise ValueError(f"Unknown mode: {mode}. Expected one of: {supported}")
+    return canonical
 
 
 @dataclass(frozen=True)
@@ -74,8 +97,7 @@ class RunConfig:
     dataset_target_horizons: tuple[int, ...] = (30, 60, 90)
 
     def __post_init__(self) -> None:
-        if self.mode not in {"fixed", "local", "flowmind"}:
-            raise ValueError(f"Unknown mode: {self.mode}")
+        object.__setattr__(self, "mode", normalize_control_mode(self.mode))
         if self.duration <= 0:
             raise ValueError("duration must be positive")
         if not 1 <= self.zone_size <= 20:

@@ -15,7 +15,7 @@ AI використовується як технологічна складов
 - запускає SUMO-симуляцію дорожньої мережі Рівного;
 - читає трафік через TraCI з контрольованих перехресть;
 - збирає дані тільки в межах sensor range біля перехресть, за замовчуванням 120 м;
-- порівнює режими `fixed`, `local`, `flowmind`;
+- порівнює режими `static_fixed`, `sumo_actuated`, `local`, `flowmind`;
 - керує фазами світлофорів через Python-контролер;
 - прогнозує майбутню чергу на 30, 60 і 90 секунд;
 - враховує зайнятість вихідних смуг, щоб не випускати авто в заблоковану ділянку;
@@ -27,9 +27,13 @@ AI використовується як технологічна складов
 
 | Режим | Опис |
 | --- | --- |
-| `fixed` | SUMO/fixed-plan baseline без адаптації до поточного трафіку |
+| `static_fixed` | детермінований baseline: активна SUMO-програма копіюється як `STATIC`, а тривалості фаз фіксуються в межах `minDur/maxDur` |
+| `sumo_actuated` | штатна actuated-логіка SUMO без зовнішнього FlowMind-контролера |
 | `local` | адаптивне керування окремим перехрестям за локальною чергою |
 | `flowmind` | зональне керування з урахуванням черги, downstream occupancy, area pressure, demand timer, ML forecast і priority override |
+
+Старе імʼя `fixed` приймається CLI лише як сумісний alias для
+`static_fixed`; нові результати завжди записуються з канонічною назвою.
 
 ## Архітектура
 
@@ -66,7 +70,7 @@ results/* + FastAPI dashboard
 | `flowmind/emergency_router.py` | маршрути для швидкої та оцінка альтернатив |
 | `flowmind/corridor_manager.py` | стан green corridor для екстреного транспорту |
 | `flowmind/metrics.py` | KPI, history, emergency trace, summary |
-| `experiments/run_demo.py` | demo-запуск FlowMind з опціональним fixed baseline |
+| `experiments/run_demo.py` | demo-запуск FlowMind з опціональним static fixed baseline |
 | `experiments/run_dataset.py` | генерація ML dataset через багато симуляцій |
 | `experiments/train_queue_ensemble.py` | тренування моделей 30/60/90 секунд |
 | `api/web_dashboard.py` | FastAPI dashboard, API, archive, averages, Gemini summary |
@@ -107,7 +111,7 @@ FastAPI dashboard:
 
 - `/` - live dashboard;
 - `/archive` - архів запусків;
-- `/averages` - порівняння середніх значень `fixed` / `local` / `flowmind`;
+- `/averages` - порівняння `static_fixed` / `sumo_actuated` / `local` / `flowmind`;
 - `/api/status` - поточний live status;
 - `/api/start-demo` - запуск demo-симуляції;
 - `/api/stop` - зупинка процесу;
@@ -169,7 +173,7 @@ http://127.0.0.1:8011/
 python experiments/run_demo.py --duration 600 --seed 42 --headless --no-dashboard
 ```
 
-З fixed baseline + FlowMind:
+З static fixed baseline + FlowMind:
 
 ```bash
 python experiments/run_demo.py --duration 600 --seed 42 --headless --no-dashboard
@@ -179,6 +183,15 @@ python experiments/run_demo.py --duration 600 --seed 42 --headless --no-dashboar
 
 ```bash
 python experiments/run_demo.py --duration 600 --seed 42 --headless --no-dashboard --no-baseline
+```
+
+Окремі режими без demo-обгортки:
+
+```bash
+python experiments/run_experiment.py static_fixed --duration 600
+python experiments/run_experiment.py sumo_actuated --duration 600
+python experiments/run_experiment.py local --duration 600
+python experiments/run_experiment.py flowmind --duration 600
 ```
 
 ## Docker
@@ -240,7 +253,7 @@ FlowMind/
 Реалізовано:
 
 - SUMO-сценарій Рівного;
-- fixed/local/flowmind режими;
+- static_fixed/sumo_actuated/local/flowmind режими;
 - sensor-window traffic reader;
 - area pressure controller;
 - safety validator;

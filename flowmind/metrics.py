@@ -9,7 +9,7 @@ from statistics import fmean
 from typing import Any
 
 from .area_model import AreaModel
-from .config import ControlConfig
+from .config import CONTROL_MODES, LEGACY_CONTROL_MODE_ALIASES, ControlConfig
 from .live_transport import LiveTelemetryPublisher
 from .traffic_state import TrafficStateReader
 
@@ -666,6 +666,11 @@ class MetricsCollector:
         with combined_path.open("w", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
             writer.writeheader()
-            for row_mode in ("fixed", "local", "flowmind"):
+            result_mode_order = (
+                CONTROL_MODES[0],
+                *LEGACY_CONTROL_MODE_ALIASES,
+                *CONTROL_MODES[1:],
+            )
+            for row_mode in result_mode_order:
                 if row_mode in rows:
                     writer.writerow(rows[row_mode])

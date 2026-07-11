@@ -21,6 +21,8 @@ class WebDashboardApiTests(unittest.TestCase):
         self.assertIn('щоб відстежувати його live', page)
         self.assertIn('Авто: &lt;5', page)
         self.assertIn('Авто: ≥10', page)
+        self.assertIn('static fixed + FlowMind', page)
+        self.assertIn('SUMO Actuated', web_dashboard.AVERAGES_PAGE)
 
     def test_stop_marker_disables_live_sumo_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -214,6 +216,24 @@ class WebDashboardApiTests(unittest.TestCase):
             120.0,
         )
         self.assertEqual(by_mode["fixed"]["count"], 1)
+
+    def test_summary_context_prefers_static_fixed_over_legacy_fixed(self) -> None:
+        context = web_dashboard.build_summary_context(
+            {
+                "summary_rows": [
+                    {"mode": "fixed", "average_waiting_time": 40},
+                    {"mode": "static_fixed", "average_waiting_time": 30},
+                    {"mode": "flowmind", "average_waiting_time": 20},
+                ],
+                "summary": {"mode": "flowmind", "average_waiting_time": 20},
+            }
+        )
+
+        self.assertEqual(context["fixed"]["mode"], "static_fixed")
+        self.assertAlmostEqual(
+            context["improvements"]["waiting_time_percent"],
+            100 / 3,
+        )
 
 
 if __name__ == "__main__":

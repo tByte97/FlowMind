@@ -74,7 +74,7 @@ def main() -> None:
                 queue_model_paths=selected_queue_model_paths(args),
             )
         )
-        for mode in ("fixed", "local", "flowmind")
+        for mode in ("static_fixed", "sumo_actuated", "local", "flowmind")
     ]
     print(json.dumps(summaries, ensure_ascii=False, indent=2))
 

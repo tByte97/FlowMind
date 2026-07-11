@@ -4,9 +4,11 @@
 
   const STALE_AFTER_MS = 15_000;
   const MODE_LABELS = {
-    fixed: "Fixed",
+    static_fixed: "Static Fixed",
+    sumo_actuated: "SUMO Actuated",
     local: "Local Adaptive",
     flowmind: "FlowMind Area Balance",
+    fixed: "Fixed (legacy)",
   };
   const SIGNAL_LABELS = {
     green: "зелений",

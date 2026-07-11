@@ -246,7 +246,7 @@
   ### Етап 1 — правильна база і safety
 
   - [x] Створити справжню static fixed-time TLS-програму для baseline.
-  - [ ] Явно розділити режими static_fixed, sumo_actuated, local, flowmind.
+  - [x] Явно розділити режими static_fixed, sumo_actuated, local, flowmind.
   - [ ] На старті логувати active SUMO program ID і type для кожного TLS.
   - [ ] Додати в Intersection program_id, program_type, minDur, maxDur.
   - [ ] Заборонити transition раніше SUMO minDur.

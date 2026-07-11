@@ -8,7 +8,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from flowmind.config import (
+    CONTROL_MODES,
     DEFAULT_QUEUE_MODEL_PATHS,
+    LEGACY_CONTROL_MODE_ALIASES,
     PROJECT_ROOT,
     ControlConfig,
     RunConfig,
@@ -20,7 +22,10 @@ from flowmind.experiment import run_experiment
 def build_parser(default_mode: str | None = None) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run a FlowMind SUMO experiment")
     if default_mode is None:
-        parser.add_argument("mode", choices=("fixed", "local", "flowmind"))
+        parser.add_argument(
+            "mode",
+            choices=(*CONTROL_MODES, *LEGACY_CONTROL_MODE_ALIASES),
+        )
     parser.add_argument("--duration", type=int, default=900)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--zone-size", type=int, default=6)

@@ -109,7 +109,7 @@ def main() -> None:
     parser.add_argument(
         "--no-baseline",
         action="store_true",
-        help="Skip the automatic fixed-plan baseline used by the final comparison.",
+        help="Skip the automatic static fixed-time baseline used by the final comparison.",
     )
     parser.add_argument(
         "--queue-model",
@@ -152,11 +152,11 @@ def main() -> None:
     try:
         if not args.no_baseline:
             print(
-                "Collecting fixed-plan baseline with the same scenario and seed..."
+                "Collecting static fixed-time baseline with the same scenario and seed..."
             )
             run_experiment(
                 RunConfig(
-                    mode="fixed",
+                    mode="static_fixed",
                     duration=args.duration,
                     seed=args.seed,
                     gui=False,
@@ -169,7 +169,7 @@ def main() -> None:
                     queue_model_paths=(),
                 )
             )
-            print("Fixed-plan baseline completed. Starting FlowMind demo...")
+            print("Static fixed-time baseline completed. Starting FlowMind demo...")
         summary = run_experiment(
             RunConfig(
                 mode="flowmind",

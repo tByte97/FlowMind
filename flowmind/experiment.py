@@ -55,7 +55,11 @@ from .area_model import (
     discover_area,
     load_zone_tls_ids,
 )
-from .config import RunConfig
+from .config import (
+    ADAPTIVE_CONTROL_MODES,
+    STATIC_FIXED_MODE,
+    RunConfig,
+)
 from .controller import AreaSignalController
 from .corridor_manager import CorridorManager
 from .decision_feed import DecisionEvent, merged_decision_log
@@ -210,10 +214,10 @@ def run_experiment(config: RunConfig) -> dict[str, object]:
                     level="success",
                 )
             )
-            if config.mode != "fixed":
+            if config.mode in ADAPTIVE_CONTROL_MODES:
                 corridor_manager = CorridorManager(config.emergency.vehicle_id)
 
-        if config.mode == "fixed":
+        if config.mode == STATIC_FIXED_MODE:
             static_programs = activate_static_fixed_programs(
                 connection,
                 area.tls_ids,
@@ -245,7 +249,7 @@ def run_experiment(config: RunConfig) -> dict[str, object]:
                 queue_forecast,
                 config.dataset_sample_interval,
             )
-            if config.mode != "fixed"
+            if config.mode in ADAPTIVE_CONTROL_MODES
             else None
         )
         if controller is not None and corridor_manager is not None:
@@ -551,7 +555,8 @@ def build_live_system_status(
             "port": config.websocket_port,
         },
         "controller": {
-            "status": "active" if controller is not None else "static_fixed",
+            "status": "active" if controller is not None else config.mode,
+            "mode": config.mode,
             "decisions": controller_stats.decisions if controller_stats else 0,
             "extensions": controller_stats.extensions if controller_stats else 0,
             "advances": controller_stats.advances if controller_stats else 0,

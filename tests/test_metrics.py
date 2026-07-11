@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import csv
 import json
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from flowmind.area_model import AreaModel, ControlledLink, Intersection
-from flowmind.config import ControlConfig
+from flowmind.config import CONTROL_MODES, ControlConfig
 from flowmind.metrics import MetricsCollector
 
 
@@ -119,6 +120,25 @@ class ActiveFakeTraci(FakeTraci):
 
 
 class MetricsCollectorTest(unittest.TestCase):
+    def test_summary_csv_keeps_all_four_control_modes_in_canonical_order(self) -> None:
+        collector = MetricsCollector(
+            FakeTraci(),
+            AreaModel(()),
+            ControlConfig(),
+        )
+        with TemporaryDirectory() as temp_dir:
+            results_dir = Path(temp_dir)
+            for index, mode in enumerate(reversed(CONTROL_MODES)):
+                collector.write(results_dir, {"mode": mode, "value": index})
+
+            with (results_dir / "summary.csv").open(
+                newline="",
+                encoding="utf-8",
+            ) as handle:
+                modes = [row["mode"] for row in csv.DictReader(handle)]
+
+        self.assertEqual(tuple(modes), CONTROL_MODES)
+
     def test_lifecycle_events_are_counted_between_metric_samples(self) -> None:
         traci = FakeTraci()
         collector = MetricsCollector(

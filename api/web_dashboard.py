@@ -40,7 +40,13 @@ MAX_DECISION_ROWS = 80
 MAX_TABLE_ROWS = 120
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.1-flash-lite")
 GEMINI_SUMMARY_FILE = "gemini_summary.json"
-MODE_ORDER = {"fixed": 0, "local": 1, "flowmind": 2}
+MODE_ORDER = {
+    "static_fixed": 0,
+    "sumo_actuated": 1,
+    "local": 2,
+    "flowmind": 3,
+    "fixed": 4,
+}
 AVERAGE_METRICS = {
     "average_travel_time": "Сер. час поїздки, с",
     "average_waiting_time": "Сер. очікування, с",
@@ -419,7 +425,10 @@ def build_summary_context(payload: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(rows, list):
         rows = []
     summary = payload.get("summary") if isinstance(payload.get("summary"), dict) else {}
-    fixed = next((row for row in rows if row.get("mode") == "fixed"), None)
+    fixed = next(
+        (row for row in rows if row.get("mode") == "static_fixed"),
+        None,
+    ) or next((row for row in rows if row.get("mode") == "fixed"), None)
     flow = next((row for row in rows if row.get("mode") == "flowmind"), None) or summary
     latest = payload.get("latest_sample") if isinstance(payload.get("latest_sample"), dict) else {}
     history = payload.get("metric_history") if isinstance(payload.get("metric_history"), list) else []
@@ -472,24 +481,24 @@ def build_local_report(context: dict[str, Any]) -> str:
     improvements = context.get("improvements") or {}
     if fixed:
         return (
-            "FlowMind завершив порівняльну симуляцію з fixed baseline. "
+            "FlowMind завершив порівняльну симуляцію зі static fixed baseline. "
             f"Середній час очікування змінився з {_format_metric(fixed.get('average_waiting_time'), ' с')} "
             f"до {_format_metric(flow.get('average_waiting_time'), ' с')}, тобто покращення становить "
             f"{_format_metric(improvements.get('waiting_time_percent'), '%')}. "
             f"Середня черга змінилася з {_format_metric(fixed.get('average_queue_length'), ' авто')} "
             f"до {_format_metric(flow.get('average_queue_length'), ' авто')}. "
-            f"Пропускна здатність: fixed {_format_metric(fixed.get('throughput'), ' авто', 0)}, "
+            f"Пропускна здатність: static fixed {_format_metric(fixed.get('throughput'), ' авто', 0)}, "
             f"FlowMind {_format_metric(flow.get('throughput'), ' авто', 0)}. "
             f"Пікова черга в live-історії: {_format_metric(context.get('peak_queue'), ' авто', 0)}. "
             "Висновок: система краще підлаштовується під потік і дає зрозумілий ефект для демонстрації."
         )
     return (
-        "FlowMind завершив симуляцію без fixed baseline. "
+        "FlowMind завершив симуляцію без static fixed baseline. "
         f"Середній час очікування: {_format_metric(flow.get('average_waiting_time'), ' с')}, "
         f"середня черга: {_format_metric(flow.get('average_queue_length'), ' авто')}, "
         f"пропускна здатність: {_format_metric(flow.get('throughput'), ' авто', 0)}. "
         f"Пікова черга в live-історії: {_format_metric(context.get('peak_queue'), ' авто', 0)}. "
-        "Для повного порівняльного висновку запусти симуляцію з увімкненим режимом fixed + FlowMind."
+        "Для повного порівняльного висновку запусти симуляцію з увімкненим режимом static fixed + FlowMind."
     )
 
 
@@ -1291,7 +1300,7 @@ HTML_PAGE = r"""<!doctype html>
         <input id="emergencyDepart" type="number" min="0" value="180">
       </label>
       <label>Baseline
-        <span class="check"><input id="baseline" type="checkbox"> fixed + FlowMind</span>
+        <span class="check"><input id="baseline" type="checkbox"> static fixed + FlowMind</span>
       </label>
       <div class="buttons">
         <button id="startBtn">Запустити</button>
@@ -2649,7 +2658,7 @@ DESIGN_PAGE = r"""<!doctype html>
           <input id="emergencyDepart" type="number" min="0" value="180">
         </label>
         <label>Baseline
-          <span class="check"><input id="baseline" type="checkbox"> fixed + FlowMind</span>
+          <span class="check"><input id="baseline" type="checkbox"> static fixed + FlowMind</span>
         </label>
         <div class="actions">
           <button id="startBtn" title="Запустити симуляцію">▶ Запустити</button>
@@ -2667,7 +2676,7 @@ DESIGN_PAGE = r"""<!doctype html>
       <section class="side-group">
         <p class="side-label">Legend</p>
         <div class="legend">
-          <span><i class="swatch" style="background: var(--red)"></i> Fixed</span>
+          <span><i class="swatch" style="background: var(--red)"></i> Static Fixed</span>
           <span><i class="swatch" style="background: var(--amber)"></i> Local Adaptive</span>
           <span><i class="swatch" style="background: var(--cyan)"></i> FlowMind</span>
         </div>
@@ -2783,7 +2792,7 @@ DESIGN_PAGE = r"""<!doctype html>
           <div class="slice-note" id="comparisonSlice">Поточний зріз метрик</div>
           <div class="comparison-grid">
             <article class="scenario-card fixed">
-              <h3>[cite: Fixed Control]</h3>
+              <h3>[cite: Static Fixed Control]</h3>
               <p>Звичайний світлофор. Працює за жорстким таймером.</p>
               <div class="vehicle-row">
                 <div class="cars" id="fixedCars"></div>
@@ -3142,7 +3151,9 @@ DESIGN_PAGE = r"""<!doctype html>
       const latest = selectedMetricPoint(payload);
       const summary = payload.summary || {};
       const rows = Array.isArray(payload.summary_rows) ? payload.summary_rows : [];
-      const fixedRow = rows.find((row) => row.mode === "fixed") || null;
+      const fixedRow = rows.find((row) => row.mode === "static_fixed")
+        || rows.find((row) => row.mode === "fixed")
+        || null;
       const flowRow = rows.find((row) => row.mode === "flowmind") || summary;
       const queue = asNumber(latest.queue_length ?? flowRow.average_queue_length ?? summary.average_queue_length) || 0;
       const wait = asNumber(latest.waiting_time ?? flowRow.average_waiting_time ?? summary.average_waiting_time) || 0;
@@ -3179,7 +3190,7 @@ DESIGN_PAGE = r"""<!doctype html>
       const fixedThroughput = asNumber(fixedRow?.throughput);
       const throughputDelta = fixedThroughput == null ? null : throughput - fixedThroughput;
       $("resultInsight").textContent = fixedRow
-        ? `Зріз ${fmt(simulated, " с", 0)}: FlowMind зменшив чергу на ${fmt(queueDelta, " авто")}, час очікування на ${fmt(waitDelta, " с")}, пропуск ${throughputDelta == null ? fmt(throughput, " авто", 0) : `${fmt(throughputDelta, " авто", 0)} до fixed`}.`
+        ? `Зріз ${fmt(simulated, " с", 0)}: FlowMind зменшив чергу на ${fmt(queueDelta, " авто")}, час очікування на ${fmt(waitDelta, " с")}, пропуск ${throughputDelta == null ? fmt(throughput, " авто", 0) : `${fmt(throughputDelta, " авто", 0)} до static fixed`}.`
         : `Зріз ${fmt(simulated, " с", 0)}: FlowMind скорочує чергу приблизно на ${fmt(queueDelta, " авто")} і час очікування на ${fmt(waitDelta, " с")}. Пропуск: ${fmt(throughput, " авто", 0)}.`;
       renderAmbulance(summary, flowRow, simulated, duration);
     }
@@ -4203,7 +4214,7 @@ AVERAGES_PAGE = r"""<!doctype html>
     .metric .note { color: var(--muted); font-size: 12px; }
     .compare-grid {
       display: grid;
-      grid-template-columns: repeat(3, minmax(0, 1fr));
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
       gap: 12px;
       margin-bottom: 14px;
     }
@@ -4215,7 +4226,8 @@ AVERAGES_PAGE = r"""<!doctype html>
       display: grid;
       gap: 10px;
     }
-    .mode-card.fixed { border-color: rgba(244, 81, 64, .7); }
+    .mode-card.fixed, .mode-card.static_fixed { border-color: rgba(244, 81, 64, .7); }
+    .mode-card.sumo_actuated { border-color: rgba(139, 92, 246, .72); }
     .mode-card.local { border-color: rgba(255, 182, 49, .65); }
     .mode-card.flowmind { border-color: rgba(61, 187, 175, .72); }
     .mode-card h3 {
@@ -4224,7 +4236,8 @@ AVERAGES_PAGE = r"""<!doctype html>
       letter-spacing: 0;
       text-transform: capitalize;
     }
-    .mode-card.fixed h3 { color: #f45140; }
+    .mode-card.fixed h3, .mode-card.static_fixed h3 { color: #f45140; }
+    .mode-card.sumo_actuated h3 { color: #a78bfa; }
     .mode-card.local h3 { color: #ffb631; }
     .mode-card.flowmind h3 { color: #3dbbaf; }
     .mode-stat {
@@ -4321,7 +4334,7 @@ AVERAGES_PAGE = r"""<!doctype html>
           <div class="mark" aria-hidden="true"></div>
           <div>
             <h1>FlowMind Averages</h1>
-            <p class="subtitle">Порівняння середніх результатів fixed, local і FlowMind по збережених симуляціях.</p>
+            <p class="subtitle">Порівняння static fixed, SUMO actuated, local і FlowMind по збережених симуляціях.</p>
           </div>
         </div>
         <nav class="nav" aria-label="Averages navigation">
@@ -4361,11 +4374,13 @@ AVERAGES_PAGE = r"""<!doctype html>
       if (!response.ok) throw new Error(await response.text());
       return await response.json();
     }
-    const modeOrder = ["fixed", "local", "flowmind"];
+    const modeOrder = ["static_fixed", "sumo_actuated", "local", "flowmind", "fixed"];
     const modeLabels = {
-      fixed: "Fixed",
+      static_fixed: "Static Fixed",
+      sumo_actuated: "SUMO Actuated",
       local: "Local adaptive",
       flowmind: "FlowMind",
+      fixed: "Fixed (legacy)",
     };
     const keyMetrics = [
       { key: "average_waiting_time", label: "Сер. очікування", suffix: " с", lower: true },
@@ -4376,7 +4391,7 @@ AVERAGES_PAGE = r"""<!doctype html>
       { key: "gridlock_risk", label: "Gridlock risk", suffix: "", lower: true, digits: 4 },
     ];
     function modeClass(mode) {
-      return ["fixed", "local", "flowmind"].includes(mode) ? mode : "";
+      return modeOrder.includes(mode) ? mode : "";
     }
     function byMode(modes) {
       return Object.fromEntries((modes || []).map(item => [item.mode, item]));
@@ -4404,7 +4419,7 @@ AVERAGES_PAGE = r"""<!doctype html>
       const fixedValue = metricValue(fixedMode, metric.key);
       const value = metricValue(mode, metric.key);
       if (fixedValue === null || value === null || fixedValue === 0) return null;
-      if (mode?.mode === "fixed") return { label: "baseline", kind: "" };
+      if (mode?.mode === fixedMode?.mode) return { label: "baseline", kind: "" };
       const delta = metric.lower
         ? ((fixedValue - value) / fixedValue) * 100
         : ((value - fixedValue) / fixedValue) * 100;
@@ -4426,7 +4441,7 @@ AVERAGES_PAGE = r"""<!doctype html>
           <strong class="${winner ? "winner" : ""}">${fmt(value, metric.suffix, metric.digits ?? 1)}</strong>
         </div>`;
       }).join("");
-      const deltas = mode.mode === "fixed"
+      const deltas = mode.mode === fixedMode?.mode
         ? `<span class="tag">baseline</span>`
         : deltaPill(deltaFromFixed(fixedMode, mode, keyMetrics[0]));
       return `<article class="mode-card ${modeClass(mode.mode)}">
@@ -4435,26 +4450,35 @@ AVERAGES_PAGE = r"""<!doctype html>
           <span class="tag">${mode.count || 0} запусків</span>
         </div>
         ${stats}
-        <div class="mode-stat"><span>Очікування vs fixed</span><strong>${deltas}</strong></div>
+        <div class="mode-stat"><span>Очікування vs static fixed</span><strong>${deltas}</strong></div>
       </article>`;
     }
     function renderComparison(modes) {
       const ordered = orderedModes(modes);
       const map = byMode(ordered);
-      const fixedMode = map.fixed || null;
-      const winners = Object.fromEntries(keyMetrics.map(metric => [metric.key, bestModeFor(ordered, metric)]));
-      const cards = ordered.length
-        ? `<div class="compare-grid">${ordered.map(mode => renderModeCard(mode, fixedMode, winners)).join("")}</div>`
+      const fixedMode = map.static_fixed || map.fixed || null;
+      const comparable = ordered.filter(mode => !(
+        mode.mode === "fixed" && map.static_fixed
+      ));
+      const comparisonModes = [
+        fixedMode?.mode || "static_fixed",
+        "sumo_actuated",
+        "local",
+        "flowmind",
+      ];
+      const winners = Object.fromEntries(keyMetrics.map(metric => [metric.key, bestModeFor(comparable, metric)]));
+      const cards = comparable.length
+        ? `<div class="compare-grid">${comparable.map(mode => renderModeCard(mode, fixedMode, winners)).join("")}</div>`
         : "";
       const rows = keyMetrics.map(metric => {
         const best = winners[metric.key];
-        const cells = modeOrder.map(modeName => {
+        const cells = comparisonModes.map(modeName => {
           const mode = map[modeName];
           const value = metricValue(mode, metric.key);
           const delta = deltaFromFixed(fixedMode, mode, metric);
           return `<td class="compare-cell ${best === modeName ? "winner" : ""}">
             <span class="value-cell">${fmt(value, metric.suffix, metric.digits ?? 1)}</span>
-            <span class="cell-note">${mode ? `${metricCount(mode, metric.key)} значень` : "немає режиму"} ${modeName !== "fixed" ? deltaPill(delta) : ""}</span>
+            <span class="cell-note">${mode ? `${metricCount(mode, metric.key)} значень` : "немає режиму"} ${modeName !== fixedMode?.mode ? deltaPill(delta) : ""}</span>
           </td>`;
         }).join("");
         return `<tr>
@@ -4466,13 +4490,13 @@ AVERAGES_PAGE = r"""<!doctype html>
       return `<section class="section">
         <div class="section-header">
           <h2>Порівняння режимів</h2>
-          <span class="tag good">Fixed = baseline</span>
+          <span class="tag good">Static Fixed = baseline</span>
         </div>
         <div class="section-body">
           ${cards}
           <table>
             <thead>
-              <tr><th>Метрика</th><th>Fixed</th><th>Local</th><th>FlowMind</th><th>Краще</th></tr>
+              <tr><th>Метрика</th>${comparisonModes.map(mode => `<th>${modeLabels[mode] || mode}</th>`).join("")}<th>Краще</th></tr>
             </thead>
             <tbody>${rows}</tbody>
           </table>
@@ -4510,7 +4534,9 @@ AVERAGES_PAGE = r"""<!doctype html>
       $("totalTag").textContent = `${payload.total_results || 0} результатів`;
       const modes = orderedModes(payload.modes || []);
       const flowmind = modes.find(item => item.mode === "flowmind") || { metrics: {} };
-      const fixed = modes.find(item => item.mode === "fixed") || { metrics: {} };
+      const fixed = modes.find(item => item.mode === "static_fixed")
+        || modes.find(item => item.mode === "fixed")
+        || { metrics: {} };
       const local = modes.find(item => item.mode === "local") || { metrics: {} };
       const wait = flowmind.metrics?.average_waiting_time?.average;
       const fixedWait = fixed.metrics?.average_waiting_time?.average;
@@ -4520,8 +4546,8 @@ AVERAGES_PAGE = r"""<!doctype html>
       $("overview").innerHTML = [
         card("Усього результатів", fmt(payload.total_results, "", 0), `${payload.total_rows || 0} summary rows`),
         card("Режимів", fmt(modes.length, "", 0), modes.map(item => item.mode).join(", ")),
-        card("FlowMind vs fixed", improvement == null ? "немає" : fmt(improvement, "%"), `очікування: ${fmt(wait, " с")}`),
-        card("Local vs fixed", localImprovement == null ? "немає" : fmt(localImprovement, "%"), `очікування: ${fmt(localWait, " с")}`),
+        card("FlowMind vs static fixed", improvement == null ? "немає" : fmt(improvement, "%"), `очікування: ${fmt(wait, " с")}`),
+        card("Local vs static fixed", localImprovement == null ? "немає" : fmt(localImprovement, "%"), `очікування: ${fmt(localWait, " с")}`),
       ].join("");
       $("comparison").innerHTML = modes.length ? renderComparison(modes) : `<div class="empty">Немає summary.csv для агрегації.</div>`;
       $("modeSections").innerHTML = modes.length ? `<section class="section">

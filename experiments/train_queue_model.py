@@ -151,8 +151,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--modes",
         nargs="+",
-        choices=("fixed", "local", "flowmind"),
-        default=("fixed", "local", "flowmind"),
+        choices=("static_fixed", "sumo_actuated", "local", "flowmind", "fixed"),
+        default=("static_fixed", "sumo_actuated", "local", "flowmind"),
     )
     parser.add_argument(
         "--output",

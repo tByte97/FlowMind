@@ -124,23 +124,24 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "Run many headless FlowMind simulations and write ML-ready CSV "
             "samples for queue prediction. Use --full-real for the complete "
-            "100-cycle fixed/local/flowmind training plan."
+            "100-cycle static_fixed/sumo_actuated/local/flowmind training plan."
         )
     )
     parser.add_argument("--runs-per-mode", type=int, default=100)
     parser.add_argument(
         "--modes",
         nargs="+",
-        choices=("local", "fixed", "flowmind"),
-        default=("local", "fixed", "flowmind"),
+        choices=("static_fixed", "sumo_actuated", "local", "flowmind"),
+        default=("static_fixed", "sumo_actuated", "local", "flowmind"),
     )
     parser.add_argument(
         "--full-real",
         action="store_true",
         help=(
-            "Use the full realistic training profile: fixed/local/flowmind, "
+            "Use the full realistic training profile: "
+            "static_fixed/sumo_actuated/local/flowmind, "
             "randomized sensor-window control settings, paired seeds, and "
-            "100 cycles by default. This produces 300 runs unless "
+            "100 cycles by default. This produces 400 runs unless "
             "--runs-per-mode is changed."
         ),
     )
@@ -418,7 +419,7 @@ def apply_full_real_profile(args: argparse.Namespace) -> None:
     if not args.full_real:
         return
     args.randomize = True
-    args.modes = ("fixed", "local", "flowmind")
+    args.modes = ("static_fixed", "sumo_actuated", "local", "flowmind")
     args.independent_random_seeds = False
 
 

@@ -44,7 +44,8 @@ QUEUE_MODEL_PRESETS = {
 }
 
 MODE_SCRIPTS = {
-    "Fixed": PROJECT_ROOT / "experiments" / "run_fixed.py",
+    "Static Fixed": PROJECT_ROOT / "experiments" / "run_fixed.py",
+    "SUMO Actuated": PROJECT_ROOT / "experiments" / "run_sumo_actuated.py",
     "Local Adaptive": PROJECT_ROOT / "experiments" / "run_local_adaptive.py",
     "FlowMind": PROJECT_ROOT / "experiments" / "run_flowmind.py",
 }

@@ -21,16 +21,27 @@ LIVE_REFRESH_INTERVAL = (
 )
 
 MODE_LABELS = {
-    "fixed": "Fixed",
+    "static_fixed": "Static Fixed",
+    "sumo_actuated": "SUMO Actuated",
     "local": "Local Adaptive",
     "flowmind": "FlowMind Area Balance",
+    "fixed": "Fixed (legacy)",
 }
 MODE_COLORS = {
-    "fixed": "#ef4444",
+    "static_fixed": "#ef4444",
+    "sumo_actuated": "#8b5cf6",
     "local": "#f59e0b",
     "flowmind": "#10b981",
+    "fixed": "#b91c1c",
 }
-MODE_ORDER = {"fixed": 0, "local": 1, "flowmind": 2}
+MODE_ORDER = {
+    "static_fixed": 0,
+    "sumo_actuated": 1,
+    "local": 2,
+    "flowmind": 3,
+    "fixed": 4,
+}
+BASELINE_MODES = ("static_fixed", "fixed")
 
 METRIC_LABELS = {
     "average_travel_time": "Середній час поїздки, с",
@@ -153,13 +164,19 @@ def pct_delta(current: float, baseline: float) -> str:
     return f"{((current - baseline) / baseline) * 100:+.1f}%"
 
 
+def select_baseline_mode(modes: Iterable[str]) -> str | None:
+    available = set(modes)
+    return next((mode for mode in BASELINE_MODES if mode in available), None)
+
+
 def before_after_rows(summary: pd.DataFrame) -> list[dict[str, object]]:
     if summary.empty or "mode" not in summary.columns:
         return []
     modes = set(summary["mode"].astype(str))
-    if not {"fixed", "flowmind"}.issubset(modes):
+    baseline_mode = select_baseline_mode(modes)
+    if baseline_mode is None or "flowmind" not in modes:
         return []
-    before = summary[summary["mode"] == "fixed"].iloc[0]
+    before = summary[summary["mode"] == baseline_mode].iloc[0]
     after = summary[summary["mode"] == "flowmind"].iloc[0]
     rows: list[dict[str, object]] = []
     for metric, label, suffix, lower_is_better in BEFORE_AFTER_METRICS:
@@ -583,7 +600,7 @@ def render_before_after(summary: pd.DataFrame) -> None:
     if not rows:
         if "flowmind" in set(summary.get("mode", pd.Series(dtype=str)).astype(str)):
             st.info(
-                "Для фінального «було → стало» потрібен fixed-прогін із тим самим "
+                "Для фінального «було → стало» потрібен static_fixed-прогін із тим самим "
                 "seed. `run_demo.py` тепер збирає його автоматично."
             )
         return
@@ -677,7 +694,9 @@ def render_comparison_panel(
 
 
 def render_visual_comparison(result_dir: Path) -> None:
-    fixed = load_timeseries(result_dir, "fixed")
+    fixed = load_timeseries(result_dir, "static_fixed")
+    if fixed is None or fixed.empty:
+        fixed = load_timeseries(result_dir, "fixed")
     flowmind = load_timeseries(result_dir, "flowmind")
     if fixed is None or flowmind is None or fixed.empty or flowmind.empty:
         return
@@ -693,7 +712,7 @@ def render_visual_comparison(result_dir: Path) -> None:
     intervals = fixed_times.sort_values().diff().dropna()
     step = float(intervals.median()) if not intervals.empty else 1.0
 
-    st.subheader("🚦 Наочне порівняння: звичайний світлофор vs FlowMind")
+    st.subheader("🚦 Наочне порівняння: Static Fixed vs FlowMind")
     st.caption(
         "Перетягніть час: обидві панелі показують той самий момент двох "
         "прогонів з однаковим сценарієм."
@@ -724,7 +743,7 @@ def render_visual_comparison(result_dir: Path) -> None:
     left, right = st.columns(2, gap="large")
     with left:
         render_comparison_panel(
-            "🔴 Звичайний світлофор",
+            "🔴 Static Fixed",
             "Працює за наперед заданою програмою та не бачить стан усієї зони.",
             fixed_snapshot,
             float(comparison["max_queue"]),
@@ -752,7 +771,7 @@ def render_visual_comparison(result_dir: Path) -> None:
     else:
         st.warning(
             f"На {float(comparison['time']):.0f}-й секунді локальний стан "
-            "FlowMind ще не кращий за fixed. Оцінюйте також фінальні KPI: "
+            "FlowMind ще не кращий за static fixed. Оцінюйте також фінальні KPI: "
             "контролер може тимчасово накопичити чергу, щоб розвантажити "
             "сусідні перехрестя."
         )
@@ -1195,7 +1214,7 @@ for column, (metric, suffix) in zip(kpi_columns, kpi_metrics, strict=True):
             st.metric(METRIC_LABELS[metric], format_number(row[metric], f" {suffix}".rstrip()))
             st.caption(f"Найкраще: {row['label']}")
 
-baseline_mode = "fixed" if "fixed" in set(summary["mode"]) else summary.iloc[0]["mode"]
+baseline_mode = select_baseline_mode(summary["mode"].astype(str)) or summary.iloc[0]["mode"]
 baseline = summary[summary["mode"] == baseline_mode].iloc[0]
 comparison_rows = []
 for _, row in summary.iterrows():

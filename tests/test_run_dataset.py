@@ -5,10 +5,14 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from experiments.run_dataset import INDEX_COLUMNS, successful_run_ids
+from flowmind.config import CONTROL_MODES
+from experiments.run_dataset import INDEX_COLUMNS, build_parser, successful_run_ids
 
 
 class RunDatasetTests(unittest.TestCase):
+    def test_default_plan_contains_all_canonical_modes(self) -> None:
+        self.assertEqual(tuple(build_parser().parse_args([]).modes), CONTROL_MODES)
+
     def test_successful_run_ids_returns_only_ok_rows(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             index_path = Path(directory) / "dataset_index.csv"
