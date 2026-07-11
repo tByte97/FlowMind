@@ -70,6 +70,10 @@ from .queue_forecast import (
     QueueForecastStats,
     load_queue_forecast_models,
 )
+from .tls_programs import (
+    StaticProgramActivation,
+    activate_static_fixed_programs,
+)
 
 
 def configure_projection_data() -> Path | None:
@@ -147,6 +151,7 @@ def run_experiment(config: RunConfig) -> dict[str, object]:
         alternatives_log = []
         emergency_route_tls: tuple[str, ...] = ()
         emergency_controlled_tls: tuple[str, ...] = ()
+        static_programs: tuple[StaticProgramActivation, ...] = ()
         dataset_collector = None
         session_events = [
             DecisionEvent(
@@ -207,6 +212,24 @@ def run_experiment(config: RunConfig) -> dict[str, object]:
             )
             if config.mode != "fixed":
                 corridor_manager = CorridorManager(config.emergency.vehicle_id)
+
+        if config.mode == "fixed":
+            static_programs = activate_static_fixed_programs(
+                connection,
+                area.tls_ids,
+            )
+            session_events.append(
+                DecisionEvent(
+                    time=0.0,
+                    category="system",
+                    title="Static fixed-time baseline активовано",
+                    detail=(
+                        f"SUMO STATIC-програму перевірено для "
+                        f"{len(static_programs)} світлофорів."
+                    ),
+                    level="success",
+                )
+            )
         priority_vehicle = (
             config.emergency.vehicle_id
             if config.emergency is not None
@@ -308,6 +331,7 @@ def run_experiment(config: RunConfig) -> dict[str, object]:
                 dataset_collector.collect(simulated_time)
 
         summary = metrics.summary(config.mode, simulated_time)
+        summary.update(static_program_summary(static_programs))
         if emergency_details is not None:
             summary.update(emergency_details.as_summary())
             summary["emergency_alternatives"] = alternatives_log
@@ -527,7 +551,7 @@ def build_live_system_status(
             "port": config.websocket_port,
         },
         "controller": {
-            "status": "active" if controller is not None else "fixed_plan",
+            "status": "active" if controller is not None else "static_fixed",
             "decisions": controller_stats.decisions if controller_stats else 0,
             "extensions": controller_stats.extensions if controller_stats else 0,
             "advances": controller_stats.advances if controller_stats else 0,
@@ -619,6 +643,20 @@ def queue_forecast_summary(stats: QueueForecastStats | None) -> dict[str, object
         "queue_forecast_model_count": stats.model_count,
         "queue_forecast_horizons": stats.horizons,
         "queue_forecast_horizon_weights": stats.horizon_weights,
+    }
+
+
+def static_program_summary(
+    activations: tuple[StaticProgramActivation, ...],
+) -> dict[str, object]:
+    return {
+        "static_fixed_program_count": len(activations),
+        "static_fixed_program_id": (
+            activations[0].program_id if activations else ""
+        ),
+        "static_fixed_source_programs": ",".join(
+            f"{item.tls_id}:{item.source_program_id}" for item in activations
+        ),
     }
 
 
