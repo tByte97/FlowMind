@@ -494,6 +494,7 @@ def live_system_rows(payload: dict[str, object]) -> list[dict[str, object]]:
         "simulation": "SUMO simulation",
         "websocket": "WebSocket",
         "controller": "Signal controller",
+        "tls_programs": "SUMO TLS programs",
         "queue_forecast": "ML queue forecast",
         "corridor": "Emergency corridor",
         "metrics": "Metrics collector",
@@ -509,7 +510,7 @@ def live_system_rows(payload: dict[str, object]) -> list[dict[str, object]]:
         facts = ", ".join(
             f"{key}={value}"
             for key, value in details.items()
-            if key not in {"status", "corridor_state"} and visible(value)
+            if key not in {"status", "corridor_state", "items"} and visible(value)
         )
         rows.append(
             {

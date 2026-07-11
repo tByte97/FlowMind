@@ -75,8 +75,11 @@ from .queue_forecast import (
     load_queue_forecast_models,
 )
 from .tls_programs import (
+    ActiveTlsProgram,
     StaticProgramActivation,
     activate_static_fixed_programs,
+    inspect_active_tls_programs,
+    write_tls_program_startup_audit,
 )
 
 
@@ -156,6 +159,8 @@ def run_experiment(config: RunConfig) -> dict[str, object]:
         emergency_route_tls: tuple[str, ...] = ()
         emergency_controlled_tls: tuple[str, ...] = ()
         static_programs: tuple[StaticProgramActivation, ...] = ()
+        active_tls_programs: tuple[ActiveTlsProgram, ...] = ()
+        tls_program_audit_path: Path | None = None
         dataset_collector = None
         session_events = [
             DecisionEvent(
@@ -234,6 +239,29 @@ def run_experiment(config: RunConfig) -> dict[str, object]:
                     level="success",
                 )
             )
+        active_tls_programs = inspect_active_tls_programs(
+            connection,
+            area.tls_ids,
+        )
+        tls_program_audit_path = write_tls_program_startup_audit(
+            config.results_dir,
+            config.mode,
+            active_tls_programs,
+        )
+        session_events.extend(
+            DecisionEvent(
+                time=0.0,
+                category="system",
+                title="Активну SUMO-програму перевірено",
+                detail=(
+                    f"{program.program_id}: {program.program_type_name} "
+                    f"(type={program.program_type}), "
+                    f"фаза {program.current_phase}/{program.phase_count - 1}."
+                ),
+                tls_id=program.tls_id,
+            )
+            for program in active_tls_programs
+        )
         priority_vehicle = (
             config.emergency.vehicle_id
             if config.emergency is not None
@@ -323,6 +351,7 @@ def run_experiment(config: RunConfig) -> dict[str, object]:
                     corridor_manager=corridor_manager,
                     publisher=publisher,
                     queue_forecast=queue_forecast,
+                    active_tls_programs=active_tls_programs,
                     running=True,
                 ),
                 decision_log=build_decision_log(
@@ -336,6 +365,12 @@ def run_experiment(config: RunConfig) -> dict[str, object]:
 
         summary = metrics.summary(config.mode, simulated_time)
         summary.update(static_program_summary(static_programs))
+        summary.update(
+            active_tls_program_summary(
+                active_tls_programs,
+                tls_program_audit_path,
+            )
+        )
         if emergency_details is not None:
             summary.update(emergency_details.as_summary())
             summary["emergency_alternatives"] = alternatives_log
@@ -416,6 +451,7 @@ def run_experiment(config: RunConfig) -> dict[str, object]:
                 corridor_manager=corridor_manager,
                 publisher=publisher,
                 queue_forecast=queue_forecast,
+                active_tls_programs=active_tls_programs,
                 running=False,
             ),
             decision_log=build_decision_log(
@@ -491,6 +527,17 @@ def write_live_run_status(
         },
     )
     system.setdefault("controller", {"status": "waiting"})
+    if status == "starting":
+        system["tls_programs"] = {
+            "status": "waiting",
+            "count": 0,
+            "items": [],
+        }
+    else:
+        system.setdefault(
+            "tls_programs",
+            {"status": "waiting", "count": 0, "items": []},
+        )
     system.setdefault("queue_forecast", {"status": "waiting"})
     system.setdefault("corridor", {"corridor_state": "waiting"})
     system.setdefault(
@@ -526,6 +573,7 @@ def build_live_system_status(
     publisher: LiveTelemetryPublisher,
     queue_forecast: QueueForecastModel | QueueForecastEnsemble | None,
     running: bool,
+    active_tls_programs: tuple[ActiveTlsProgram, ...] = (),
 ) -> dict[str, object]:
     controller_stats = controller.stats if controller is not None else None
     corridor_summary = (
@@ -571,6 +619,13 @@ def build_live_system_status(
                 if controller_stats
                 else 0
             ),
+        },
+        "tls_programs": {
+            "status": "audited" if active_tls_programs else "waiting",
+            "count": len(active_tls_programs),
+            "items": [
+                program.as_payload() for program in active_tls_programs
+            ],
         },
         "queue_forecast": {
             "status": "active" if queue_forecast is not None else "disabled",
@@ -662,6 +717,24 @@ def static_program_summary(
         "static_fixed_source_programs": ",".join(
             f"{item.tls_id}:{item.source_program_id}" for item in activations
         ),
+    }
+
+
+def active_tls_program_summary(
+    programs: tuple[ActiveTlsProgram, ...],
+    audit_path: Path | None,
+) -> dict[str, object]:
+    return {
+        "active_tls_program_count": len(programs),
+        "active_tls_programs": [program.as_payload() for program in programs],
+        "active_tls_program_ids": ",".join(
+            f"{program.tls_id}:{program.program_id}" for program in programs
+        ),
+        "active_tls_program_types": ",".join(
+            f"{program.tls_id}:{program.program_type_name}"
+            for program in programs
+        ),
+        "tls_program_startup_audit": str(audit_path) if audit_path else "",
     }
 
 

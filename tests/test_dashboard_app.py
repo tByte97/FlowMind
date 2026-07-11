@@ -29,6 +29,11 @@ class DashboardAppTests(unittest.TestCase):
             ],
             "system": {
                 "simulation": {"status": "running", "expected_vehicles": 5},
+                "tls_programs": {
+                    "status": "audited",
+                    "count": 6,
+                    "items": [{"tls_id": "tls_1", "program_type": 3}],
+                },
                 "corridor": {
                     "corridor_state": "GREEN_WINDOW",
                     "corridor_active_tls": "tls_1",
@@ -41,7 +46,13 @@ class DashboardAppTests(unittest.TestCase):
 
         self.assertEqual(history["departed"].tolist(), [2, 4])
         self.assertEqual(rows[0]["Стан"], "running")
-        self.assertEqual(rows[1]["Стан"], "GREEN_WINDOW")
+        tls_row = next(row for row in rows if row["Компонент"] == "SUMO TLS programs")
+        self.assertEqual(tls_row["Стан"], "audited")
+        self.assertEqual(tls_row["Деталі"], "count=6")
+        corridor_row = next(
+            row for row in rows if row["Компонент"] == "Emergency corridor"
+        )
+        self.assertEqual(corridor_row["Стан"], "GREEN_WINDOW")
 
     def test_live_average_metrics_and_simulation_status(self) -> None:
         payload = {

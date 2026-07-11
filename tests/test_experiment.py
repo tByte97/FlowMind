@@ -13,6 +13,7 @@ import flowmind.experiment as experiment
 from experiments.run_experiment import build_parser
 from flowmind.config import CONTROL_MODES, RunConfig
 from flowmind.experiment import configure_projection_data
+from flowmind.tls_programs import ActiveTlsProgram
 
 
 class ExperimentEnvironmentTest(unittest.TestCase):
@@ -88,11 +89,29 @@ class ExperimentEnvironmentTest(unittest.TestCase):
                 websocket_port=9876,
             )
 
+            previous = config.results_dir / "live_status.json"
+            previous.write_text(
+                json.dumps(
+                    {
+                        "system": {
+                            "tls_programs": {
+                                "status": "audited",
+                                "count": 1,
+                                "items": [{"tls_id": "old"}],
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
             path = experiment.write_live_run_status(config, "starting")
             payload = json.loads(path.read_text(encoding="utf-8"))
 
         self.assertEqual(payload["system"]["simulation"]["status"], "starting")
         self.assertEqual(payload["system"]["websocket"]["port"], 9876)
+        self.assertEqual(payload["system"]["tls_programs"]["status"], "waiting")
+        self.assertEqual(payload["system"]["tls_programs"]["items"], [])
         self.assertEqual(payload["metric_history"], [])
 
     def test_failed_run_marker_disables_existing_zone_snapshot(self) -> None:
@@ -147,6 +166,45 @@ class ExperimentEnvironmentTest(unittest.TestCase):
 
                 self.assertEqual(status["controller"]["status"], mode)
                 self.assertEqual(status["controller"]["mode"], mode)
+
+    def test_live_status_exposes_startup_tls_program_audit(self) -> None:
+        class Simulation:
+            @staticmethod
+            def getMinExpectedNumber() -> int:
+                return 1
+
+        class Connection:
+            simulation = Simulation()
+
+        class Publisher:
+            client_count = 0
+
+        program = ActiveTlsProgram(
+            tls_id="I-01",
+            program_id="0",
+            program_type=3,
+            program_type_name="actuated",
+            current_phase=1,
+            phase_count=4,
+        )
+
+        status = experiment.build_live_system_status(
+            config=RunConfig(mode="sumo_actuated"),
+            connection=Connection(),
+            controller=None,
+            corridor_manager=None,
+            publisher=Publisher(),
+            queue_forecast=None,
+            running=True,
+            active_tls_programs=(program,),
+        )
+
+        self.assertEqual(status["tls_programs"]["status"], "audited")
+        self.assertEqual(status["tls_programs"]["items"][0]["tls_id"], "I-01")
+        self.assertEqual(
+            status["tls_programs"]["items"][0]["program_type_name"],
+            "actuated",
+        )
 
 
 if __name__ == "__main__":

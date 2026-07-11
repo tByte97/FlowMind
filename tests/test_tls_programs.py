@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from sumolib.net import Phase
 from traci import constants as tc
@@ -9,6 +12,8 @@ from traci._trafficlight import Logic
 from flowmind.tls_programs import (
     STATIC_FIXED_PROGRAM_ID,
     activate_static_fixed_programs,
+    inspect_active_tls_programs,
+    write_tls_program_startup_audit,
 )
 
 
@@ -104,6 +109,16 @@ class StaticFixedProgramTest(unittest.TestCase):
             self.assertEqual(phase.maxDur, phase.duration)
             self.assertEqual(phase.next, ())
 
+        audit = inspect_active_tls_programs(
+            _FakeConnection(trafficlight),
+            ("I-01",),
+        )[0]
+        self.assertEqual(audit.program_id, STATIC_FIXED_PROGRAM_ID)
+        self.assertEqual(audit.program_type, tc.TRAFFICLIGHT_TYPE_STATIC)
+        self.assertEqual(audit.program_type_name, "static")
+        self.assertEqual(audit.current_phase, 2)
+        self.assertEqual(audit.phase_count, 3)
+
     def test_all_programs_are_validated_before_any_tls_is_changed(self) -> None:
         trafficlight = _FakeTrafficLightDomain(
             {
@@ -141,6 +156,47 @@ class StaticFixedProgramTest(unittest.TestCase):
                 _FakeConnection(trafficlight),
                 ("I-01",),
             )
+
+    def test_startup_audit_records_active_actuated_program(self) -> None:
+        trafficlight = _FakeTrafficLightDomain(
+            {"I-01": (_actuated_logic(),)},
+            {"I-01": "actuated"},
+            {"I-01": 1},
+        )
+
+        programs = inspect_active_tls_programs(
+            _FakeConnection(trafficlight),
+            ("I-01",),
+        )
+
+        self.assertEqual(programs[0].program_id, "actuated")
+        self.assertEqual(programs[0].program_type_name, "actuated")
+        self.assertEqual(programs[0].program_type, tc.TRAFFICLIGHT_TYPE_ACTUATED)
+        self.assertEqual(programs[0].current_phase, 1)
+
+    def test_startup_audit_is_written_as_structured_json(self) -> None:
+        trafficlight = _FakeTrafficLightDomain(
+            {"I-01": (_actuated_logic(),)},
+            {"I-01": "actuated"},
+            {"I-01": 0},
+        )
+        programs = inspect_active_tls_programs(
+            _FakeConnection(trafficlight),
+            ("I-01",),
+        )
+
+        with TemporaryDirectory() as directory:
+            path = write_tls_program_startup_audit(
+                Path(directory),
+                "sumo_actuated",
+                programs,
+            )
+            payload = json.loads(path.read_text(encoding="utf-8"))
+
+        self.assertEqual(path.name, "sumo_actuated_tls_programs_startup.json")
+        self.assertEqual(payload["mode"], "sumo_actuated")
+        self.assertEqual(payload["programs"][0]["tls_id"], "I-01")
+        self.assertEqual(payload["programs"][0]["program_type_name"], "actuated")
 
 
 if __name__ == "__main__":

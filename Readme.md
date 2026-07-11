@@ -34,6 +34,9 @@ AI використовується як технологічна складов
 
 Старе імʼя `fixed` приймається CLI лише як сумісний alias для
 `static_fixed`; нові результати завжди записуються з канонічною назвою.
+На старті кожного режиму FlowMind перевіряє фактично активні SUMO
+`program_id`/`program_type` для всіх TLS і записує їх у
+`<mode>_tls_programs_startup.json`, summary та live telemetry.
 
 ## Архітектура
 
@@ -62,6 +65,7 @@ results/* + FastAPI dashboard
 | Файл | Призначення |
 | --- | --- |
 | `flowmind/area_model.py` | модель контрольованої зони, світлофорів, фаз і lane links |
+| `flowmind/tls_programs.py` | static fixed-time програма й startup-аудит активних SUMO TLS-програм |
 | `flowmind/traffic_state.py` | читання стану смуг у sensor range |
 | `flowmind/signal_policy.py` | scoring фаз для `local` і `flowmind` |
 | `flowmind/controller.py` | прийняття рішень і керування світлофорами через TraCI |

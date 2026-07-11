@@ -1583,6 +1583,7 @@ HTML_PAGE = r"""<!doctype html>
       const summary = payload.summary || {};
       const simulation = system.simulation || {};
       const controller = system.controller || {};
+      const tlsPrograms = system.tls_programs || {};
       const forecast = system.queue_forecast || {};
       const corridor = system.corridor || {};
       const metrics = system.metrics || {};
@@ -1592,6 +1593,11 @@ HTML_PAGE = r"""<!doctype html>
           label: "Контролер",
           value: controller.status || "немає",
           note: `${fmt(controller.decisions)} рішень`
+        },
+        {
+          label: "TLS-програми",
+          value: tlsPrograms.status || "немає",
+          note: `${fmt(tlsPrograms.count, "", 0)} перевірено`
         },
         {
           label: "Прогноз",
@@ -3031,6 +3037,7 @@ DESIGN_PAGE = r"""<!doctype html>
       const summary = payload.summary || {};
       const simulation = system.simulation || {};
       const controller = system.controller || {};
+      const tlsPrograms = system.tls_programs || {};
       const forecast = system.queue_forecast || {};
       const corridor = system.corridor || {};
       const metrics = system.metrics || {};
@@ -3040,6 +3047,11 @@ DESIGN_PAGE = r"""<!doctype html>
           label: "Controller",
           value: controller.status || "немає",
           note: `${fmt(controller.decisions ?? summary.controller_decisions, "", 0)} рішень`
+        },
+        {
+          label: "SUMO TLS Programs",
+          value: tlsPrograms.status || "немає",
+          note: `${fmt(tlsPrograms.count, "", 0)} audited`
         },
         {
           label: "ML Predictor",

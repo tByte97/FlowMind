@@ -1,7 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+import json
+import logging
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from math import isclose, isfinite
+from pathlib import Path
 
 from sumolib.net import Phase
 from traci import constants as tc
@@ -9,6 +13,27 @@ from traci._trafficlight import Logic
 
 
 STATIC_FIXED_PROGRAM_ID = "flowmind_static_fixed"
+logger = logging.getLogger(__name__)
+
+PROGRAM_TYPE_NAMES = {
+    tc.TRAFFICLIGHT_TYPE_STATIC: "static",
+    tc.TRAFFICLIGHT_TYPE_ACTUATED: "actuated",
+    tc.TRAFFICLIGHT_TYPE_NEMA: "nema",
+    tc.TRAFFICLIGHT_TYPE_DELAYBASED: "delay_based",
+}
+
+
+@dataclass(frozen=True)
+class ActiveTlsProgram:
+    tls_id: str
+    program_id: str
+    program_type: int
+    program_type_name: str
+    current_phase: int
+    phase_count: int
+
+    def as_payload(self) -> dict[str, object]:
+        return asdict(self)
 
 
 @dataclass(frozen=True)
@@ -28,6 +53,84 @@ class StaticProgramActivation:
 class _PreparedStaticProgram:
     activation: StaticProgramActivation
     logic: Logic
+
+
+def inspect_active_tls_programs(
+    traci_connection: object,
+    tls_ids: tuple[str, ...],
+) -> tuple[ActiveTlsProgram, ...]:
+    """Read and validate the program SUMO is actually running for each TLS."""
+
+    trafficlight = traci_connection.trafficlight
+    audits: list[ActiveTlsProgram] = []
+    for tls_id in tls_ids:
+        program_id = str(trafficlight.getProgram(tls_id))
+        matches = tuple(
+            logic
+            for logic in trafficlight.getAllProgramLogics(tls_id)
+            if str(logic.programID) == program_id
+        )
+        if len(matches) != 1:
+            raise RuntimeError(
+                f"TLS {tls_id}: active SUMO program {program_id!r} "
+                f"matched {len(matches)} program definitions during startup audit"
+            )
+        logic = matches[0]
+        phases = tuple(logic.getPhases())
+        current_phase = int(trafficlight.getPhase(tls_id))
+        if not phases or not 0 <= current_phase < len(phases):
+            raise RuntimeError(
+                f"TLS {tls_id}: invalid active phase {current_phase} for "
+                f"program {program_id!r} with {len(phases)} phases"
+            )
+        program_type = int(logic.type)
+        audit = ActiveTlsProgram(
+            tls_id=tls_id,
+            program_id=program_id,
+            program_type=program_type,
+            program_type_name=PROGRAM_TYPE_NAMES.get(
+                program_type,
+                f"unknown_{program_type}",
+            ),
+            current_phase=current_phase,
+            phase_count=len(phases),
+        )
+        audits.append(audit)
+        logger.info(
+            "Active SUMO TLS program: tls_id=%s program_id=%s "
+            "program_type=%s(%s) current_phase=%s phase_count=%s",
+            audit.tls_id,
+            audit.program_id,
+            audit.program_type_name,
+            audit.program_type,
+            audit.current_phase,
+            audit.phase_count,
+        )
+    return tuple(audits)
+
+
+def write_tls_program_startup_audit(
+    results_dir: Path,
+    mode: str,
+    programs: tuple[ActiveTlsProgram, ...],
+) -> Path:
+    """Persist startup program evidence independently of the final summary."""
+
+    results_dir.mkdir(parents=True, exist_ok=True)
+    output_path = results_dir / f"{mode}_tls_programs_startup.json"
+    payload = {
+        "schema_version": 1,
+        "audited_at": datetime.now(timezone.utc).isoformat(),
+        "mode": mode,
+        "programs": [program.as_payload() for program in programs],
+    }
+    temporary_path = output_path.with_suffix(".json.tmp")
+    temporary_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    temporary_path.replace(output_path)
+    return output_path
 
 
 def activate_static_fixed_programs(
