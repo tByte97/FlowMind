@@ -69,7 +69,7 @@ results/* + FastAPI dashboard
 | `flowmind/traffic_state.py` | читання стану смуг у sensor range |
 | `flowmind/signal_policy.py` | scoring фаз для `local` і `flowmind` |
 | `flowmind/controller.py` | прийняття рішень і керування світлофорами через TraCI |
-| `flowmind/safety_validator.py` | перевірка min-green, yellow/all-red і безпечних переходів |
+| `flowmind/safety_validator.py` | hard floor SUMO minDur, перевірка min-green, yellow/all-red і безпечних переходів |
 | `flowmind/queue_forecast.py` | LightGBM-прогноз черг на 30/60/90 секунд |
 | `flowmind/emergency_router.py` | маршрути для швидкої та оцінка альтернатив |
 | `flowmind/corridor_manager.py` | стан green corridor для екстреного транспорту |

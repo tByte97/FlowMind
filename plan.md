@@ -249,7 +249,7 @@
   - [x] Явно розділити режими static_fixed, sumo_actuated, local, flowmind.
   - [x] На старті логувати active SUMO program ID і type для кожного TLS.
   - [x] Додати в Intersection program_id, program_type, minDur, maxDur.
-  - [ ] Заборонити transition раніше SUMO minDur.
+  - [x] Заборонити transition раніше SUMO minDur.
   - [ ] Узгодити clearance_seconds із реальними yellow/all-red фазами.
   - [ ] Додати hard gate для blocked downstream.
   - [ ] Для emergency дозволяти рух лише за наявності гарантованого storage

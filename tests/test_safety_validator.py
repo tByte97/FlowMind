@@ -121,6 +121,51 @@ class SafetyValidatorTest(unittest.TestCase):
         self.assertFalse(expired.allowed)
         self.assertEqual(expired.reason, "max green reached")
 
+    def test_sumo_min_dur_blocks_normal_and_priority_transitions(self) -> None:
+        area = AreaModel(
+            (
+                Intersection(
+                    tls_id="tls_0",
+                    position=(0.0, 0.0),
+                    phases=("G", "y"),
+                    links=(ControlledLink("north_0", "south_0", 0),),
+                    phase_durations=(6.0, 3.0),
+                    phase_min_durations=(13.0, None),
+                    phase_max_durations=(50.0, None),
+                ),
+            )
+        )
+        validator = SafetyValidator(FakeTraci(), area, self.config)
+
+        normal = validator.validate_transition(
+            "tls_0",
+            0,
+            1,
+            12.0,
+            spent_duration=12.0,
+        )
+        priority = validator.validate_transition(
+            "tls_0",
+            0,
+            1,
+            12.0,
+            spent_duration=12.0,
+            priority=True,
+        )
+        ready = validator.validate_transition(
+            "tls_0",
+            0,
+            1,
+            13.0,
+            spent_duration=13.0,
+        )
+
+        self.assertFalse(normal.allowed)
+        self.assertEqual(normal.reason, "SUMO minDur not satisfied")
+        self.assertFalse(priority.allowed)
+        self.assertEqual(priority.reason, "SUMO minDur not satisfied")
+        self.assertTrue(ready.allowed)
+
 
 if __name__ == "__main__":
     unittest.main()

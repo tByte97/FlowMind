@@ -1,6 +1,6 @@
 {
   "duration": 1800,
-  "vehicles_per_hour": 3000,
+  "vehicles_per_hour": 3600,
   "controlled_tls": [
     "cluster_580698747_6327278548_6327278549",
     "cluster_13437168454_4315795790_583213300_6642884072",

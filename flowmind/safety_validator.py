@@ -90,7 +90,13 @@ class SafetyValidator:
 
         if any(signal in "Gg" for signal in current_state):
             if spent < min_green:
-                return SafetyDecision(False, "min green not satisfied")
+                sumo_minimum = intersection.phase_min_duration(current_phase)
+                reason = (
+                    "SUMO minDur not satisfied"
+                    if sumo_minimum is not None and spent < sumo_minimum
+                    else "min green not satisfied"
+                )
+                return SafetyDecision(False, reason)
         elif (
             "y" in current_state.lower()
             and spent < self._config.clearance_seconds

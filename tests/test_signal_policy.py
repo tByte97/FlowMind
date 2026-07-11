@@ -179,6 +179,28 @@ class SignalPolicyTest(unittest.TestCase):
         self.assertEqual(effective_min_green(self.config, intersection, 0), 6.0)
         self.assertEqual(effective_max_green(self.config, intersection, 0), 14.0)
 
+    def test_sumo_min_dur_is_a_hard_floor_for_every_timing_mode(self) -> None:
+        intersection = Intersection(
+            tls_id="timed",
+            position=(0.0, 0.0),
+            phases=("G", "y"),
+            links=(ControlledLink("north", "south", 0),),
+            phase_durations=(6.0, 3.0),
+            phase_min_durations=(13.0, None),
+            phase_max_durations=(50.0, None),
+        )
+
+        self.assertEqual(effective_min_green(self.config, intersection, 0), 13.0)
+        self.assertEqual(
+            effective_min_green(
+                ControlConfig(use_default_phase_timing=False, min_green=4),
+                intersection,
+                0,
+            ),
+            13.0,
+        )
+        self.assertEqual(effective_max_green(self.config, intersection, 0), 14.0)
+
 
 if __name__ == "__main__":
     unittest.main()

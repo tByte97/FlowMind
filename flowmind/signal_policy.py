@@ -81,12 +81,17 @@ def effective_min_green(
     intersection: Intersection,
     phase_index: int,
 ) -> float:
-    if not config.use_default_phase_timing:
-        return float(config.min_green)
-    default_duration = intersection.default_phase_duration(phase_index)
-    if default_duration is None:
-        return float(config.min_green)
-    return max(1.0, min(float(config.min_green), default_duration))
+    configured_minimum = float(config.min_green)
+    if config.use_default_phase_timing:
+        default_duration = intersection.default_phase_duration(phase_index)
+        if default_duration is not None:
+            configured_minimum = min(configured_minimum, default_duration)
+    sumo_minimum = intersection.phase_min_duration(phase_index)
+    return max(
+        1.0,
+        configured_minimum,
+        sumo_minimum if sumo_minimum is not None else 0.0,
+    )
 
 
 def effective_max_green(
