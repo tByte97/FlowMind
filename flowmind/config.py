@@ -49,6 +49,11 @@ class ControlConfig:
     min_downstream_storage_slots: float = 1.0
     priority_min_storage_slots: float = 2.0
     downstream_weight: float = 10.0
+    downstream_graph_weight: float = 24.0
+    downstream_graph_hops: int = 2
+    downstream_graph_decay: float = 0.55
+    spillback_start_occupancy: float = 0.55
+    spillback_hard_gate_probability: float = 0.85
     area_pressure_weight: float = 0.35
     queue_forecast_weight: float = 0.75
     empty_approach_penalty: float = 8.0

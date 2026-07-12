@@ -159,19 +159,9 @@ class AreaModel:
         )
 
 def load_zone_tls_ids(zone_path: str | Path) -> tuple[str, ...]:
-    payload = json.loads(Path(zone_path).read_text(encoding="utf-8"))
-    intersections = payload.get("intersections")
-    if not isinstance(intersections, list) or not intersections:
-        raise ValueError("Zone definition must contain a non-empty intersections list")
-    tls_ids = tuple(
-        str(item["tls_id"])
-        for item in intersections
-        if isinstance(item, dict) and item.get("tls_id")
-    )
-    if len(tls_ids) != len(intersections):
-        raise ValueError("Every zone intersection must contain tls_id")
-    if len(set(tls_ids)) != len(tls_ids):
-        raise ValueError("Zone traffic-light IDs must be unique")
+    from .zone_graph import load_zone_definition
+
+    tls_ids = load_zone_definition(zone_path).tls_ids
     if not 4 <= len(tls_ids) <= 6:
         raise ValueError("A FlowMind zone must contain 4 to 6 traffic lights")
     return tls_ids
