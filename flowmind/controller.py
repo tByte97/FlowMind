@@ -7,7 +7,7 @@ from .config import ControlConfig
 from .decision_feed import DecisionEvent
 from .priority_flow import priority_links
 from .queue_forecast import QueueForecastEnsemble, QueueForecastModel
-from .safety_validator import SafetyValidator
+from .safety_validator import SafetyValidator, clearance_duration
 from .signal_policy import (
     area_pressure_by_incoming_lane,
     choose_phase,
@@ -228,6 +228,18 @@ class AreaSignalController:
                 if not safety.allowed:
                     continue
                 self._traci.trafficlight.setPhase(tls_id, next_phase)
+                next_state = intersection.phases[next_phase]
+                if "y" in next_state.lower() or not any(
+                    signal in "GgYy" for signal in next_state
+                ):
+                    self._traci.trafficlight.setPhaseDuration(
+                        tls_id,
+                        clearance_duration(
+                            intersection,
+                            next_phase,
+                            self._config.clearance_seconds,
+                        ),
+                    )
                 self.stats.advances += 1
                 self._record_decision(
                     simulation_time,

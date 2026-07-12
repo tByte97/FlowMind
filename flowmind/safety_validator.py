@@ -13,6 +13,31 @@ class SafetyDecision:
     reason: str = "ok"
 
 
+def clearance_duration(
+    intersection: object,
+    phase_index: int,
+    fallback_seconds: float,
+) -> float:
+    """Return the clearance duration encoded by the active SUMO program.
+
+    ``duration`` is the normal lifetime of a yellow/all-red phase.  Actuated
+    programs may additionally provide ``minDur``; when they do, it remains a
+    hard lower bound.  The FlowMind setting is used only for programs that do
+    not expose either value.
+    """
+
+    duration_getter = getattr(intersection, "default_phase_duration", None)
+    minimum_getter = getattr(intersection, "phase_min_duration", None)
+    duration = duration_getter(phase_index) if callable(duration_getter) else None
+    minimum = minimum_getter(phase_index) if callable(minimum_getter) else None
+    known_values = tuple(
+        float(value) for value in (duration, minimum) if value is not None
+    )
+    if known_values:
+        return max(known_values)
+    return float(fallback_seconds)
+
+
 class SafetyValidator:
     """Validate signal phase decisions before TraCI applies them.
 
@@ -98,16 +123,18 @@ class SafetyValidator:
                 )
                 return SafetyDecision(False, reason)
         elif "y" in current_state.lower():
-            clearance_seconds = self._clearance_seconds(
+            clearance_seconds = clearance_duration(
                 intersection,
                 current_phase,
+                self._config.clearance_seconds,
             )
             if spent < clearance_seconds:
                 return SafetyDecision(False, "yellow clearance not satisfied")
         elif not any(signal in "GgYy" for signal in current_state):
-            clearance_seconds = self._clearance_seconds(
+            clearance_seconds = clearance_duration(
                 intersection,
                 current_phase,
+                self._config.clearance_seconds,
             )
             if spent < clearance_seconds:
                 return SafetyDecision(False, "all-red clearance not satisfied")
@@ -161,20 +188,6 @@ class SafetyValidator:
             simulation_time - started_at
             <= float(self._config.max_priority_override)
         )
-
-    def _clearance_seconds(
-        self,
-        intersection: object,
-        phase_index: int,
-    ) -> float:
-        """Use the real SUMO phase duration first, then the configured fallback."""
-
-        duration = getattr(intersection, "default_phase_duration", None)
-        if callable(duration):
-            phase_duration = duration(phase_index)
-            if phase_duration is not None:
-                return float(phase_duration)
-        return float(self._config.clearance_seconds)
 
     @staticmethod
     def _is_malformed_state(state: str, intersection: object) -> bool:

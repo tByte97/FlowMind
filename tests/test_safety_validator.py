@@ -203,6 +203,32 @@ class SafetyValidatorTest(unittest.TestCase):
         self.assertEqual(blocked.reason, "yellow clearance not satisfied")
         self.assertTrue(allowed.allowed)
 
+    def test_clearance_respects_sumo_minimum_when_above_duration(self) -> None:
+        area = AreaModel(
+            (
+                Intersection(
+                    tls_id="tls_0",
+                    position=(0.0, 0.0),
+                    phases=("G", "y", "r"),
+                    links=(ControlledLink("north_0", "south_0", 0),),
+                    phase_durations=(6.0, 3.0, 4.0),
+                    phase_min_durations=(13.0, 4.0, None),
+                ),
+            )
+        )
+        validator = SafetyValidator(FakeTraci(), area, self.config)
+
+        blocked = validator.validate_transition(
+            "tls_0", 1, 2, 3.0, spent_duration=3.0
+        )
+        ready = validator.validate_transition(
+            "tls_0", 1, 2, 4.0, spent_duration=4.0
+        )
+
+        self.assertFalse(blocked.allowed)
+        self.assertEqual(blocked.reason, "yellow clearance not satisfied")
+        self.assertTrue(ready.allowed)
+
 
 if __name__ == "__main__":
     unittest.main()
