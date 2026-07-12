@@ -29,11 +29,15 @@ class TrafficStateReader:
         traci_connection: object,
         area: AreaModel,
         sensor_range_meters: float = 120.0,
+        monitored_lane_ids: tuple[str, ...] = (),
     ) -> None:
         self._traci = traci_connection
         self._incoming = set(area.incoming_lanes)
         self._outgoing = set(area.outgoing_lanes)
-        self._lane_ids = tuple(sorted(self._incoming | self._outgoing))
+        self._full_lane = set(monitored_lane_ids) - self._incoming - self._outgoing
+        self._lane_ids = tuple(
+            sorted(self._incoming | self._outgoing | self._full_lane)
+        )
         self._sensor_range_meters = max(float(sensor_range_meters), 1.0)
 
     def read(self) -> TrafficState:
@@ -83,7 +87,11 @@ class TrafficStateReader:
             )
             vehicle_count = len(sensor_vehicle_ids)
             queue = sum(1 for speed in speeds if speed < 0.1)
-            sensor_length = min(self._sensor_range_meters, length)
+            sensor_length = (
+                length
+                if lane_id in self._full_lane
+                else min(self._sensor_range_meters, length)
+            )
             capacity = max(sensor_length / 7.5, 1.0)
             return LaneState(
                 queue=queue,
@@ -119,6 +127,8 @@ class TrafficStateReader:
             return True
         if lane_id in self._outgoing and position <= self._sensor_range_meters:
             return True
+        if lane_id in self._full_lane:
+            return True
         return False
 
     def _fallback_lane_state(self, lane_id: str, length: float) -> LaneState:
@@ -129,7 +139,12 @@ class TrafficStateReader:
                 lane_id,
             )
         )
-        capacity = max(min(length, self._sensor_range_meters) / 7.5, 1.0)
+        monitored_length = (
+            length
+            if lane_id in self._full_lane
+            else min(length, self._sensor_range_meters)
+        )
+        capacity = max(monitored_length / 7.5, 1.0)
         return LaneState(
             queue=int(
                 self._safe_call(

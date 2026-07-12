@@ -86,6 +86,29 @@ class TrafficStateReaderTest(unittest.TestCase):
         self.assertEqual(outgoing.vehicle_ids, ("near_exit",))
         self.assertEqual(outgoing.vehicle_count, 1)
 
+    def test_reads_full_intermediate_graph_lane(self) -> None:
+        area = AreaModel(
+            (
+                Intersection(
+                    tls_id="tls",
+                    position=(0.0, 0.0),
+                    phases=("G", "y"),
+                    links=(ControlledLink("in_0", "out_0", 0),),
+                ),
+            )
+        )
+        traci = FakeTraci()
+        traci.lane.vehicle_ids["middle_0"] = ("far_exit",)
+        state = TrafficStateReader(
+            traci,
+            area,
+            sensor_range_meters=60.0,
+            monitored_lane_ids=("middle_0",),
+        ).read()
+
+        self.assertEqual(state.lane("middle_0").vehicle_ids, ("far_exit",))
+        self.assertEqual(state.lane("middle_0").vehicle_count, 1)
+
 
 if __name__ == "__main__":
     unittest.main()
