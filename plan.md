@@ -252,7 +252,7 @@
   - [x] Заборонити transition раніше SUMO minDur.
   - [x] Узгодити clearance_seconds із реальними yellow/all-red фазами.
   - [x] Додати hard gate для blocked downstream.
-  - [ ] Для emergency дозволяти рух лише за наявності гарантованого storage
+  - [x] Для emergency дозволяти рух лише за наявності гарантованого storage
     space.
 
   - [ ] Додати конфліктну матрицю рухів та startup-validation усіх TLS plans.

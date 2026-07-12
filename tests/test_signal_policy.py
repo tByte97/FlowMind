@@ -74,6 +74,29 @@ class SignalPolicyTest(unittest.TestCase):
         self.assertEqual(best.phase_index, 2)
         self.assertNotIn(0, [item.phase_index for item in scores])
 
+    def test_priority_cannot_force_blocked_downstream_phase(self) -> None:
+        state = TrafficState(
+            {
+                "north": LaneState(30, 30, 0.3, 0.0, 8.0),
+                "south": LaneState(30, 30, 0.95, 0.0, 0.0),
+                "east": LaneState(5, 5, 0.2, 0.0, 8.0),
+                "west": LaneState(0, 0, 0.0, 10.0, 15.0),
+            }
+        )
+
+        best = choose_phase(
+            score_phases(
+                self.intersection,
+                state,
+                "flowmind",
+                self.config,
+                priority_link=0,
+            )
+        )
+
+        self.assertIsNotNone(best)
+        self.assertEqual(best.phase_index, 2)
+
     def test_priority_link_overrides_regular_score(self) -> None:
         state = TrafficState({})
         best = choose_phase(
