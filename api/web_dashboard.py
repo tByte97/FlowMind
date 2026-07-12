@@ -54,7 +54,7 @@ AVERAGE_METRICS = {
     "max_queue_length": "Макс. черга, авто",
     "throughput": "Пропуск, авто",
     "stops_count": "Зупинки",
-    "gridlock_risk": "Gridlock risk",
+    "blocked_outgoing_share": "Blocked outgoing share",
     "controller_decisions": "Рішення контролера",
     "phase_extensions": "Продовження зеленого",
     "phase_advances": "Перемикання фаз",
@@ -1532,7 +1532,7 @@ HTML_PAGE = r"""<!doctype html>
     function renderMetrics(payload) {
       const latest = payload.latest_sample || {};
       const summary = payload.summary || {};
-      const gridlockRisk = latest.gridlock_risk ?? summary.gridlock_risk;
+      const gridlockRisk = latest.blocked_outgoing_share ?? summary.blocked_outgoing_share;
       const cards = [
         {
           label: "Активні авто",
@@ -3006,7 +3006,7 @@ DESIGN_PAGE = r"""<!doctype html>
     function renderMetrics(payload) {
       const latest = payload.latest_sample || {};
       const summary = payload.summary || {};
-      const gridlockRisk = latest.gridlock_risk ?? summary.gridlock_risk;
+      const gridlockRisk = latest.blocked_outgoing_share ?? summary.blocked_outgoing_share;
       const cards = [
         {
           label: "Авто в зоні",
@@ -4005,7 +4005,14 @@ ARCHIVE_PAGE = r"""<!doctype html>
         card("Очікування", fmt(summary.average_waiting_time ?? sample.waiting_time, " с"), "середнє"),
         card("Черга", fmt(summary.average_queue_length ?? sample.queue_length, " авто"), `макс: ${fmt(summary.max_queue_length ?? sample.max_queue_length, " авто")}`),
         card("Пропуск", fmt(summary.throughput ?? sample.throughput, " авто", 0), `виїхало: ${fmt(summary.departed_vehicles ?? sample.departed, " авто", 0)}`),
-        card("Gridlock", fmt((summary.gridlock_risk ?? sample.gridlock_risk) * 100, "%"), "ризик затору"),
+        card(
+          "Blocked outgoing",
+          fmt(
+            (summary.blocked_outgoing_share ?? sample.blocked_outgoing_share) * 100,
+            "%"
+          ),
+          "частка заблокованих виходів"
+        ),
         card("ML", fmt(summary.queue_forecast_predictions, "", 0), "прогнозів черги"),
       ].join("");
       renderHistory(payload.metric_history || []);
@@ -4400,7 +4407,7 @@ AVERAGES_PAGE = r"""<!doctype html>
       { key: "max_queue_length", label: "Макс. черга", suffix: " авто", lower: true },
       { key: "throughput", label: "Пропуск", suffix: " авто", lower: false, digits: 0 },
       { key: "stops_count", label: "Зупинки", suffix: "", lower: true, digits: 0 },
-      { key: "gridlock_risk", label: "Gridlock risk", suffix: "", lower: true, digits: 4 },
+      { key: "blocked_outgoing_share", label: "Blocked outgoing share", suffix: "", lower: true, digits: 4 },
     ];
     function modeClass(mode) {
       return modeOrder.includes(mode) ? mode : "";

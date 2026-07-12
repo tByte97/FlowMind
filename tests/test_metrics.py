@@ -9,6 +9,7 @@ from tempfile import TemporaryDirectory
 from flowmind.area_model import AreaModel, ControlledLink, Intersection
 from flowmind.config import CONTROL_MODES, ControlConfig
 from flowmind.metrics import MetricsCollector
+from flowmind.zone_boundary import ZoneBoundary
 
 
 class FakeSimulation:
@@ -65,11 +66,20 @@ class FakeVehicle:
         return 42.0
 
 
+class FakeEdge:
+    def __init__(self) -> None:
+        self.vehicles: dict[str, tuple[str, ...]] = {}
+
+    def getLastStepVehicleIDs(self, edge_id: str) -> tuple[str, ...]:
+        return self.vehicles.get(edge_id, ())
+
+
 class FakeTraci:
     def __init__(self) -> None:
         self.simulation = FakeSimulation()
         self.lane = FakeLane()
         self.vehicle = FakeVehicle()
+        self.edge = FakeEdge()
 
 
 class ActiveFakeLane(FakeLane):
@@ -219,7 +229,7 @@ class MetricsCollectorTest(unittest.TestCase):
             self.assertEqual(payload["schema_version"], 2)
             self.assertEqual(len(payload["metric_history"]), 1)
             self.assertEqual(payload["traffic_flow"]["active_network"], 0)
-            self.assertEqual(payload["traffic_flow"]["inflow_per_minute"], 0.0)
+            self.assertIsNone(payload["traffic_flow"]["inflow_per_minute"])
             self.assertEqual(payload["intersections"], [])
             self.assertEqual(payload["vehicles"], [])
             self.assertFalse(payload["zone_simulation"]["active"])
@@ -312,22 +322,70 @@ class MetricsCollectorTest(unittest.TestCase):
 
     def test_live_flow_rates_use_changes_between_samples(self) -> None:
         traci = FakeTraci()
+        boundary = ZoneBoundary(
+            incoming_lane_ids=("entry_0",),
+            outgoing_lane_ids=("exit_0",),
+            incoming_edge_ids=("entry",),
+            outgoing_edge_ids=("exit",),
+        )
         collector = MetricsCollector(
             traci,
             AreaModel(()),
             ControlConfig(decision_interval=3),
+            zone_boundary=boundary,
         )
         traci.simulation.departed = ("veh1",)
+        traci.edge.vehicles = {"entry": ("veh1",), "exit": ()}
         collector.collect(3.0)
         traci.simulation.departed = ("veh2", "veh3")
         traci.simulation.arrived = ("veh1",)
+        traci.edge.vehicles = {
+            "entry": ("veh2", "veh3"),
+            "exit": ("veh1",),
+        }
         collector.collect(6.0)
 
         latest = collector.samples[-1]
         self.assertEqual(latest.departed, 3)
         self.assertEqual(latest.arrived, 1)
-        self.assertEqual(latest.inflow_per_minute, 40.0)
-        self.assertEqual(latest.outflow_per_minute, 20.0)
+        self.assertEqual(latest.zone_inflow, 3)
+        self.assertEqual(latest.zone_outflow, 1)
+        self.assertEqual(latest.zone_inflow_per_minute, 40.0)
+        self.assertEqual(latest.zone_outflow_per_minute, 20.0)
+
+    def test_unfinished_travel_times_are_reported_as_censored(self) -> None:
+        traci = FakeTraci()
+        collector = MetricsCollector(
+            traci,
+            AreaModel(()),
+            ControlConfig(decision_interval=5),
+        )
+        traci.simulation.departed = ("veh1",)
+        collector.collect(1.0)
+        traci.simulation.departed = ()
+        collector.collect(5.0)
+
+        summary = collector.summary("flowmind", 5.0)
+
+        self.assertIsNone(summary["average_travel_time"])
+        self.assertEqual(summary["completed_trips"], 0)
+        self.assertEqual(summary["unfinished_trips"], 1)
+        self.assertEqual(summary["unfinished_travel_time_lower_bound_mean"], 4.0)
+        outcome = collector.trip_outcomes(5.0)[0]
+        self.assertEqual(outcome.status, "unfinished_censored")
+        self.assertIsNone(outcome.travel_time)
+
+    def test_fractional_steps_do_not_duplicate_metric_samples(self) -> None:
+        collector = MetricsCollector(
+            FakeTraci(),
+            AreaModel(()),
+            ControlConfig(decision_interval=3),
+        )
+
+        for simulation_time in (3.1, 3.5, 3.9, 6.2):
+            collector.collect(simulation_time)
+
+        self.assertEqual([sample.time for sample in collector.samples], [3.1, 6.2])
 
 
 if __name__ == "__main__":

@@ -42,6 +42,7 @@ class MLDatasetCollector:
             control.sensor_range_meters,
         )
         self._rows: list[dict[str, object]] = []
+        self._next_sample_at = 0.0
 
     @property
     def output_path(self) -> Path:
@@ -52,7 +53,7 @@ class MLDatasetCollector:
         return len(self._rows)
 
     def collect(self, simulation_time: float) -> None:
-        if int(simulation_time) % self._config.sample_interval:
+        if not self._sample_is_due(simulation_time):
             return
 
         state = self._reader.read(simulation_time)
@@ -154,6 +155,15 @@ class MLDatasetCollector:
                         "downstream_blocked": int(downstream_blocked),
                     }
                 )
+
+    def _sample_is_due(self, simulation_time: float) -> bool:
+        now = float(simulation_time)
+        if now + 1e-9 < self._next_sample_at:
+            return False
+        interval = float(self._config.sample_interval)
+        elapsed_intervals = int((now - self._next_sample_at) // interval) + 1
+        self._next_sample_at += elapsed_intervals * interval
+        return True
 
     def write(self) -> dict[str, object]:
         self._config.output_dir.mkdir(parents=True, exist_ok=True)

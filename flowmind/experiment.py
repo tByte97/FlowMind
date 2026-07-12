@@ -74,6 +74,7 @@ from .queue_forecast import (
     QueueForecastStats,
     load_queue_forecast_models,
 )
+from .provenance import run_provenance_summary
 from .sumo_tls_adapter import SumoTlsSafetyAdapter
 from .sumo_corridor_adapter import SumoCorridorObservationAdapter
 from .sumo_zone_graph_adapter import SumoZoneGraphAdapter
@@ -91,6 +92,7 @@ from .tls_safety import (
 )
 from .tls_safety_audit import write_tls_safety_startup_audit
 from .zone_graph import AreaGraph, load_zone_definition
+from .zone_boundary import build_zone_boundary
 
 
 def configure_projection_data() -> Path | None:
@@ -150,10 +152,12 @@ def load_area(config: RunConfig) -> AreaModel:
 
 
 def run_experiment(config: RunConfig) -> dict[str, object]:
-    write_live_run_status(config, "starting")
+    if config.enable_live_telemetry:
+        write_live_run_status(config, "starting")
     connection = None
     try:
-        area = load_area(config)
+        evaluation_area = load_area(config)
+        area = evaluation_area
         zone_definition = load_zone_definition(config.zone_path)
         net_path = config.config_path.resolve().parent / "osm.net.xml.gz"
         queue_forecast = load_queue_forecast(config)
@@ -168,7 +172,11 @@ def run_experiment(config: RunConfig) -> dict[str, object]:
         corridor_manager = None
         corridor_observer = None
         router = None
-        route_reassessment_done = config.emergency is None
+        route_reassessment_done = (
+            config.emergency is None
+            or not config.allow_emergency_reroute
+            or bool(config.fixed_emergency_route_edges)
+        )
         emergency_route_changed = False
         alternatives_log = []
         emergency_route_tls: tuple[str, ...] = ()
@@ -198,13 +206,26 @@ def run_experiment(config: RunConfig) -> dict[str, object]:
                 area,
                 net_path,
             )
-            best_route, alternatives_log = router.find_alternatives(
-                config.emergency.start.edge_id,
-                config.emergency.destination.edge_id,
-                config.emergency.base_vehicle_type_id,
-                config.emergency.depart_time,
-                num_alternatives=5,
-            )
+            if config.fixed_emergency_route_edges:
+                best_route = router.route_option_from_edges(
+                    config.fixed_emergency_route_edges
+                )
+                if best_route is None:
+                    raise RuntimeError("Fixed emergency route is invalid for this map")
+                alternatives_log = [
+                    {
+                        **best_route.as_dict(),
+                        "reason": "Selected (Fixed Paired Route)",
+                    }
+                ]
+            else:
+                best_route, alternatives_log = router.find_alternatives(
+                    config.emergency.start.edge_id,
+                    config.emergency.destination.edge_id,
+                    config.emergency.base_vehicle_type_id,
+                    config.emergency.depart_time,
+                    num_alternatives=5,
+                )
             for alternative in alternatives_log:
                 alternative["assessment"] = "initial"
             edges = best_route.edge_ids if best_route else None
@@ -386,11 +407,15 @@ def run_experiment(config: RunConfig) -> dict[str, object]:
                 level="success",
             )
         )
+        evaluation_graph = SumoZoneGraphAdapter(net_path).build_graph(
+            zone_definition,
+            evaluation_area,
+        )
+        zone_boundary = build_zone_boundary(evaluation_area, evaluation_graph)
+        if not zone_boundary.valid:
+            raise RuntimeError("Evaluation zone has no valid directed boundary")
         if config.mode in ADAPTIVE_CONTROL_MODES:
-            area_graph = SumoZoneGraphAdapter(net_path).build_graph(
-                zone_definition,
-                area,
-            )
+            area_graph = evaluation_graph
             session_events.append(
                 DecisionEvent(
                     time=0.0,
@@ -429,7 +454,11 @@ def run_experiment(config: RunConfig) -> dict[str, object]:
             host="127.0.0.1",
             port=config.websocket_port,
         )
-        publisher_error = start_publisher_resilient(publisher)
+        publisher_error = (
+            start_publisher_resilient(publisher)
+            if config.enable_live_telemetry
+            else None
+        )
         if publisher_error is not None:
             telemetry_failures += 1
             session_events.append(
@@ -442,9 +471,15 @@ def run_experiment(config: RunConfig) -> dict[str, object]:
                 )
             )
         metrics = MetricsCollector(
-            connection, area, config.control, priority_vehicle
+            connection,
+            evaluation_area,
+            config.control,
+            priority_vehicle,
+            zone_boundary,
         )
-        metrics.set_live_publisher(publisher)
+        metrics.set_live_publisher(
+            publisher if config.enable_live_telemetry else None
+        )
         if config.dataset_dir is not None:
             dataset_collector = MLDatasetCollector(
                 connection,
@@ -475,6 +510,7 @@ def run_experiment(config: RunConfig) -> dict[str, object]:
             
             if (
                 not route_reassessment_done
+                and config.allow_emergency_reroute
                 and config.emergency is not None
                 and router is not None
                 and emergency_manager is not None
@@ -570,7 +606,7 @@ def run_experiment(config: RunConfig) -> dict[str, object]:
             if corridor_manager is not None:
                 metrics.set_corridor_state(corridor_manager.state)
             metrics.collect(simulated_time)
-            if not write_live_status_resilient(
+            if config.enable_live_telemetry and not write_live_status_resilient(
                 metrics,
                 config.results_dir,
                 config.mode,
@@ -730,8 +766,25 @@ def run_experiment(config: RunConfig) -> dict[str, object]:
             )
         summary["telemetry_failures"] = telemetry_failures
         summary.update(queue_forecast_summary(queue_forecast_stats))
+        actual_emergency_route = (
+            emergency_details.route_edges if emergency_details is not None else ()
+        )
+        summary.update(
+            run_provenance_summary(
+                config,
+                net_path,
+                queue_forecast_stats,
+                actual_emergency_route,
+            )
+        )
         if dataset_collector is not None:
             summary.update(dataset_collector.write())
+        waiting_value = summary.get("average_waiting_time")
+        waiting_label = (
+            f"{float(waiting_value):.1f} с"
+            if waiting_value is not None
+            else "немає даних"
+        )
         session_events.append(
             DecisionEvent(
                 time=round(simulated_time, 3),
@@ -739,13 +792,12 @@ def run_experiment(config: RunConfig) -> dict[str, object]:
                 title="Симуляцію завершено",
                 detail=(
                     f"Завершили маршрут {summary.get('throughput', 0)} авто; "
-                    f"середнє очікування "
-                    f"{float(summary.get('average_waiting_time', 0.0)):.1f} с."
+                    f"середнє очікування {waiting_label}."
                 ),
                 level="success",
             )
         )
-        if not write_live_status_resilient(
+        if config.enable_live_telemetry and not write_live_status_resilient(
             metrics,
             config.results_dir,
             config.mode,
@@ -773,7 +825,8 @@ def run_experiment(config: RunConfig) -> dict[str, object]:
         metrics.write(config.results_dir, summary)
         return summary
     except Exception as error:
-        write_live_run_status(config, "failed", str(error))
+        if config.enable_live_telemetry:
+            write_live_run_status(config, "failed", str(error))
         raise
     finally:
         if connection is not None:

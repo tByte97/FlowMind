@@ -79,8 +79,12 @@ results/* + FastAPI dashboard
 | `flowmind/corridor_manager.py` | стан green corridor для екстреного транспорту |
 | `flowmind/sumo_corridor_adapter.py` | SUMO-specific підтвердження фактичного проїзду stop line |
 | `flowmind/corridor_recovery.py` | нейтральний recovery planner базової фази та cycle offset |
-| `flowmind/metrics.py` | KPI, history, emergency trace, summary |
+| `flowmind/zone_boundary.py` | фіксована межа evaluation-зони та directed inflow/outflow edges |
+| `flowmind/metrics.py` | zone KPI, completed/censored trips, emergency trace і summary |
+| `flowmind/provenance.py` | hashes сценарію, demand, мережі, конфігурації, controller і моделей |
+| `flowmind/evaluation.py` | paired CI/tests та regression gates без підміни `null` нулем |
 | `experiments/run_demo.py` | demo-запуск FlowMind з опціональним static fixed baseline |
+| `experiments/run_evaluation.py` | resumable benchmark 30–50 повних пар усіх режимів |
 | `experiments/run_dataset.py` | генерація ML dataset через багато симуляцій |
 | `experiments/train_queue_ensemble.py` | тренування моделей 30/60/90 секунд |
 | `api/web_dashboard.py` | FastAPI dashboard, API, archive, averages, Gemini summary |
@@ -150,16 +154,24 @@ Gemini не запускається автоматично. Висновок ф
 | Метрика | Джерело |
 | --- | --- |
 | `average_travel_time` | `summary.csv` |
+| `completed_trips` / `unfinished_trips` | кількість завершених і censored поїздок |
+| `unfinished_travel_time_lower_bound_mean` | нижня межа часу незавершених поїздок |
 | `average_waiting_time` | `summary.csv` |
 | `average_queue_length` | `summary.csv` |
 | `max_queue_length` | `summary.csv` |
-| `throughput` | `summary.csv` / `live_status.json` |
+| `zone_inflow` / `zone_outflow` | перетини directed boundary edges evaluation-зони |
+| `throughput` | alias фактичного `zone_outflow` для сумісності dashboard |
 | `departed_vehicles` | `summary.csv` |
 | `peak_active_vehicles` | `summary.csv` |
 | `stops_count` | `summary.csv` |
-| `gridlock_risk` | `summary.csv` / live samples |
+| `blocked_outgoing_share` | фактична частка заблокованих outgoing lanes |
 | `queue_forecast_predictions` | controller stats |
 | `priority_decisions` | emergency priority stats |
+
+Якщо метрику неможливо обчислити (немає валідних lane samples, завершеної
+поїздки або emergency arrival), summary містить JSON `null`, а не штучний `0`.
+Evaluation-зона завжди залишається початковою зоною з конфігурації; тимчасове
+розширення control-зони вздовж emergency corridor не змінює межі вимірювання.
 
 ## Технології
 
@@ -218,6 +230,32 @@ python experiments/run_experiment.py flowmind --duration 600 --emergency
 # ML вплив лише після shadow-валідації:
 python experiments/run_experiment.py flowmind --duration 600 --enable-queue-control
 ```
+
+## Відтворювана оцінка режимів
+
+Повний benchmark запускає 30 пар (120 SUMO runs) для
+`static_fixed`, `sumo_actuated`, `local` і `flowmind`:
+
+```bash
+python experiments/run_evaluation.py \
+  --replicates 30 \
+  --duration 1800 \
+  --workers 4 \
+  --evaluation-id rivne_full_v1
+```
+
+У межах кожної пари однакові seed, scenario/network/demand hashes, control
+config і фактичний маршрут швидкої. Після першого режиму маршрут фіксується
+як список SUMO edges для решти трьох режимів; pre-departure rerouting у
+benchmark вимкнено. Перерваний запуск можна продовжити з тими самими
+параметрами та `--resume`.
+
+Runner формує `evaluation_manifest.json`, `summaries.json`,
+`evaluation_report.json`, `paired_metrics.csv`, `regression_gates.csv` і
+`validated_pairs.csv`. Звіт містить 95% CI paired differences, двосторонній
+paired t-test і non-regression gates для waiting, zone outflow, stops,
+blocked outgoing share та emergency ETA. Повна методика і точні допуски:
+[`docs/EVALUATION.md`](docs/EVALUATION.md).
 
 ## Docker
 

@@ -63,7 +63,7 @@ INDEX_COLUMNS = (
     "departed_vehicles",
     "peak_active_vehicles",
     "stops_count",
-    "gridlock_risk",
+    "blocked_outgoing_share",
     "controller_decisions",
     "phase_extensions",
     "phase_advances",

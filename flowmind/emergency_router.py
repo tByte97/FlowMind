@@ -215,6 +215,14 @@ class EmergencyRouter:
             ),
         )
 
+    def route_option_from_edges(
+        self,
+        edges: tuple[str, ...],
+    ) -> EmergencyRouteOption | None:
+        """Evaluate a fixed route supplied by a paired experiment plan."""
+
+        return self._route_option_from_edges(tuple(edges))
+
     def _network_alternatives(
         self,
         start_edge: str,

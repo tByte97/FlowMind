@@ -12,6 +12,7 @@ from .area_model import AreaModel
 from .config import CONTROL_MODES, LEGACY_CONTROL_MODE_ALIASES, ControlConfig
 from .live_transport import LiveTelemetryPublisher
 from .traffic_state import TrafficStateReader
+from .zone_boundary import ZoneBoundary
 
 
 @dataclass(frozen=True)
@@ -20,15 +21,17 @@ class MetricSample:
     active_vehicles: int
     departed: int
     arrived: int
-    inflow_per_minute: float
-    outflow_per_minute: float
-    mean_speed: float
-    waiting_time: float
-    queue_length: int
-    max_queue_length: int
+    zone_inflow: int | None
+    zone_outflow: int | None
+    zone_inflow_per_minute: float | None
+    zone_outflow_per_minute: float | None
+    mean_speed: float | None
+    waiting_time: float | None
+    queue_length: int | None
+    max_queue_length: int | None
     throughput: int
     stops_count: int
-    gridlock_risk: float
+    blocked_outgoing_share: float | None
 
 
 @dataclass(frozen=True)
@@ -56,6 +59,16 @@ class CivilianImpactSample:
     mean_waiting_time: float
 
 
+@dataclass(frozen=True)
+class TripOutcome:
+    vehicle_id: str
+    status: str
+    departure_time: float
+    observation_end_time: float
+    travel_time: float | None
+    censored_lower_bound: float | None
+
+
 class MetricsCollector:
     def __init__(
         self,
@@ -63,11 +76,13 @@ class MetricsCollector:
         area: AreaModel,
         control: ControlConfig,
         priority_vehicle: str | None = None,
+        zone_boundary: ZoneBoundary | None = None,
     ) -> None:
         self._traci = traci_connection
         self._area = area
         self._control = control
         self._priority_vehicle = priority_vehicle
+        self._zone_boundary = zone_boundary
         self._reader = TrafficStateReader(
             traci_connection,
             area,
@@ -76,12 +91,17 @@ class MetricsCollector:
         self._previously_stopped: set[str] = set()
         self._departed_at: dict[str, float] = {}
         self._travel_times: list[float] = []
+        self._completed_trip_outcomes: list[TripOutcome] = []
         self._throughput = 0
         self._stops = 0
         self._priority_departed: float | None = None
         self._priority_arrived: float | None = None
         self._priority_eta: float | None = None
         self._departed_count = 0
+        self._zone_inflow_count = 0
+        self._zone_outflow_count = 0
+        self._previous_boundary_incoming: set[str] = set()
+        self._previous_boundary_outgoing: set[str] = set()
         self._peak_active_vehicles = 0
         self.samples: list[MetricSample] = []
         self.emergency_trace: list[EmergencyTraceSample] = []
@@ -90,6 +110,7 @@ class MetricsCollector:
         self._last_live_status: dict[str, Any] | None = None
         self._publisher: LiveTelemetryPublisher | None = None
         self._visual_lanes = area.visual_lanes
+        self._next_sample_at = float(control.decision_interval)
 
     def collect(self, simulation_time: float) -> None:
         departed = self._traci.simulation.getDepartedIDList()
@@ -110,20 +131,38 @@ class MetricsCollector:
             if departed_at is not None:
                 duration = simulation_time - departed_at
                 self._travel_times.append(duration)
+                self._completed_trip_outcomes.append(
+                    TripOutcome(
+                        vehicle_id=vehicle_id,
+                        status="completed",
+                        departure_time=departed_at,
+                        observation_end_time=simulation_time,
+                        travel_time=duration,
+                        censored_lower_bound=None,
+                    )
+                )
                 if vehicle_id == self._priority_vehicle:
                     self._priority_eta = duration
                     self._priority_arrived = simulation_time
 
+        self._collect_zone_boundary_crossings()
         self._collect_priority_trace(simulation_time)
 
-        if int(simulation_time) % self._control.decision_interval:
+        if not self._sample_is_due(simulation_time):
             return
 
-        traffic = self._reader.read()
+        traffic = self._reader.read(simulation_time)
         lane_ids = set(self._area.incoming_lanes) | set(self._area.outgoing_lanes)
-        queues = [traffic.lane(lane_id).queue for lane_id in lane_ids]
+        valid_lanes = [
+            traffic.lane(lane_id)
+            for lane_id in lane_ids
+            if traffic.lane(lane_id).valid
+        ]
+        queues = [lane.queue for lane in valid_lanes]
         outgoing_occupancies = [
-            traffic.lane(lane_id).occupancy for lane_id in self._area.outgoing_lanes
+            traffic.lane(lane_id).occupancy
+            for lane_id in self._area.outgoing_lanes
+            if traffic.lane(lane_id).valid
         ]
         zone_vehicles = {
             vehicle_id
@@ -182,15 +221,23 @@ class MetricsCollector:
         )
         previous = self.samples[-1] if self.samples else None
         elapsed = simulation_time - previous.time if previous is not None else 0.0
+        boundary_available = self._boundary_available
         inflow_per_minute = (
-            (self._departed_count - previous.departed) * 60.0 / elapsed
-            if previous is not None and elapsed > 0
-            else 0.0
+            (self._zone_inflow_count - int(previous.zone_inflow or 0))
+            * 60.0
+            / elapsed
+            if boundary_available and previous is not None and elapsed > 0
+            else None
         )
         outflow_per_minute = (
-            (self._throughput - previous.arrived) * 60.0 / elapsed
-            if previous is not None and elapsed > 0
-            else 0.0
+            (self._zone_outflow_count - int(previous.zone_outflow or 0))
+            * 60.0
+            / elapsed
+            if boundary_available and previous is not None and elapsed > 0
+            else None
+        )
+        effective_throughput = (
+            self._zone_outflow_count if boundary_available else self._throughput
         )
         self.samples.append(
             MetricSample(
@@ -198,23 +245,64 @@ class MetricsCollector:
                 active_vehicles=len(zone_vehicles),
                 departed=self._departed_count,
                 arrived=self._throughput,
-                inflow_per_minute=round(inflow_per_minute, 3),
-                outflow_per_minute=round(outflow_per_minute, 3),
-                mean_speed=fmean(speeds.values()) if speeds else 0.0,
-                waiting_time=fmean(waiting) if waiting else 0.0,
-                queue_length=sum(queues),
-                max_queue_length=max(queues, default=0),
-                throughput=self._throughput,
+                zone_inflow=(self._zone_inflow_count if boundary_available else None),
+                zone_outflow=(self._zone_outflow_count if boundary_available else None),
+                zone_inflow_per_minute=(
+                    round(inflow_per_minute, 3)
+                    if inflow_per_minute is not None
+                    else None
+                ),
+                zone_outflow_per_minute=(
+                    round(outflow_per_minute, 3)
+                    if outflow_per_minute is not None
+                    else None
+                ),
+                mean_speed=fmean(speeds.values()) if speeds else None,
+                waiting_time=fmean(waiting) if waiting else None,
+                queue_length=sum(queues) if valid_lanes else None,
+                max_queue_length=max(queues) if queues else None,
+                throughput=effective_throughput,
                 stops_count=self._stops,
-                gridlock_risk=(
+                blocked_outgoing_share=(
                     blocked / len(outgoing_occupancies)
                     if outgoing_occupancies
-                    else 0.0
+                    else None
                 ),
             )
         )
 
+    def _sample_is_due(self, simulation_time: float) -> bool:
+        now = float(simulation_time)
+        if now + 1e-9 < self._next_sample_at:
+            return False
+        interval = float(self._control.decision_interval)
+        elapsed_intervals = int((now - self._next_sample_at) // interval) + 1
+        self._next_sample_at += elapsed_intervals * interval
+        return True
+
     def summary(self, mode: str, simulated_duration: float) -> dict[str, object]:
+        waiting_values = [
+            sample.waiting_time
+            for sample in self.samples
+            if sample.waiting_time is not None
+        ]
+        queue_values = [
+            sample.queue_length
+            for sample in self.samples
+            if sample.queue_length is not None
+        ]
+        max_queue_values = [
+            sample.max_queue_length
+            for sample in self.samples
+            if sample.max_queue_length is not None
+        ]
+        blocked_values = [
+            sample.blocked_outgoing_share
+            for sample in self.samples
+            if sample.blocked_outgoing_share is not None
+        ]
+        censored = self._censored_trip_outcomes(simulated_duration)
+        boundary_available = self._boundary_available
         result = {
             "mode": mode,
             "simulated_duration": round(simulated_duration, 2),
@@ -222,29 +310,55 @@ class MetricsCollector:
             "tls_ids": ",".join(self._area.tls_ids),
             "average_travel_time": round(fmean(self._travel_times), 3)
             if self._travel_times
-            else 0.0,
-            "average_waiting_time": round(
-                fmean(sample.waiting_time for sample in self.samples), 3
-            )
-            if self.samples
-            else 0.0,
-            "average_queue_length": round(
-                fmean(sample.queue_length for sample in self.samples), 3
-            )
-            if self.samples
-            else 0.0,
-            "max_queue_length": max(
-                (sample.max_queue_length for sample in self.samples), default=0
+            else None,
+            "completed_travel_time_mean": round(fmean(self._travel_times), 3)
+            if self._travel_times
+            else None,
+            "completed_trips": len(self._completed_trip_outcomes),
+            "unfinished_trips": len(censored),
+            "unfinished_travel_time_lower_bound_mean": (
+                round(
+                    fmean(
+                        float(item.censored_lower_bound)
+                        for item in censored
+                        if item.censored_lower_bound is not None
+                    ),
+                    3,
+                )
+                if censored
+                else None
             ),
-            "throughput": self._throughput,
+            "average_waiting_time": round(
+                fmean(waiting_values), 3
+            )
+            if waiting_values
+            else None,
+            "average_queue_length": round(
+                fmean(queue_values), 3
+            )
+            if queue_values
+            else None,
+            "max_queue_length": max(max_queue_values) if max_queue_values else None,
+            "throughput": (
+                self._zone_outflow_count if boundary_available else self._throughput
+            ),
+            "zone_boundary_available": boundary_available,
+            "zone_inflow": self._zone_inflow_count if boundary_available else None,
+            "zone_outflow": self._zone_outflow_count if boundary_available else None,
+            "zone_net_flow": (
+                self._zone_inflow_count - self._zone_outflow_count
+                if boundary_available
+                else None
+            ),
             "departed_vehicles": self._departed_count,
+            "network_arrived_vehicles": self._throughput,
             "peak_active_vehicles": self._peak_active_vehicles,
             "stops_count": self._stops,
-            "gridlock_risk": round(
-                fmean(sample.gridlock_risk for sample in self.samples), 4
+            "blocked_outgoing_share": round(
+                fmean(blocked_values), 4
             )
-            if self.samples
-            else 0.0,
+            if blocked_values
+            else None,
             "emergency_departure_time": self._priority_departed,
             "emergency_arrival_time": self._priority_arrived,
             "emergency_eta": self._priority_eta,
@@ -254,8 +368,61 @@ class MetricsCollector:
                 set(self._area.incoming_lanes) | set(self._area.outgoing_lanes)
             ),
         }
+        if self._zone_boundary is not None:
+            result.update(self._zone_boundary.as_summary())
         result.update(self._civilian_impact_summary())
         return result
+
+    @property
+    def _boundary_available(self) -> bool:
+        return self._zone_boundary is not None and self._zone_boundary.valid
+
+    def trip_outcomes(self, simulated_duration: float) -> tuple[TripOutcome, ...]:
+        return tuple(
+            [
+                *self._completed_trip_outcomes,
+                *self._censored_trip_outcomes(simulated_duration),
+            ]
+        )
+
+    def _censored_trip_outcomes(
+        self,
+        simulated_duration: float,
+    ) -> list[TripOutcome]:
+        observation_end = float(simulated_duration)
+        return [
+            TripOutcome(
+                vehicle_id=vehicle_id,
+                status="unfinished_censored",
+                departure_time=departed_at,
+                observation_end_time=observation_end,
+                travel_time=None,
+                censored_lower_bound=max(observation_end - departed_at, 0.0),
+            )
+            for vehicle_id, departed_at in sorted(self._departed_at.items())
+        ]
+
+    def _collect_zone_boundary_crossings(self) -> None:
+        if not self._boundary_available or self._zone_boundary is None:
+            return
+        edge_domain = getattr(self._traci, "edge", None)
+        getter = getattr(edge_domain, "getLastStepVehicleIDs", None)
+        if not callable(getter):
+            return
+        incoming = {
+            str(vehicle_id)
+            for edge_id in self._zone_boundary.incoming_edge_ids
+            for vehicle_id in self._safe_call(getter, (), edge_id)
+        }
+        outgoing = {
+            str(vehicle_id)
+            for edge_id in self._zone_boundary.outgoing_edge_ids
+            for vehicle_id in self._safe_call(getter, (), edge_id)
+        }
+        self._zone_inflow_count += len(incoming - self._previous_boundary_incoming)
+        self._zone_outflow_count += len(outgoing - self._previous_boundary_outgoing)
+        self._previous_boundary_incoming = incoming
+        self._previous_boundary_outgoing = outgoing
 
     def set_corridor_state(self, state: object) -> None:
         self._corridor_state = getattr(state, "name", str(state)).upper()
@@ -374,15 +541,22 @@ class MetricsCollector:
                 ),
                 "departed_total": self._departed_count,
                 "arrived_total": self._throughput,
+                "zone_boundary_available": self._boundary_available,
+                "zone_inflow_total": (
+                    self._zone_inflow_count if self._boundary_available else None
+                ),
+                "zone_outflow_total": (
+                    self._zone_outflow_count if self._boundary_available else None
+                ),
                 "inflow_per_minute": (
-                    float(latest_sample["inflow_per_minute"])
+                    latest_sample.get("zone_inflow_per_minute")
                     if latest_sample is not None
-                    else 0.0
+                    else None
                 ),
                 "outflow_per_minute": (
-                    float(latest_sample["outflow_per_minute"])
+                    latest_sample.get("zone_outflow_per_minute")
                     if latest_sample is not None
-                    else 0.0
+                    else None
                 ),
             },
             "sensor_model": {
@@ -742,6 +916,20 @@ class MetricsCollector:
                 writer.writerows(
                     asdict(sample) for sample in self.civilian_impact_samples
                 )
+
+        duration_value = summary.get("simulated_duration")
+        outcomes = (
+            self.trip_outcomes(float(duration_value))
+            if duration_value is not None
+            else ()
+        )
+        if outcomes:
+            outcomes_path = results_dir / f"{mode}_trip_outcomes.csv"
+            with outcomes_path.open("w", newline="", encoding="utf-8") as handle:
+                fieldnames = list(asdict(outcomes[0]).keys())
+                writer = csv.DictWriter(handle, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(asdict(outcome) for outcome in outcomes)
 
         with (results_dir / f"{mode}_summary.json").open(
             "w", encoding="utf-8"

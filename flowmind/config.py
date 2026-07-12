@@ -168,6 +168,7 @@ class RunConfig:
         PROJECT_ROOT / "simulation" / "rivne_area" / "central_zone.json"
     )
     results_dir: Path = PROJECT_ROOT / "results"
+    scenario_name: str | None = None
     tls_ids: tuple[str, ...] = field(default_factory=tuple)
     priority_vehicle: str | None = None
     emergency: EmergencyVehicleConfig | None = None
@@ -179,6 +180,12 @@ class RunConfig:
     dataset_scenario: str = "rivne_focused"
     dataset_sample_interval: int = 5
     dataset_target_horizons: tuple[int, ...] = (30, 60, 90)
+    evaluation_id: str | None = None
+    evaluation_pair_id: str | None = None
+    evaluation_replicate: int | None = None
+    fixed_emergency_route_edges: tuple[str, ...] = field(default_factory=tuple)
+    allow_emergency_reroute: bool = True
+    enable_live_telemetry: bool = True
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "mode", normalize_control_mode(self.mode))
@@ -200,3 +207,9 @@ class RunConfig:
             raise ValueError("queue forecast horizon weights cannot be negative")
         if self.emergency is not None and self.emergency.depart_time >= self.duration:
             raise ValueError("Emergency must depart before the simulation ends")
+        if self.evaluation_replicate is not None and self.evaluation_replicate <= 0:
+            raise ValueError("evaluation_replicate must be positive")
+        if self.fixed_emergency_route_edges and len(self.fixed_emergency_route_edges) < 2:
+            raise ValueError("fixed_emergency_route_edges must contain at least two edges")
+        if self.fixed_emergency_route_edges and self.emergency is None:
+            raise ValueError("A fixed emergency route requires emergency configuration")

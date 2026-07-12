@@ -95,6 +95,36 @@ class MLDatasetCollectorTest(unittest.TestCase):
         self.assertEqual(rows[0]["queue_forecast_weight"], "0.75")
         self.assertEqual(rows[1]["target_incoming_queue_30s"], "")
 
+    def test_fractional_steps_do_not_duplicate_samples(self) -> None:
+        collector = MLDatasetCollector(
+            FakeTraci(),
+            AreaModel(
+                (
+                    Intersection(
+                        tls_id="tls",
+                        position=(0.0, 0.0),
+                        phases=("G",),
+                        links=(ControlledLink("in_0", "out_0", 0),),
+                    ),
+                )
+            ),
+            ControlConfig(),
+            MLDatasetConfig(
+                output_dir=Path("unused"),
+                run_id="fractional",
+                scenario="test",
+                mode="flowmind",
+                seed=1,
+                duration=10,
+                sample_interval=5,
+            ),
+        )
+
+        for simulation_time in (0.0, 0.2, 4.9, 5.1):
+            collector.collect(simulation_time)
+
+        self.assertEqual(collector.row_count, 2)
+
 
 if __name__ == "__main__":
     unittest.main()

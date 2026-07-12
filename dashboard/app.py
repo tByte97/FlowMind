@@ -50,7 +50,7 @@ METRIC_LABELS = {
     "max_queue_length": "Максимальна черга, авто",
     "throughput": "Пропускна здатність, авто",
     "stops_count": "Кількість зупинок",
-    "gridlock_risk": "Gridlock risk",
+    "blocked_outgoing_share": "Blocked outgoing share",
     "controller_decisions": "Рішення контролера",
     "phase_extensions": "Продовження зеленого",
     "phase_advances": "Перемикання фаз",
@@ -64,7 +64,7 @@ LOWER_IS_BETTER = {
     "average_queue_length",
     "max_queue_length",
     "stops_count",
-    "gridlock_risk",
+    "blocked_outgoing_share",
 }
 NUMERIC_COLUMNS = [
     *METRIC_LABELS,
@@ -470,15 +470,15 @@ def live_history_frame(payload: dict[str, object]) -> pd.DataFrame:
         "active_vehicles",
         "departed",
         "arrived",
-        "inflow_per_minute",
-        "outflow_per_minute",
+        "zone_inflow_per_minute",
+        "zone_outflow_per_minute",
         "mean_speed",
         "waiting_time",
         "queue_length",
         "max_queue_length",
         "throughput",
         "stops_count",
-        "gridlock_risk",
+        "blocked_outgoing_share",
     ]
     for column in numeric_columns:
         if column in frame.columns:
@@ -564,12 +564,12 @@ def live_average_metrics(payload: dict[str, object]) -> dict[str, float]:
     history = live_history_frame(payload)
     fields = {
         "active_vehicles": "active_vehicles",
-        "inflow_per_minute": "inflow_per_minute",
-        "outflow_per_minute": "outflow_per_minute",
+        "zone_inflow_per_minute": "zone_inflow_per_minute",
+        "zone_outflow_per_minute": "zone_outflow_per_minute",
         "queue_length": "queue_length",
         "waiting_time": "waiting_time",
         "mean_speed": "mean_speed",
-        "gridlock_risk": "gridlock_risk",
+        "blocked_outgoing_share": "blocked_outgoing_share",
     }
     averages: dict[str, float] = {}
     for output_name, column in fields.items():
@@ -875,11 +875,11 @@ def render_live_dashboard(result_dir: Path) -> None:
     )
     live_cols[1].metric(
         "Середній вхідний потік",
-        format_number(averages["inflow_per_minute"], " авто/хв", 1),
+        format_number(averages["zone_inflow_per_minute"], " авто/хв", 1),
     )
     live_cols[2].metric(
         "Середній вихідний потік",
-        format_number(averages["outflow_per_minute"], " авто/хв", 1),
+        format_number(averages["zone_outflow_per_minute"], " авто/хв", 1),
     )
     live_cols[3].metric(
         "Середня черга",
@@ -897,7 +897,7 @@ def render_live_dashboard(result_dir: Path) -> None:
     )
     quality_cols[2].metric(
         "Середній gridlock risk",
-        format_number(averages["gridlock_risk"], "", 3),
+        format_number(averages["blocked_outgoing_share"], "", 3),
     )
 
     st.caption(
@@ -1095,7 +1095,13 @@ status_columns[3].metric(
 )
 status_columns[4].metric(
     "Gridlock risk",
-    format_number(summary["gridlock_risk"].max() if "gridlock_risk" in summary else None, "", 2),
+    format_number(
+        summary["blocked_outgoing_share"].max()
+        if "blocked_outgoing_share" in summary
+        else None,
+        "",
+        2,
+    ),
 )
 
 if "tls_ids" in summary.columns and not summary.empty:
@@ -1277,7 +1283,7 @@ if timeseries_frames:
             "mean_speed",
             "arrived",
             "departed",
-            "gridlock_risk",
+            "blocked_outgoing_share",
         ]
         if field in timeseries_all.columns
     ]
