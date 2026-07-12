@@ -250,7 +250,7 @@
   - [x] На старті логувати active SUMO program ID і type для кожного TLS.
   - [x] Додати в Intersection program_id, program_type, minDur, maxDur.
   - [x] Заборонити transition раніше SUMO minDur.
-  - [ ] Узгодити clearance_seconds із реальними yellow/all-red фазами.
+  - [x] Узгодити clearance_seconds із реальними yellow/all-red фазами.
   - [ ] Додати hard gate для blocked downstream.
   - [ ] Для emergency дозволяти рух лише за наявності гарантованого storage
     space.

@@ -166,6 +166,43 @@ class SafetyValidatorTest(unittest.TestCase):
         self.assertEqual(priority.reason, "SUMO minDur not satisfied")
         self.assertTrue(ready.allowed)
 
+    def test_uses_real_clearance_duration_before_config_fallback(self) -> None:
+        area = AreaModel(
+            (
+                Intersection(
+                    tls_id="tls_0",
+                    position=(0.0, 0.0),
+                    phases=("G", "y", "r"),
+                    links=(ControlledLink("north_0", "south_0", 0),),
+                    phase_durations=(6.0, 3.0, 4.0),
+                ),
+            )
+        )
+        validator = SafetyValidator(
+            FakeTraci(spent=2.0),
+            area,
+            ControlConfig(clearance_seconds=5),
+        )
+
+        blocked = validator.validate_transition(
+            "tls_0",
+            1,
+            2,
+            2.0,
+            spent_duration=2.0,
+        )
+        allowed = validator.validate_transition(
+            "tls_0",
+            1,
+            2,
+            3.0,
+            spent_duration=3.0,
+        )
+
+        self.assertFalse(blocked.allowed)
+        self.assertEqual(blocked.reason, "yellow clearance not satisfied")
+        self.assertTrue(allowed.allowed)
+
 
 if __name__ == "__main__":
     unittest.main()

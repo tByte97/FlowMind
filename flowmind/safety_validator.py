@@ -97,13 +97,19 @@ class SafetyValidator:
                     else "min green not satisfied"
                 )
                 return SafetyDecision(False, reason)
-        elif (
-            "y" in current_state.lower()
-            and spent < self._config.clearance_seconds
-        ):
-            return SafetyDecision(False, "yellow clearance not satisfied")
+        elif "y" in current_state.lower():
+            clearance_seconds = self._clearance_seconds(
+                intersection,
+                current_phase,
+            )
+            if spent < clearance_seconds:
+                return SafetyDecision(False, "yellow clearance not satisfied")
         elif not any(signal in "GgYy" for signal in current_state):
-            if spent < self._config.clearance_seconds:
+            clearance_seconds = self._clearance_seconds(
+                intersection,
+                current_phase,
+            )
+            if spent < clearance_seconds:
                 return SafetyDecision(False, "all-red clearance not satisfied")
 
         return SafetyDecision(True)
@@ -155,6 +161,20 @@ class SafetyValidator:
             simulation_time - started_at
             <= float(self._config.max_priority_override)
         )
+
+    def _clearance_seconds(
+        self,
+        intersection: object,
+        phase_index: int,
+    ) -> float:
+        """Use the real SUMO phase duration first, then the configured fallback."""
+
+        duration = getattr(intersection, "default_phase_duration", None)
+        if callable(duration):
+            phase_duration = duration(phase_index)
+            if phase_duration is not None:
+                return float(phase_duration)
+        return float(self._config.clearance_seconds)
 
     @staticmethod
     def _is_malformed_state(state: str, intersection: object) -> bool:
