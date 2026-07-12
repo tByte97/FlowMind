@@ -41,13 +41,11 @@ AI використовується як технологічна складов
 ## Архітектура
 
 ```text
-SUMO network / focused.sumocfg
+Data source (SUMO now; controller/backend API in production)
         ↓
-SUMO simulation
+replaceable adapter
         ↓
-TraCI
-        ↓
-TrafficStateReader
+neutral TrafficState + TLS safety catalog
         ↓
 AreaSignalController
         ↓
@@ -66,6 +64,8 @@ results/* + FastAPI dashboard
 | --- | --- |
 | `flowmind/area_model.py` | модель зони, TLS program ID/type, фазових duration/minDur/maxDur і lane links |
 | `flowmind/tls_programs.py` | static fixed-time програма й startup-аудит активних SUMO TLS-програм |
+| `flowmind/tls_safety.py` | незалежна від джерела модель рухів, конфліктів і startup-validation всіх TLS plans |
+| `flowmind/sumo_tls_adapter.py` | ізольований адаптер SUMO topology/TraCI до нейтрального safety-каталогу |
 | `flowmind/traffic_state.py` | читання стану смуг у sensor range |
 | `flowmind/signal_policy.py` | scoring фаз для `local` і `flowmind` |
 | `flowmind/controller.py` | прийняття рішень і керування світлофорами через TraCI |

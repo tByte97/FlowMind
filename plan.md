@@ -257,7 +257,8 @@
   - [x] Для emergency вимагати окремий гарантований storage buffer,
     навіть якщо авто ще не потрапило в sensor window.
 
-  - [ ] Додати конфліктну матрицю рухів та startup-validation усіх TLS plans.
+  - [x] Додати незалежну від SUMO конфліктну матрицю рухів,
+    startup-validation всіх TLS plans і fail-fast JSON-аудит.
 
   ### Етап 2 — справжній зональний граф
 

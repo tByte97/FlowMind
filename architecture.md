@@ -1,6 +1,32 @@
 # Архітектура FlowMind Rivne pre-MVP
 
-## Потік даних
+## Шари системи
+
+SUMO не є частиною доменної логіки FlowMind. У pre-MVP він дає
+топологію, traffic state і TLS programs через окремі адаптери. У
+production ці адаптери можуть бути замінені на API дорожніх
+контролерів, GIS і sensor backend.
+
+```text
+SUMO / field controllers / backend API
+                 |
+                 v
+        source-specific adapters
+                 |
+                 v
+ TrafficState + TlsSafetyCatalog
+                 |
+                 v
+ FlowMind policy + safety + area controller
+                 |
+                 v
+       command/output adapter
+```
+
+`flowmind/tls_safety.py` не імпортує SUMO або TraCI. SUMO-специфічне
+перетворення зосереджене у `flowmind/sumo_tls_adapter.py`.
+
+## Потік даних pre-MVP
 
 ```text
 central_zone.json
@@ -19,7 +45,8 @@ TraCI simulation connection
         |
         v
 Signal Policy
-  - Fixed: штатна програма SUMO
+  - Static fixed: детермінована fixed-time програма
+  - SUMO actuated: окремий simulation baseline
   - Local: тільки вхідна черга конкретного перехрестя
   - FlowMind: вхідна черга + стан наступної ділянки
         |
@@ -49,6 +76,8 @@ EmergencyVehicleManager
 | Модуль | Відповідальність |
 | --- | --- |
 | `flowmind/area_model.py` | Читає SUMO network, знаходить керовані світлофори й формує зону |
+| `flowmind/tls_safety.py` | Нейтральна модель TLS plans, конфліктна матриця і fail-fast validation |
+| `flowmind/sumo_tls_adapter.py` | Перетворює SUMO topology/right-of-way і TraCI Logic на `TlsSafetyCatalog` |
 | `flowmind/traffic_state.py` | Нормалізує телеметрію смуг із TraCI |
 | `flowmind/signal_policy.py` | Рахує оцінки фаз для Local та FlowMind |
 | `flowmind/controller.py` | Застосовує рішення з min/max green та безпечним порядком фаз |
