@@ -161,8 +161,8 @@ def load_zone_tls_ids(zone_path: str | Path) -> tuple[str, ...]:
     from .zone_graph import load_zone_definition
 
     tls_ids = load_zone_definition(zone_path).tls_ids
-    if not 4 <= len(tls_ids) <= 6:
-        raise ValueError("A FlowMind zone must contain 4 to 6 traffic lights")
+    if not 4 <= len(tls_ids) <= 20:
+        raise ValueError("A FlowMind zone must contain 4 to 20 traffic lights")
     return tls_ids
 
 
@@ -241,7 +241,7 @@ def _optional_phase_bound(value: object) -> float | None:
 
 def discover_area(
     net_path: str | Path,
-    zone_size: int = 6,
+    zone_size: int = 20,
     requested_tls: tuple[str, ...] = (),
     strict_requested: bool = True,
 ) -> AreaModel:

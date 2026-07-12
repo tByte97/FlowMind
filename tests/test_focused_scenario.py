@@ -24,7 +24,7 @@ class FocusedScenarioTest(unittest.TestCase):
     def test_area_preserves_tls_program_and_phase_safety_metadata(self) -> None:
         area = load_area(RunConfig(mode="sumo_actuated"))
 
-        self.assertEqual(len(area.intersections), 6)
+        self.assertEqual(len(area.intersections), 20)
         for intersection in area.intersections:
             self.assertEqual(intersection.program_id, "0")
             self.assertEqual(intersection.program_type, "actuated")
@@ -49,7 +49,7 @@ class FocusedScenarioTest(unittest.TestCase):
             )
         )
 
-    def test_manifest_covers_a_connected_six_light_zone(self) -> None:
+    def test_manifest_covers_a_connected_twenty_light_zone(self) -> None:
         zone_tls = load_zone_tls_ids(SCENARIO_DIR / "central_zone.json")
         manifest = json.loads(
             (SCENARIO_DIR / "focused.manifest.json").read_text(encoding="utf-8")
@@ -83,8 +83,8 @@ class FocusedScenarioTest(unittest.TestCase):
         root = ET.parse(SCENARIO_DIR / "focused.rou.xml").getroot()
         routes = root.findall("route")
         flows = root.findall("flow")
-        self.assertEqual(len(routes), 8)
-        self.assertEqual(len(flows), 8)
+        self.assertEqual(len(routes), 20)
+        self.assertEqual(len(flows), 20)
         self.assertTrue(all(len(route.attrib["edges"].split()) >= 2 for route in routes))
         self.assertEqual(
             {flow.attrib["route"] for flow in flows},

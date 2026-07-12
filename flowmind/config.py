@@ -157,7 +157,7 @@ class RunConfig:
     mode: str
     duration: int = 900
     seed: int = 42
-    zone_size: int = 6
+    zone_size: int = 20
     gui: bool = False
     gui_delay_ms: int = 50
     websocket_port: int = 8765

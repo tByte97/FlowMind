@@ -56,7 +56,7 @@ class SumoTlsSafetyAdapterTest(unittest.TestCase):
         ).load_catalog(tls_ids)
 
         self.assertEqual(catalog.source.split(":", 1)[0], "sumo")
-        self.assertEqual(len(catalog.intersections), 6)
+        self.assertEqual(len(catalog.intersections), 20)
         self.assertTrue(all(item.movements for item in catalog.intersections))
         self.assertTrue(all(item.conflicts for item in catalog.intersections))
         self.assertTrue(all(item.plans for item in catalog.intersections))

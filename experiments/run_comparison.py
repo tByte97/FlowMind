@@ -20,7 +20,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run all FlowMind control modes")
     parser.add_argument("--duration", type=int, default=900)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--zone-size", type=int, default=6)
+    parser.add_argument("--zone-size", type=int, default=20)
     parser.add_argument(
         "--sensor-range",
         type=float,

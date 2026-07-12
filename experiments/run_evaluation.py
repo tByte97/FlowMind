@@ -58,7 +58,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--replicates", type=int, default=DEFAULT_MIN_PAIRS)
     parser.add_argument("--duration", type=int, default=1800)
     parser.add_argument("--seed-start", type=int, default=42)
-    parser.add_argument("--zone-size", type=int, default=6)
+    parser.add_argument("--zone-size", type=int, default=20)
     parser.add_argument(
         "--sensor-range",
         type=float,

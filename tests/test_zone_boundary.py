@@ -73,6 +73,109 @@ class ZoneBoundaryTest(unittest.TestCase):
         self.assertEqual(boundary.outgoing_edge_ids, ("exit",))
         self.assertTrue(boundary.valid)
 
+    def test_all_segment_path_lanes_are_internal(self) -> None:
+        area = AreaModel(
+            (
+                Intersection(
+                    "A",
+                    (0.0, 0.0),
+                    ("G",),
+                    (
+                        ControlledLink("entry_0", "path_0", 0),
+                        ControlledLink("path_0", "exit_0", 1),
+                    ),
+                ),
+            )
+        )
+        zone = ZoneDefinition(
+            "zone",
+            "Zone",
+            (
+                ZoneIntersection("A", "A", ("loop",)),
+                ZoneIntersection("B", "B", ("loop",)),
+            ),
+            (Corridor("loop", ("A", "B")),),
+        )
+        graph = AreaGraph(
+            zone,
+            (
+                RoadSegment(
+                    "A>B",
+                    "loop",
+                    "A",
+                    "B",
+                    ("path",),
+                    ("path_0",),
+                    ("path_0",),
+                    ("path_0",),
+                    100.0,
+                    10.0,
+                ),
+            ),
+            (
+                IntersectionStorage("A", ("entry_0",), 10.0),
+                IntersectionStorage("B", ("path_0",), 10.0),
+            ),
+        )
+
+        boundary = build_zone_boundary(area, graph)
+
+        self.assertEqual(boundary.incoming_edge_ids, ("entry",))
+        self.assertEqual(boundary.outgoing_edge_ids, ("exit",))
+
+    def test_edge_shared_by_two_controlled_tls_is_internal(self) -> None:
+        area = AreaModel(
+            (
+                Intersection(
+                    "A",
+                    (0.0, 0.0),
+                    ("G",),
+                    (ControlledLink("entry_0", "shared_0", 0),),
+                ),
+                Intersection(
+                    "B",
+                    (1.0, 0.0),
+                    ("G",),
+                    (ControlledLink("shared_1", "exit_0", 0),),
+                ),
+            )
+        )
+        zone = ZoneDefinition(
+            "zone",
+            "Zone",
+            (
+                ZoneIntersection("A", "A", ("main",)),
+                ZoneIntersection("B", "B", ("main",)),
+            ),
+            (Corridor("main", ("A", "B")),),
+        )
+        graph = AreaGraph(
+            zone,
+            (
+                RoadSegment(
+                    "A>B",
+                    "main",
+                    "A",
+                    "B",
+                    ("other",),
+                    ("other_0",),
+                    ("other_0",),
+                    ("other_0",),
+                    100.0,
+                    10.0,
+                ),
+            ),
+            (
+                IntersectionStorage("A", ("entry_0",), 10.0),
+                IntersectionStorage("B", ("shared_1",), 10.0),
+            ),
+        )
+
+        boundary = build_zone_boundary(area, graph)
+
+        self.assertEqual(boundary.incoming_edge_ids, ("entry",))
+        self.assertEqual(boundary.outgoing_edge_ids, ("exit",))
+
 
 if __name__ == "__main__":
     unittest.main()
