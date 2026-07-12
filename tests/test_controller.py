@@ -5,6 +5,7 @@ import unittest
 from flowmind.area_model import AreaModel, ControlledLink, Intersection
 from flowmind.config import ControlConfig
 from flowmind.controller import AreaSignalController
+from flowmind.queue_forecast import ForecastDiagnostics
 from flowmind.safety_validator import SafetyDecision
 
 
@@ -70,6 +71,15 @@ class FakeTraci:
         self.lane = FakeLaneDomain()
         self.vehicle = FakeVehicleDomain()
         self.trafficlight = FakeTrafficLightDomain()
+
+
+class FakeQueueForecast:
+    def __init__(self, diagnostics: ForecastDiagnostics) -> None:
+        self.last_diagnostics = diagnostics
+        self.evaluation_horizon_seconds = 3
+
+    def predict_intersection(self, **_kwargs: object) -> dict[tuple[int, int], float]:
+        return {(0, 0): 1.0, (2, 1): 9.0}
 
 
 class AreaSignalControllerTest(unittest.TestCase):
@@ -246,6 +256,60 @@ class AreaSignalControllerTest(unittest.TestCase):
         self.assertEqual(
             controller.stats.decision_events[-1].title,
             "Safety відхилив команду",
+        )
+
+    def test_ml_shadow_predictions_are_measured_but_not_used(self) -> None:
+        traci = FakeTraci()
+        forecast = FakeQueueForecast(
+            ForecastDiagnostics("current_policy", 1.0, False, (), True)
+        )
+        controller = AreaSignalController(
+            traci,
+            self.area(),
+            "flowmind",
+            ControlConfig(queue_forecast_shadow_mode=True),
+            queue_forecast=forecast,  # type: ignore[arg-type]
+        )
+
+        controller.step(12.0)
+        controller.step(15.0)
+
+        self.assertEqual(controller.stats.queue_forecast_predictions, 2)
+        self.assertEqual(controller.stats.queue_forecast_shadow_predictions, 2)
+        self.assertEqual(controller.stats.queue_forecast_control_predictions, 0)
+        self.assertEqual(controller.stats.queue_forecast_shadow_evaluations, 1)
+        self.assertEqual(controller.stats.queue_forecast_shadow_mae, 1.0)
+        sample = controller.stats.queue_forecast_samples[0]
+        self.assertFalse(sample.used_for_control)
+        self.assertEqual(sample.observed_mean, 5.0)
+        self.assertEqual(sample.mean_absolute_error, 1.0)
+
+    def test_ood_forecast_is_gated_even_when_shadow_mode_is_disabled(self) -> None:
+        traci = FakeTraci()
+        forecast = FakeQueueForecast(
+            ForecastDiagnostics(
+                "current_policy",
+                0.4,
+                True,
+                ("unseen_lane",),
+                False,
+            )
+        )
+        controller = AreaSignalController(
+            traci,
+            self.area(),
+            "flowmind",
+            ControlConfig(queue_forecast_shadow_mode=False),
+            queue_forecast=forecast,  # type: ignore[arg-type]
+        )
+
+        controller.step(12.0)
+
+        self.assertEqual(controller.stats.queue_forecast_control_predictions, 0)
+        self.assertEqual(controller.stats.queue_forecast_ood_predictions, 2)
+        self.assertEqual(
+            controller.stats.queue_forecast_rejection_reasons,
+            {"unseen_lane": 1, "confidence_below_threshold": 1},
         )
 
 

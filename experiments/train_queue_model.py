@@ -13,7 +13,11 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from flowmind.config import PROJECT_ROOT, ControlConfig
-from flowmind.queue_forecast import stable_hash
+from flowmind.queue_forecast import (
+    dataset_sha256,
+    feature_schema_sha256,
+    file_sha256,
+)
 
 
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/flowmind_matplotlib")
@@ -65,28 +69,16 @@ NUMERIC_FEATURES = (
     "outgoing_mean_speed",
     "outgoing_free_slots",
     "downstream_blocked",
-    "movement_hash",
-    "incoming_lane_hash",
-    "outgoing_lane_hash",
 )
 
 CATEGORICAL_FEATURES = (
     "mode",
     "tls_id",
-    "signal_state",
-    "phase_state",
-)
-
-HASH_SOURCE_COLUMNS = (
     "movement_id",
     "incoming_lane",
     "outgoing_lane",
-)
-
-CSV_NUMERIC_FEATURES = tuple(
-    feature
-    for feature in NUMERIC_FEATURES
-    if feature not in {"movement_hash", "incoming_lane_hash", "outgoing_lane_hash"}
+    "signal_state",
+    "phase_state",
 )
 
 DEFAULT_CONTROL = ControlConfig()
@@ -163,6 +155,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--metadata-output",
         type=Path,
         help="Defaults to <output stem>_metadata.json.",
+    )
+    parser.add_argument(
+        "--network",
+        type=Path,
+        default=PROJECT_ROOT / "simulation" / "rivne_area" / "osm.net.xml.gz",
+        help="Network used by the training/demo scenario (stored by SHA-256).",
     )
     parser.add_argument("--max-files", type=int)
     parser.add_argument("--max-rows", type=int)
@@ -263,10 +261,16 @@ def main() -> None:
         f"{args.output.stem}_metadata.json"
     )
     metadata = {
+        "artifact_format_version": 2,
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "model_type": args.model_type,
+        "forecast_contract": "current_policy",
         "target": args.target,
         "dataset_dir": str(args.dataset_dir),
+        "dataset_sha256": dataset_sha256(sample_paths),
+        "dataset_files": [path.name for path in sample_paths],
+        "network_path": str(args.network),
+        "network_sha256": file_sha256(args.network),
         "sample_file_count": len(sample_paths),
         "row_count": int(len(df)),
         "rows_per_file": rows_per_file,
@@ -274,6 +278,26 @@ def main() -> None:
         "feature_columns": feature_columns,
         "numeric_features": list(NUMERIC_FEATURES),
         "categorical_features": list(CATEGORICAL_FEATURES),
+        "feature_schema_sha256": feature_schema_sha256(
+            feature_columns,
+            NUMERIC_FEATURES,
+            CATEGORICAL_FEATURES,
+            "current_policy",
+        ),
+        "feature_ranges": numeric_feature_ranges(train_df),
+        "known_tls_ids": sorted(
+            str(value) for value in train_df["tls_id"].dropna().unique()
+        ),
+        "known_lane_ids": sorted(
+            {
+                str(value)
+                for column in ("incoming_lane", "outgoing_lane")
+                for value in train_df[column].dropna().unique()
+            }
+        ),
+        "training_modes": sorted(
+            str(value) for value in train_df["mode"].dropna().unique()
+        ),
         "dropped_columns": list(DROP_COLUMNS),
         "train_seeds": train_seeds,
         "validation_seeds": valid_seeds,
@@ -287,6 +311,7 @@ def main() -> None:
     }
 
     dependencies["joblib"].dump(artifact, args.output)
+    metadata["artifact_sha256"] = file_sha256(args.output)
     metadata_path.write_text(
         json.dumps(metadata, ensure_ascii=False, indent=2),
         encoding="utf-8",
@@ -371,8 +396,8 @@ def load_dataset(
         raise SystemExit("--rows-per-file must be positive unless --full-dataset is used.")
 
     frames = []
-    use_columns = set(CSV_NUMERIC_FEATURES) | set(CATEGORICAL_FEATURES)
-    use_columns |= set(HASH_SOURCE_COLUMNS) | {target, "seed"}
+    use_columns = set(NUMERIC_FEATURES) | set(CATEGORICAL_FEATURES)
+    use_columns |= {target, "seed"}
     for index, path in enumerate(sample_paths, start=1):
         frame = pd.read_csv(
             path,
@@ -389,7 +414,7 @@ def load_dataset(
                 n=rows_per_file,
                 random_state=random_state + index,
             )
-        frames.append(add_hash_features(frame))
+        frames.append(frame)
         if index % 25 == 0 or index == len(sample_paths):
             loaded_rows = sum(len(item) for item in frames)
             print(
@@ -401,14 +426,6 @@ def load_dataset(
     if max_rows is not None and len(df) > max_rows:
         df = df.sample(n=max_rows, random_state=random_state)
     return df.reset_index(drop=True)
-
-
-def add_hash_features(df: Any) -> Any:
-    df = df.copy()
-    df["movement_hash"] = df["movement_id"].map(stable_hash)
-    df["incoming_lane_hash"] = df["incoming_lane"].map(stable_hash)
-    df["outgoing_lane_hash"] = df["outgoing_lane"].map(stable_hash)
-    return df
 
 
 def add_optional_feature_defaults(df: Any) -> Any:
@@ -570,6 +587,19 @@ def feature_importances(pipeline: Any, limit: int) -> list[dict[str, Any]]:
         {"feature": str(name), "importance": float(importance)}
         for name, importance in pairs[:limit]
     ]
+
+
+def numeric_feature_ranges(df: Any) -> dict[str, list[float]]:
+    ranges: dict[str, list[float]] = {}
+    for feature in NUMERIC_FEATURES:
+        values = df[feature].dropna()
+        if values.empty:
+            continue
+        minimum = float(values.min())
+        maximum = float(values.max())
+        if math.isfinite(minimum) and math.isfinite(maximum):
+            ranges[feature] = [minimum, maximum]
+    return ranges
 
 
 def print_dataset_report(

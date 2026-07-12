@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import os
 import re
@@ -29,6 +30,20 @@ class QueueForecastStats:
     model_count: int = 1
     horizons: str = ""
     horizon_weights: str = ""
+    forecast_contract: str = "current_policy"
+    artifact_sha256: str = ""
+    dataset_sha256: str = ""
+    network_sha256: str = ""
+    feature_schema_sha256: str = ""
+
+
+@dataclass(frozen=True)
+class ForecastDiagnostics:
+    forecast_contract: str
+    confidence: float
+    ood: bool
+    reasons: tuple[str, ...]
+    influence_allowed: bool
 
 
 class QueueForecastModel:
@@ -55,6 +70,47 @@ class QueueForecastModel:
             raise ValueError("Queue forecast artifact does not expose feature_columns")
         self._target = str(metadata.get("target", "target_incoming_queue_60s"))
         self._horizon_seconds = horizon_from_target(self._target)
+        self._forecast_contract = str(
+            metadata.get("forecast_contract", "current_policy")
+        )
+        if self._forecast_contract not in {"current_policy", "counterfactual"}:
+            raise ValueError(
+                f"Unsupported queue forecast contract: {self._forecast_contract}"
+            )
+        self._known_tls_ids = frozenset(
+            str(value) for value in metadata.get("known_tls_ids", ())
+        )
+        self._known_lane_ids = frozenset(
+            str(value) for value in metadata.get("known_lane_ids", ())
+        )
+        ranges = metadata.get("feature_ranges", {})
+        self._feature_ranges = ranges if isinstance(ranges, dict) else {}
+        self._artifact_sha256 = _file_sha256(model_path)
+        self._declared_artifact_sha256 = str(metadata.get("artifact_sha256", ""))
+        self._dataset_sha256 = str(metadata.get("dataset_sha256", ""))
+        self._network_sha256 = str(metadata.get("network_sha256", ""))
+        self._feature_schema_sha256 = str(
+            metadata.get("feature_schema_sha256", "")
+        )
+        self._computed_feature_schema_sha256 = feature_schema_sha256(
+            self._feature_columns,
+            tuple(str(value) for value in metadata.get("numeric_features", ())),
+            tuple(
+                str(value) for value in metadata.get("categorical_features", ())
+            ),
+            self._forecast_contract,
+        )
+        self._legacy_hash_schema = any(
+            column in self._feature_columns
+            for column in ("movement_hash", "incoming_lane_hash", "outgoing_lane_hash")
+        )
+        self._last_diagnostics = ForecastDiagnostics(
+            forecast_contract=self._forecast_contract,
+            confidence=0.0,
+            ood=True,
+            reasons=("not_evaluated",),
+            influence_allowed=False,
+        )
 
     @classmethod
     def load(cls, model_path: Path) -> QueueForecastModel:
@@ -72,6 +128,13 @@ class QueueForecastModel:
             raise ValueError(f"Queue forecast artifact has no pipeline: {model_path}")
         if not isinstance(metadata, dict):
             metadata = {}
+        sidecar_path = model_path.with_name(f"{model_path.stem}_metadata.json")
+        try:
+            sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            sidecar = {}
+        if isinstance(sidecar, dict):
+            metadata = {**metadata, **sidecar}
         return cls(pipeline, pd.DataFrame, model_path, metadata)
 
     @property
@@ -81,11 +144,24 @@ class QueueForecastModel:
             target=self._target,
             feature_count=len(self._feature_columns),
             horizons=(str(self._horizon_seconds) if self._horizon_seconds else ""),
+            forecast_contract=self._forecast_contract,
+            artifact_sha256=self._artifact_sha256,
+            dataset_sha256=self._dataset_sha256,
+            network_sha256=self._network_sha256,
+            feature_schema_sha256=self._feature_schema_sha256,
         )
 
     @property
     def horizon_seconds(self) -> int | None:
         return self._horizon_seconds
+
+    @property
+    def evaluation_horizon_seconds(self) -> int:
+        return self._horizon_seconds or 0
+
+    @property
+    def last_diagnostics(self) -> ForecastDiagnostics:
+        return self._last_diagnostics
 
     def predict_intersection(
         self,
@@ -99,15 +175,32 @@ class QueueForecastModel:
         control: ControlConfig,
         sample_interval: int,
     ) -> dict[tuple[int, int], float]:
+        if not 0 <= current_phase < len(intersection.phases):
+            self._last_diagnostics = ForecastDiagnostics(
+                self._forecast_contract,
+                0.0,
+                True,
+                ("current_phase_out_of_range",),
+                False,
+            )
+            return {}
+        current_state = intersection.phases[current_phase]
         rows: list[dict[str, Any]] = []
-        keys: list[tuple[int, int]] = []
-        for phase_index in intersection.green_phase_indices:
-            phase_state = intersection.phases[phase_index]
+        row_keys: list[tuple[tuple[int, int], ...]] = []
+        if self._forecast_contract == "current_policy":
             for link_index, link in enumerate(intersection.links):
-                if link.signal_index >= len(phase_state):
-                    continue
-                signal_state = phase_state[link.signal_index]
-                if signal_state not in "Gg":
+                signal_state = (
+                    current_state[link.signal_index]
+                    if link.signal_index < len(current_state)
+                    else ""
+                )
+                candidate_keys = tuple(
+                    (phase_index, link_index)
+                    for phase_index in intersection.green_phase_indices
+                    if link.signal_index < len(intersection.phases[phase_index])
+                    and intersection.phases[phase_index][link.signal_index] in "Gg"
+                )
+                if not candidate_keys:
                     continue
                 rows.append(
                     self._feature_row(
@@ -116,17 +209,46 @@ class QueueForecastModel:
                         intersection=intersection,
                         link=link,
                         signal_state=signal_state,
-                        phase_index=phase_index,
-                        phase_state=phase_state,
-                        phase_elapsed=(
-                            phase_elapsed if phase_index == current_phase else 0.0
-                        ),
+                        current_phase=current_phase,
+                        phase_state=current_state,
+                        phase_elapsed=phase_elapsed,
+                        candidate_phase=None,
                         state=state,
                         control=control,
                         sample_interval=sample_interval,
                     )
                 )
-                keys.append((phase_index, link_index))
+                row_keys.append(candidate_keys)
+        else:
+            for phase_index in intersection.green_phase_indices:
+                candidate_state = intersection.phases[phase_index]
+                for link_index, link in enumerate(intersection.links):
+                    if link.signal_index >= len(candidate_state):
+                        continue
+                    if candidate_state[link.signal_index] not in "Gg":
+                        continue
+                    signal_state = (
+                        current_state[link.signal_index]
+                        if link.signal_index < len(current_state)
+                        else ""
+                    )
+                    rows.append(
+                        self._feature_row(
+                            mode=mode,
+                            simulation_time=simulation_time,
+                            intersection=intersection,
+                            link=link,
+                            signal_state=signal_state,
+                            current_phase=current_phase,
+                            phase_state=current_state,
+                            phase_elapsed=phase_elapsed,
+                            candidate_phase=phase_index,
+                            state=state,
+                            control=control,
+                            sample_interval=sample_interval,
+                        )
+                    )
+                    row_keys.append(((phase_index, link_index),))
 
         if not rows:
             return {}
@@ -134,10 +256,21 @@ class QueueForecastModel:
         frame = self._dataframe_factory(rows)
         frame = frame.reindex(columns=self._feature_columns, fill_value=0)
         predictions = self._pipeline.predict(frame)
-        return {
-            key: sanitized_prediction(prediction)
-            for key, prediction in zip(keys, predictions, strict=False)
-        }
+        diagnostics = self._diagnostics(intersection, rows)
+        self._last_diagnostics = diagnostics
+        result: dict[tuple[int, int], float] = {}
+        for keys, prediction in zip(row_keys, predictions, strict=False):
+            link_index = keys[0][1]
+            incoming = state.lane(intersection.links[link_index].incoming_lane)
+            capacity = max(
+                float(incoming.vehicle_count) + float(incoming.free_slots),
+                float(incoming.queue),
+                1.0,
+            )
+            bounded = sanitized_prediction(prediction, upper_bound=capacity)
+            for key in keys:
+                result[key] = bounded
+        return result
 
     def _feature_row(
         self,
@@ -147,9 +280,10 @@ class QueueForecastModel:
         intersection: Intersection,
         link: ControlledLink,
         signal_state: str,
-        phase_index: int,
+        current_phase: int,
         phase_state: str,
         phase_elapsed: float,
+        candidate_phase: int | None,
         state: TrafficState,
         control: ControlConfig,
         sample_interval: int,
@@ -184,13 +318,19 @@ class QueueForecastModel:
             "clearance_seconds": control.clearance_seconds,
             "time": int(simulation_time),
             "tls_id": intersection.tls_id,
+            "movement_id": movement_id,
+            "incoming_lane": link.incoming_lane,
+            "outgoing_lane": link.outgoing_lane,
             "movement_hash": stable_hash(movement_id),
             "incoming_lane_hash": stable_hash(link.incoming_lane),
             "outgoing_lane_hash": stable_hash(link.outgoing_lane),
             "signal_index": link.signal_index,
             "signal_state": signal_state,
             "is_green": int(signal_state in "Gg"),
-            "current_phase": phase_index,
+            "current_phase": current_phase,
+            "candidate_phase": (
+                candidate_phase if candidate_phase is not None else current_phase
+            ),
             "phase_state": phase_state,
             "phase_elapsed": round(phase_elapsed, 3),
             "phase_count": len(intersection.phases),
@@ -207,6 +347,67 @@ class QueueForecastModel:
             "downstream_blocked": int(outgoing.occupancy >= control.blocked_occupancy),
         }
 
+    def _diagnostics(
+        self,
+        intersection: Intersection,
+        rows: list[dict[str, Any]],
+    ) -> ForecastDiagnostics:
+        reasons: list[str] = []
+        if not self._known_tls_ids or not self._known_lane_ids:
+            reasons.append("artifact_training_domain_missing")
+        else:
+            if intersection.tls_id not in self._known_tls_ids:
+                reasons.append("unseen_tls")
+            lanes = {
+                lane_id
+                for link in intersection.links
+                for lane_id in (link.incoming_lane, link.outgoing_lane)
+            }
+            if not lanes.issubset(self._known_lane_ids):
+                reasons.append("unseen_lane")
+        if not self._feature_ranges:
+            reasons.append("feature_ranges_missing")
+        else:
+            for row in rows:
+                for feature, bounds in self._feature_ranges.items():
+                    if feature not in row or not isinstance(bounds, (list, tuple)):
+                        continue
+                    if len(bounds) != 2:
+                        continue
+                    try:
+                        value = float(row[feature])
+                        minimum = float(bounds[0])
+                        maximum = float(bounds[1])
+                    except (TypeError, ValueError):
+                        continue
+                    if value < minimum or value > maximum:
+                        reasons.append(f"feature_out_of_range:{feature}")
+                        break
+        if self._legacy_hash_schema:
+            reasons.append("legacy_numeric_hash_schema")
+        if not self._dataset_sha256:
+            reasons.append("dataset_hash_missing")
+        if not self._network_sha256:
+            reasons.append("network_hash_missing")
+        if not self._feature_schema_sha256:
+            reasons.append("feature_schema_hash_missing")
+        elif self._feature_schema_sha256 != self._computed_feature_schema_sha256:
+            reasons.append("feature_schema_hash_mismatch")
+        if not self._declared_artifact_sha256:
+            reasons.append("artifact_hash_missing")
+        elif self._artifact_sha256 and self._declared_artifact_sha256 != self._artifact_sha256:
+            reasons.append("artifact_hash_mismatch")
+        unique_reasons = tuple(dict.fromkeys(reasons))
+        confidence = max(0.0, 1.0 - 0.2 * len(unique_reasons))
+        ood = bool(unique_reasons)
+        return ForecastDiagnostics(
+            forecast_contract=self._forecast_contract,
+            confidence=confidence,
+            ood=ood,
+            reasons=unique_reasons,
+            influence_allowed=not ood,
+        )
+
 
 class QueueForecastEnsemble:
     """Blend multiple horizon-specific queue forecasts into one score signal."""
@@ -218,6 +419,9 @@ class QueueForecastEnsemble:
         if not weighted_models:
             raise ValueError("QueueForecastEnsemble needs at least one model")
         self._weighted_models = weighted_models
+        self._last_diagnostics = ForecastDiagnostics(
+            "current_policy", 0.0, True, ("not_evaluated",), False
+        )
 
     @property
     def stats(self) -> QueueForecastStats:
@@ -238,6 +442,36 @@ class QueueForecastEnsemble:
                 horizon_weight_label(model.horizon_seconds, weight)
                 for model, weight in self._weighted_models
             ),
+            forecast_contract=";".join(
+                sorted({model.stats.forecast_contract for model in models})
+            ),
+            artifact_sha256=";".join(model.stats.artifact_sha256 for model in models),
+            dataset_sha256=";".join(model.stats.dataset_sha256 for model in models),
+            network_sha256=";".join(model.stats.network_sha256 for model in models),
+            feature_schema_sha256=";".join(
+                model.stats.feature_schema_sha256 for model in models
+            ),
+        )
+
+    @property
+    def last_diagnostics(self) -> ForecastDiagnostics:
+        return self._last_diagnostics
+
+    @property
+    def evaluation_horizon_seconds(self) -> int:
+        weighted = tuple(
+            (model.horizon_seconds, weight)
+            for model, weight in self._weighted_models
+            if model.horizon_seconds is not None and weight > 0.0
+        )
+        total_weight = sum(weight for _horizon, weight in weighted)
+        if not weighted or total_weight <= 0.0:
+            return 0
+        return int(
+            round(
+                sum(float(horizon) * weight for horizon, weight in weighted)
+                / total_weight
+            )
         )
 
     def predict_intersection(
@@ -270,6 +504,22 @@ class QueueForecastEnsemble:
             for key, prediction in predictions.items():
                 totals[key] = totals.get(key, 0.0) + prediction * weight
                 weights[key] = weights.get(key, 0.0) + weight
+        diagnostics = tuple(
+            model.last_diagnostics for model, weight in self._weighted_models if weight > 0
+        )
+        reasons = tuple(
+            dict.fromkeys(reason for item in diagnostics for reason in item.reasons)
+        )
+        self._last_diagnostics = ForecastDiagnostics(
+            forecast_contract=";".join(
+                sorted({item.forecast_contract for item in diagnostics})
+            ),
+            confidence=min((item.confidence for item in diagnostics), default=0.0),
+            ood=any(item.ood for item in diagnostics),
+            reasons=reasons,
+            influence_allowed=bool(diagnostics)
+            and all(item.influence_allowed for item in diagnostics),
+        )
         return {
             key: value / weights[key]
             for key, value in totals.items()
@@ -311,11 +561,69 @@ def stable_hash(value: object) -> int:
     return int.from_bytes(digest, "little", signed=False)
 
 
-def sanitized_prediction(value: object) -> float:
+def sanitized_prediction(value: object, upper_bound: float | None = None) -> float:
     prediction = float(value)
     if not math.isfinite(prediction):
         return 0.0
-    return max(prediction, 0.0)
+    prediction = max(prediction, 0.0)
+    if upper_bound is not None:
+        prediction = min(prediction, max(float(upper_bound), 0.0))
+    return prediction
+
+
+def _file_sha256(path: Path) -> str:
+    try:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except OSError:
+        return ""
+
+
+def file_sha256(path: Path) -> str:
+    """Return a reproducible content hash for an artifact or network file."""
+
+    return _file_sha256(path)
+
+
+def dataset_sha256(paths: list[Path] | tuple[Path, ...]) -> str:
+    """Hash dataset contents and stable relative names, independent of ordering."""
+
+    digest = hashlib.sha256()
+    for path in sorted(paths, key=lambda item: item.as_posix()):
+        digest.update(path.name.encode("utf-8"))
+        digest.update(b"\0")
+        try:
+            with path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+        except OSError:
+            return ""
+        digest.update(b"\0")
+    return digest.hexdigest() if paths else ""
+
+
+def feature_schema_sha256(
+    feature_columns: tuple[str, ...] | list[str],
+    numeric_features: tuple[str, ...] | list[str],
+    categorical_features: tuple[str, ...] | list[str],
+    forecast_contract: str,
+) -> str:
+    payload = {
+        "forecast_contract": forecast_contract,
+        "feature_columns": list(feature_columns),
+        "numeric_features": list(numeric_features),
+        "categorical_features": list(categorical_features),
+    }
+    canonical = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def horizon_from_target(target: str) -> int | None:

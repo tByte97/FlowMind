@@ -33,6 +33,23 @@ class QueueForecastSample:
     min_prediction: float
     mean_prediction: float
     max_prediction: float
+    horizon_seconds: int
+    evaluation_time: float
+    forecast_contract: str
+    confidence: float
+    ood: bool
+    diagnostic_reasons: str
+    shadow: bool
+    used_for_control: bool
+    observed_time: float | None = None
+    observed_mean: float | None = None
+    mean_absolute_error: float | None = None
+
+
+@dataclass
+class PendingQueueForecast:
+    sample: QueueForecastSample
+    lane_predictions: tuple[tuple[str, float], ...]
 
 
 @dataclass(frozen=True)
@@ -57,6 +74,12 @@ class ControllerStats:
     scoreless_skips: int = 0
     queue_forecast_predictions: int = 0
     queue_forecast_failures: int = 0
+    queue_forecast_shadow_predictions: int = 0
+    queue_forecast_control_predictions: int = 0
+    queue_forecast_ood_predictions: int = 0
+    queue_forecast_shadow_evaluations: int = 0
+    queue_forecast_shadow_absolute_error: float = 0.0
+    queue_forecast_rejection_reasons: dict[str, int] = field(default_factory=dict)
     sensor_failures: int = 0
     stale_lane_samples: int = 0
     invalid_state_skips: int = 0
@@ -65,6 +88,15 @@ class ControllerStats:
     safety_rejection_reasons: dict[str, int] = field(default_factory=dict)
     queue_forecast_samples: list[QueueForecastSample] = field(default_factory=list)
     decision_events: list[DecisionEvent] = field(default_factory=list)
+
+    @property
+    def queue_forecast_shadow_mae(self) -> float | None:
+        if self.queue_forecast_shadow_evaluations <= 0:
+            return None
+        return (
+            self.queue_forecast_shadow_absolute_error
+            / self.queue_forecast_shadow_evaluations
+        )
 
 
 class AreaSignalController:
@@ -107,6 +139,7 @@ class AreaSignalController:
         self._lane_demand_started_at: dict[str, float] = {}
         self._next_decision_at = float(config.decision_interval)
         self._fallback_active = False
+        self._pending_queue_forecasts: list[PendingQueueForecast] = []
         self.stats = ControllerStats()
 
     def set_corridor_manager(self, manager: object) -> None:
@@ -132,6 +165,7 @@ class AreaSignalController:
                 "FlowMind повернувся з перевіреного TLS fallback до адаптивного керування.",
                 "success",
             )
+        self._resolve_pending_queue_forecasts(traffic, simulation_time)
         demand_wait_by_lane = self._update_demand_timers(
             traffic,
             simulation_time,
@@ -165,10 +199,10 @@ class AreaSignalController:
                 continue
 
             priority_link = overrides.get(tls_id)
-            queue_forecast = {}
+            queue_forecast: dict[tuple[int, int], float] = {}
             if self._queue_forecast is not None:
                 try:
-                    queue_forecast = self._queue_forecast.predict_intersection(
+                    raw_forecast = self._queue_forecast.predict_intersection(
                         mode=self._mode,
                         simulation_time=simulation_time,
                         intersection=intersection,
@@ -178,18 +212,44 @@ class AreaSignalController:
                         control=self._config,
                         sample_interval=self._queue_forecast_sample_interval,
                     )
-                    self.stats.queue_forecast_predictions += len(queue_forecast)
-                    if queue_forecast:
-                        values = tuple(queue_forecast.values())
-                        self.stats.queue_forecast_samples.append(
-                            QueueForecastSample(
-                                time=round(simulation_time, 3),
-                                tls_id=tls_id,
-                                candidates=len(values),
-                                min_prediction=round(min(values), 5),
-                                mean_prediction=round(sum(values) / len(values), 5),
-                                max_prediction=round(max(values), 5),
-                            )
+                    diagnostics = self._queue_forecast.last_diagnostics
+                    count = len(raw_forecast)
+                    self.stats.queue_forecast_predictions += count
+                    if diagnostics.ood:
+                        self.stats.queue_forecast_ood_predictions += count
+                    influence_allowed = (
+                        not self._config.queue_forecast_shadow_mode
+                        and diagnostics.influence_allowed
+                        and diagnostics.confidence
+                        >= self._config.queue_forecast_min_confidence
+                    )
+                    rejection_reasons = list(diagnostics.reasons)
+                    if (
+                        diagnostics.confidence
+                        < self._config.queue_forecast_min_confidence
+                    ):
+                        rejection_reasons.append("confidence_below_threshold")
+                    if self._config.queue_forecast_shadow_mode:
+                        self.stats.queue_forecast_shadow_predictions += count
+                    elif influence_allowed:
+                        self.stats.queue_forecast_control_predictions += count
+                    for reason in dict.fromkeys(rejection_reasons):
+                        self.stats.queue_forecast_rejection_reasons[reason] = (
+                            self.stats.queue_forecast_rejection_reasons.get(reason, 0)
+                            + 1
+                        )
+                    if influence_allowed:
+                        queue_forecast = raw_forecast
+                    if raw_forecast:
+                        self._record_queue_forecast(
+                            simulation_time,
+                            intersection,
+                            raw_forecast,
+                            diagnostics.forecast_contract,
+                            diagnostics.confidence,
+                            diagnostics.ood,
+                            tuple(dict.fromkeys(rejection_reasons)),
+                            influence_allowed,
                         )
                 except Exception:
                     self.stats.queue_forecast_failures += 1
@@ -218,6 +278,85 @@ class AreaSignalController:
 
         for decision in prepared:
             self._apply_prepared_decision(decision, simulation_time)
+
+    def _record_queue_forecast(
+        self,
+        simulation_time: float,
+        intersection: Intersection,
+        predictions: dict[tuple[int, int], float],
+        forecast_contract: str,
+        confidence: float,
+        ood: bool,
+        reasons: tuple[str, ...],
+        used_for_control: bool,
+    ) -> None:
+        by_link: dict[int, float] = {}
+        for (_phase_index, link_index), prediction in predictions.items():
+            by_link.setdefault(link_index, prediction)
+        lane_predictions = tuple(
+            (intersection.links[link_index].incoming_lane, prediction)
+            for link_index, prediction in by_link.items()
+            if 0 <= link_index < len(intersection.links)
+        )
+        if not lane_predictions:
+            return
+        values = tuple(prediction for _lane_id, prediction in lane_predictions)
+        horizon = self._queue_forecast.evaluation_horizon_seconds
+        sample = QueueForecastSample(
+            time=round(simulation_time, 3),
+            tls_id=intersection.tls_id,
+            candidates=len(values),
+            min_prediction=round(min(values), 5),
+            mean_prediction=round(sum(values) / len(values), 5),
+            max_prediction=round(max(values), 5),
+            horizon_seconds=horizon,
+            evaluation_time=round(simulation_time + horizon, 3),
+            forecast_contract=forecast_contract,
+            confidence=round(confidence, 5),
+            ood=ood,
+            diagnostic_reasons=";".join(reasons),
+            shadow=self._config.queue_forecast_shadow_mode,
+            used_for_control=used_for_control,
+        )
+        self.stats.queue_forecast_samples.append(sample)
+        self._pending_queue_forecasts.append(
+            PendingQueueForecast(sample, lane_predictions)
+        )
+
+    def _resolve_pending_queue_forecasts(
+        self,
+        traffic: TrafficState,
+        simulation_time: float,
+    ) -> None:
+        pending: list[PendingQueueForecast] = []
+        for item in self._pending_queue_forecasts:
+            if simulation_time + 1e-9 < item.sample.evaluation_time:
+                pending.append(item)
+                continue
+            observations = tuple(
+                (
+                    float(traffic.lane(lane_id).queue),
+                    float(prediction),
+                )
+                for lane_id, prediction in item.lane_predictions
+                if traffic.lane(lane_id).valid
+            )
+            if not observations:
+                pending.append(item)
+                continue
+            actual_mean = sum(actual for actual, _prediction in observations) / len(
+                observations
+            )
+            mae = sum(
+                abs(actual - prediction) for actual, prediction in observations
+            ) / len(observations)
+            item.sample.observed_time = round(simulation_time, 3)
+            item.sample.observed_mean = round(actual_mean, 5)
+            item.sample.mean_absolute_error = round(mae, 5)
+            if item.sample.shadow:
+                self.stats.queue_forecast_shadow_evaluations += 1
+                self.stats.queue_forecast_shadow_absolute_error += mae
+        self._pending_queue_forecasts = pending
 
     def _activate_fallback(
         self,

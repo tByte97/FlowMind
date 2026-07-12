@@ -491,6 +491,27 @@ def run_experiment(config: RunConfig) -> dict[str, object]:
                         controller.stats.queue_forecast_predictions
                     ),
                     "queue_forecast_failures": controller.stats.queue_forecast_failures,
+                    "queue_forecast_shadow_mode": (
+                        config.control.queue_forecast_shadow_mode
+                    ),
+                    "queue_forecast_shadow_predictions": (
+                        controller.stats.queue_forecast_shadow_predictions
+                    ),
+                    "queue_forecast_control_predictions": (
+                        controller.stats.queue_forecast_control_predictions
+                    ),
+                    "queue_forecast_ood_predictions": (
+                        controller.stats.queue_forecast_ood_predictions
+                    ),
+                    "queue_forecast_shadow_evaluations": (
+                        controller.stats.queue_forecast_shadow_evaluations
+                    ),
+                    "queue_forecast_shadow_mae": (
+                        controller.stats.queue_forecast_shadow_mae
+                    ),
+                    "queue_forecast_rejection_reasons": (
+                        controller.stats.queue_forecast_rejection_reasons
+                    ),
                     "queue_forecast_trace_samples": len(
                         controller.stats.queue_forecast_samples
                     ),
@@ -523,6 +544,15 @@ def run_experiment(config: RunConfig) -> dict[str, object]:
                     "queue_forecast_enabled": False,
                     "queue_forecast_predictions": 0,
                     "queue_forecast_failures": 0,
+                    "queue_forecast_shadow_mode": (
+                        config.control.queue_forecast_shadow_mode
+                    ),
+                    "queue_forecast_shadow_predictions": 0,
+                    "queue_forecast_control_predictions": 0,
+                    "queue_forecast_ood_predictions": 0,
+                    "queue_forecast_shadow_evaluations": 0,
+                    "queue_forecast_shadow_mae": None,
+                    "queue_forecast_rejection_reasons": {},
                     "queue_forecast_trace_samples": 0,
                     "sensor_failures": 0,
                     "stale_lane_samples": 0,
@@ -827,6 +857,32 @@ def build_live_system_status(
                 if controller_stats
                 else 0
             ),
+            "shadow_mode": config.control.queue_forecast_shadow_mode,
+            "shadow_predictions": (
+                controller_stats.queue_forecast_shadow_predictions
+                if controller_stats
+                else 0
+            ),
+            "control_predictions": (
+                controller_stats.queue_forecast_control_predictions
+                if controller_stats
+                else 0
+            ),
+            "ood_predictions": (
+                controller_stats.queue_forecast_ood_predictions
+                if controller_stats
+                else 0
+            ),
+            "shadow_evaluations": (
+                controller_stats.queue_forecast_shadow_evaluations
+                if controller_stats
+                else 0
+            ),
+            "shadow_mae": (
+                controller_stats.queue_forecast_shadow_mae
+                if controller_stats
+                else None
+            ),
         },
         "corridor": corridor_summary,
         "metrics": {
@@ -903,6 +959,11 @@ def queue_forecast_summary(stats: QueueForecastStats | None) -> dict[str, object
             "queue_forecast_model_count": 0,
             "queue_forecast_horizons": "",
             "queue_forecast_horizon_weights": "",
+            "queue_forecast_contract": "",
+            "queue_forecast_artifact_sha256": "",
+            "queue_forecast_dataset_sha256": "",
+            "queue_forecast_network_sha256": "",
+            "queue_forecast_feature_schema_sha256": "",
         }
     return {
         "queue_forecast_model": stats.model_path,
@@ -911,6 +972,11 @@ def queue_forecast_summary(stats: QueueForecastStats | None) -> dict[str, object
         "queue_forecast_model_count": stats.model_count,
         "queue_forecast_horizons": stats.horizons,
         "queue_forecast_horizon_weights": stats.horizon_weights,
+        "queue_forecast_contract": stats.forecast_contract,
+        "queue_forecast_artifact_sha256": stats.artifact_sha256,
+        "queue_forecast_dataset_sha256": stats.dataset_sha256,
+        "queue_forecast_network_sha256": stats.network_sha256,
+        "queue_forecast_feature_schema_sha256": stats.feature_schema_sha256,
     }
 
 

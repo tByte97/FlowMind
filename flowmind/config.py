@@ -56,6 +56,8 @@ class ControlConfig:
     spillback_hard_gate_probability: float = 0.85
     area_pressure_weight: float = 0.35
     queue_forecast_weight: float = 0.75
+    queue_forecast_shadow_mode: bool = True
+    queue_forecast_min_confidence: float = 0.70
     empty_approach_penalty: float = 8.0
     empty_phase_penalty: float = 30.0
     congested_queue_threshold: int = 8
@@ -105,6 +107,7 @@ class ControlConfig:
             "congested_occupancy_threshold": (
                 self.congested_occupancy_threshold
             ),
+            "queue_forecast_min_confidence": self.queue_forecast_min_confidence,
         }
         for name, value in probabilities.items():
             if not 0.0 <= float(value) <= 1.0:
