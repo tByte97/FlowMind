@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import json
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from flowmind.tls_safety import (
+    ActivePlanExpectation,
     Movement,
     MovementConflict,
     SignalPhase,
@@ -11,6 +15,7 @@ from flowmind.tls_safety import (
     TlsSafetyDefinition,
     validate_tls_catalog,
 )
+from flowmind.tls_safety_audit import write_tls_safety_startup_audit
 
 
 def definition(
@@ -174,6 +179,58 @@ class TlsSafetyValidationTest(unittest.TestCase):
         self.assertIn(
             "green_during_conflicting_clearance",
             {issue.code for issue in report.issues},
+        )
+
+    def test_runtime_plan_must_match_controller_model(self) -> None:
+        item = definition(
+            (
+                SignalPhase("Gr", 10),
+                SignalPhase("yr", 3),
+                SignalPhase("rG", 10),
+                SignalPhase("ry", 3),
+            )
+        )
+
+        report = validate_tls_catalog(
+            TlsSafetyCatalog((item,), source="controller"),
+            {
+                "I-01": ActivePlanExpectation(
+                    program_id="another-plan",
+                    phase_states=("Gr", "yr", "rG", "ry"),
+                )
+            },
+        )
+
+        self.assertIn(
+            "active_program_mismatch",
+            {issue.code for issue in report.issues},
+        )
+
+    def test_audit_contains_report_and_conflict_matrix(self) -> None:
+        item = definition(
+            (
+                SignalPhase("Gr", 10),
+                SignalPhase("yr", 3),
+                SignalPhase("rG", 10),
+                SignalPhase("ry", 3),
+            )
+        )
+        catalog = TlsSafetyCatalog((item,), source="controller")
+        report = validate_tls_catalog(catalog)
+
+        with TemporaryDirectory() as directory:
+            path = write_tls_safety_startup_audit(
+                Path(directory),
+                "flowmind",
+                catalog,
+                report,
+            )
+            payload = json.loads(path.read_text(encoding="utf-8"))
+
+        self.assertTrue(payload["report"]["valid"])
+        self.assertEqual(
+            payload["catalog"]["intersections"][0]["conflicts"][0]["reason"],
+            "right_of_way_foe",
         )
 
 

@@ -64,6 +64,12 @@ class TlsSafetyCatalog:
     source: str
 
 
+@dataclass(frozen=True)
+class ActivePlanExpectation:
+    program_id: str
+    phase_states: tuple[str, ...]
+
+
 class TlsSafetyDataSource(Protocol):
     """Boundary implemented by SUMO, controller or backend adapters."""
 
@@ -130,7 +136,11 @@ class TlsSafetyReport:
         )
 
 
-def validate_tls_catalog(catalog: TlsSafetyCatalog) -> TlsSafetyReport:
+def validate_tls_catalog(
+    catalog: TlsSafetyCatalog,
+    expected_active_plans: dict[str, ActivePlanExpectation] | None = None,
+) -> TlsSafetyReport:
+    expected_active_plans = expected_active_plans or {}
     issues: list[ValidationIssue] = []
     tls_ids: set[str] = set()
     for definition in catalog.intersections:
@@ -139,7 +149,21 @@ def validate_tls_catalog(catalog: TlsSafetyCatalog) -> TlsSafetyReport:
                 _issue(definition.tls_id, "duplicate_tls", "Duplicate TLS ID")
             )
         tls_ids.add(definition.tls_id)
-        issues.extend(_validate_definition(definition))
+        issues.extend(
+            _validate_definition(
+                definition,
+                expected_active_plans.get(definition.tls_id),
+            )
+        )
+    missing_expected = sorted(set(expected_active_plans) - tls_ids)
+    for tls_id in missing_expected:
+        issues.append(
+            _issue(
+                tls_id,
+                "expected_tls_missing",
+                "Expected TLS is missing from the safety catalog",
+            )
+        )
     return TlsSafetyReport(
         source=catalog.source,
         tls_count=len(catalog.intersections),
@@ -187,6 +211,7 @@ def catalog_payload(catalog: TlsSafetyCatalog) -> dict[str, object]:
 
 def _validate_definition(
     definition: TlsSafetyDefinition,
+    expected_active_plan: ActivePlanExpectation | None = None,
 ) -> list[ValidationIssue]:
     issues: list[ValidationIssue] = []
     tls_id = definition.tls_id
@@ -292,6 +317,29 @@ def _validate_definition(
                 program_id=active_plan.program_id,
             )
         )
+    if expected_active_plan is not None:
+        if definition.active_program_id != expected_active_plan.program_id:
+            issues.append(
+                _issue(
+                    tls_id,
+                    "active_program_mismatch",
+                    f"Runtime active program {definition.active_program_id!r} "
+                    f"does not match controller model "
+                    f"{expected_active_plan.program_id!r}",
+                    program_id=definition.active_program_id,
+                )
+            )
+        elif active_plan is not None:
+            actual_states = tuple(phase.state for phase in active_plan.phases)
+            if actual_states != expected_active_plan.phase_states:
+                issues.append(
+                    _issue(
+                        tls_id,
+                        "active_phase_states_mismatch",
+                        "Runtime active phase states differ from controller model",
+                        program_id=active_plan.program_id,
+                    )
+                )
     return issues
 
 
