@@ -211,6 +211,31 @@ class EmergencyVehicleTest(unittest.TestCase):
             all(width == 9.0 for _, width in traci.polygon.widths)
         )
 
+    def test_scheduled_route_can_be_reassessed_before_departure(self) -> None:
+        traci = FakeTraci()
+        manager = EmergencyVehicleManager(traci, self._config())
+        manager.install()
+
+        changed = manager.replace_scheduled_route(
+            ("start", "alt", "hospital"),
+            route_length=1_500.0,
+            expected_travel_time=100.0,
+            predicted_eta=120.0,
+        )
+
+        self.assertTrue(changed)
+        self.assertIn(
+            (
+                "setRoute",
+                "ambulance",
+                ("start", "alt", "hospital"),
+                {},
+            ),
+            traci.vehicle.calls,
+        )
+        self.assertEqual(manager.details.route_edges, ("start", "alt", "hospital"))
+        self.assertEqual(manager.details.predicted_eta, 120.0)
+
     def test_manager_reports_edges_from_another_map(self) -> None:
         traci = FakeTraci()
         traci.edge = FakeEdge(("other_edge",))

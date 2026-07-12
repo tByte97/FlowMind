@@ -85,6 +85,14 @@ def build_parser(default_mode: str | None = None) -> argparse.ArgumentParser:
         action="store_true",
         help="Disable ML queue forecast and run classic FlowMind scoring.",
     )
+    parser.add_argument(
+        "--enable-queue-control",
+        action="store_true",
+        help=(
+            "Allow in-domain, high-confidence ML predictions to affect control. "
+            "The safe default is shadow-only evaluation."
+        ),
+    )
     parser.set_defaults(default_mode=default_mode)
     return parser
 
@@ -114,7 +122,10 @@ def main(default_mode: str | None = None) -> None:
             tls_ids=tuple(args.tls),
             priority_vehicle=args.priority_vehicle,
             emergency=emergency,
-            control=ControlConfig(sensor_range_meters=args.sensor_range),
+            control=ControlConfig(
+                sensor_range_meters=args.sensor_range,
+                queue_forecast_shadow_mode=not args.enable_queue_control,
+            ),
             queue_model_paths=selected_queue_model_paths(args),
         )
     )

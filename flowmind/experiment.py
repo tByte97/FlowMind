@@ -75,6 +75,7 @@ from .queue_forecast import (
     load_queue_forecast_models,
 )
 from .sumo_tls_adapter import SumoTlsSafetyAdapter
+from .sumo_corridor_adapter import SumoCorridorObservationAdapter
 from .sumo_zone_graph_adapter import SumoZoneGraphAdapter
 from .tls_programs import (
     ActiveTlsProgram,
@@ -165,9 +166,15 @@ def run_experiment(config: RunConfig) -> dict[str, object]:
         emergency_details = None
         emergency_manager = None
         corridor_manager = None
+        corridor_observer = None
+        router = None
+        route_reassessment_done = config.emergency is None
+        emergency_route_changed = False
         alternatives_log = []
         emergency_route_tls: tuple[str, ...] = ()
         emergency_controlled_tls: tuple[str, ...] = ()
+        emergency_rejected_tls: tuple[str, ...] = ()
+        emergency_candidate_safety_audit: Path | None = None
         static_programs: tuple[StaticProgramActivation, ...] = ()
         active_tls_programs: tuple[ActiveTlsProgram, ...] = ()
         tls_program_audit_path: Path | None = None
@@ -198,15 +205,70 @@ def run_experiment(config: RunConfig) -> dict[str, object]:
                 config.emergency.depart_time,
                 num_alternatives=5,
             )
+            for alternative in alternatives_log:
+                alternative["assessment"] = "initial"
             edges = best_route.edge_ids if best_route else None
             emergency_route_tls = best_route.tls_sequence if best_route else ()
             if emergency_route_tls:
                 requested_tls = _merge_tls_ids(area.tls_ids, emergency_route_tls)
-                area = discover_area(
+                candidate_area = discover_area(
                     net_path,
                     requested_tls=requested_tls,
                     strict_requested=False,
                 )
+                if config.mode in ADAPTIVE_CONTROL_MODES:
+                    candidate_expectations = {
+                        intersection.tls_id: ActivePlanExpectation(
+                            program_id=intersection.program_id,
+                            phase_states=intersection.phases,
+                        )
+                        for intersection in candidate_area.intersections
+                    }
+                    candidate_catalog = SumoTlsSafetyAdapter(
+                        net_path,
+                        connection,
+                    ).load_catalog(candidate_area.tls_ids)
+                    candidate_report = validate_tls_catalog(
+                        candidate_catalog,
+                        candidate_expectations,
+                    )
+                    emergency_candidate_safety_audit = (
+                        write_tls_safety_startup_audit(
+                            config.results_dir,
+                            f"{config.mode}_emergency_candidates",
+                            candidate_catalog,
+                            candidate_report,
+                        )
+                    )
+                    base_tls_ids = set(area.tls_ids)
+                    unsafe_added = {
+                        issue.tls_id
+                        for issue in candidate_report.issues
+                        if issue.severity == "error"
+                        and issue.tls_id not in base_tls_ids
+                    }
+                    emergency_rejected_tls = tuple(sorted(unsafe_added))
+                    area = AreaModel(
+                        tuple(
+                            intersection
+                            for intersection in candidate_area.intersections
+                            if intersection.tls_id not in unsafe_added
+                        )
+                    )
+                    if emergency_rejected_tls:
+                        session_events.append(
+                            DecisionEvent(
+                                time=0.0,
+                                category="corridor",
+                                title="Небезпечні TLS виключено з corridor control",
+                                detail=(
+                                    ", ".join(emergency_rejected_tls)
+                                    + ": startup safety validation failed; "
+                                    "вони залишаються під штатною програмою."
+                                ),
+                                level="warning",
+                            )
+                        )
                 emergency_controlled_tls = tuple(
                     tls_id for tls_id in emergency_route_tls if tls_id in area.tls_ids
                 )
@@ -234,7 +296,15 @@ def run_experiment(config: RunConfig) -> dict[str, object]:
                 )
             )
             if config.mode in ADAPTIVE_CONTROL_MODES:
-                corridor_manager = CorridorManager(config.emergency.vehicle_id)
+                corridor_manager = CorridorManager(
+                    config.emergency.vehicle_id,
+                    prepare_tls_count=config.control.corridor_prepare_tls_count,
+                )
+                corridor_observer = SumoCorridorObservationAdapter(
+                    connection,
+                    config.emergency.vehicle_id,
+                    config.control.corridor_pass_confirmation_distance,
+                )
 
         if config.mode == STATIC_FIXED_MODE:
             static_programs = activate_static_fixed_programs(
@@ -403,18 +473,92 @@ def run_experiment(config: RunConfig) -> dict[str, object]:
             connection.simulationStep()
             simulated_time = float(connection.simulation.getTime())
             
-            if corridor_manager is not None:
-                veh_id = corridor_manager.vehicle_id
-                in_network = veh_id in connection.vehicle.getIDList()
-                next_tls_info = None
-                if in_network:
-                    next_tls_list = connection.vehicle.getNextTLS(veh_id)
-                    if next_tls_list:
-                        next_tls_info = [
-                            (str(tls_id), int(link_index), float(distance))
-                            for tls_id, link_index, distance, *_state in next_tls_list
-                        ]
-                corridor_manager.step(simulated_time, in_network, next_tls_info)
+            if (
+                not route_reassessment_done
+                and config.emergency is not None
+                and router is not None
+                and emergency_manager is not None
+                and simulated_time
+                >= max(
+                    config.emergency.depart_time
+                    - config.control.corridor_reroute_lead_seconds,
+                    0.0,
+                )
+            ):
+                route_reassessment_done = True
+                in_network = (
+                    config.emergency.vehicle_id in connection.vehicle.getIDList()
+                )
+                if not in_network:
+                    reassessed_route, reassessment_log = router.find_alternatives(
+                        config.emergency.start.edge_id,
+                        config.emergency.destination.edge_id,
+                        config.emergency.vehicle_type_id,
+                        config.emergency.depart_time,
+                        num_alternatives=5,
+                        allowed_tls_ids=area.tls_ids,
+                    )
+                    for alternative in reassessment_log:
+                        alternative["assessment"] = "predeparture"
+                    alternatives_log.extend(reassessment_log)
+                    if reassessed_route is not None:
+                        try:
+                            emergency_route_changed = (
+                                emergency_manager.replace_scheduled_route(
+                                    reassessed_route.edge_ids,
+                                    route_length=reassessed_route.length,
+                                    expected_travel_time=(
+                                        reassessed_route.base_travel_time
+                                    ),
+                                    predicted_eta=reassessed_route.predicted_eta,
+                                )
+                            )
+                        except Exception as error:
+                            session_events.append(
+                                DecisionEvent(
+                                    time=round(simulated_time, 3),
+                                    category="route",
+                                    title="Не вдалося застосувати новий маршрут",
+                                    detail=(
+                                        f"{type(error).__name__}: {error}; "
+                                        "залишено перевірений початковий маршрут."
+                                    ),
+                                    level="warning",
+                                )
+                            )
+                        else:
+                            emergency_details = emergency_manager.details
+                            emergency_route_tls = reassessed_route.tls_sequence
+                            emergency_controlled_tls = tuple(
+                                tls_id
+                                for tls_id in emergency_route_tls
+                                if tls_id in area.tls_ids
+                            )
+                    session_events.append(
+                        DecisionEvent(
+                            time=round(simulated_time, 3),
+                            category="route",
+                            title=(
+                                "Маршрут швидкої оновлено"
+                                if emergency_route_changed
+                                else "Маршрут швидкої повторно перевірено"
+                            ),
+                            detail=(
+                                "Маршрут переоцінено за актуальними чергами "
+                                "безпосередньо перед departure."
+                            ),
+                            level="success",
+                        )
+                    )
+
+            if corridor_manager is not None and corridor_observer is not None:
+                observation = corridor_observer.observe()
+                corridor_manager.step(
+                    simulated_time,
+                    observation.vehicle_in_network,
+                    list(observation.upcoming_tls),
+                    observation.passed_tls_ids,
+                )
                 if emergency_manager is not None:
                     emergency_manager.update_corridor_visualization(
                         corridor_manager.state,
@@ -423,6 +567,8 @@ def run_experiment(config: RunConfig) -> dict[str, object]:
 
             if controller is not None:
                 controller.step(simulated_time)
+            if corridor_manager is not None:
+                metrics.set_corridor_state(corridor_manager.state)
             metrics.collect(simulated_time)
             if not write_live_status_resilient(
                 metrics,
@@ -471,6 +617,14 @@ def run_experiment(config: RunConfig) -> dict[str, object]:
             summary["emergency_alternatives"] = alternatives_log
             summary["emergency_route_tls"] = emergency_route_tls
             summary["emergency_controlled_tls"] = emergency_controlled_tls
+            summary["emergency_rejected_tls"] = emergency_rejected_tls
+            summary["emergency_candidate_safety_audit"] = (
+                str(emergency_candidate_safety_audit)
+                if emergency_candidate_safety_audit is not None
+                else ""
+            )
+            summary["emergency_route_reassessed"] = route_reassessment_done
+            summary["emergency_route_changed"] = emergency_route_changed
             if corridor_manager is not None:
                 summary.update(corridor_manager.as_summary())
         if controller is not None:
@@ -523,6 +677,15 @@ def run_experiment(config: RunConfig) -> dict[str, object]:
                     "safety_rejection_reasons": (
                         controller.stats.safety_rejection_reasons
                     ),
+                    "corridor_preparation_targets": (
+                        controller.stats.corridor_preparation_targets
+                    ),
+                    "corridor_downstream_blocks": (
+                        controller.stats.corridor_downstream_blocks
+                    ),
+                    "corridor_recovery_actions": (
+                        controller.stats.corridor_recovery_actions
+                    ),
                 }
             )
             write_queue_forecast_trace(
@@ -560,6 +723,9 @@ def run_experiment(config: RunConfig) -> dict[str, object]:
                     "fallback_activations": 0,
                     "safety_rejections": 0,
                     "safety_rejection_reasons": {},
+                    "corridor_preparation_targets": 0,
+                    "corridor_downstream_blocks": 0,
+                    "corridor_recovery_actions": 0,
                 }
             )
         summary["telemetry_failures"] = telemetry_failures
@@ -763,7 +929,14 @@ def build_live_system_status(
         else {
             "corridor_state": "DISABLED",
             "corridor_active_tls": None,
+            "corridor_prepared_tls": (),
             "corridor_completed_tls": (),
+            "corridor_unconfirmed_tls": (),
+            "corridor_affected_tls": (),
+            "corridor_recovery_tls": (),
+            "corridor_restored_tls": (),
+            "corridor_downstream_blocks": 0,
+            "corridor_downstream_block_reasons": {},
         }
     )
     try:
@@ -808,6 +981,21 @@ def build_live_system_status(
             ),
             "fallback_activations": (
                 controller_stats.fallback_activations if controller_stats else 0
+            ),
+            "corridor_preparation_targets": (
+                controller_stats.corridor_preparation_targets
+                if controller_stats
+                else 0
+            ),
+            "corridor_downstream_blocks": (
+                controller_stats.corridor_downstream_blocks
+                if controller_stats
+                else 0
+            ),
+            "corridor_recovery_actions": (
+                controller_stats.corridor_recovery_actions
+                if controller_stats
+                else 0
             ),
         },
         "tls_programs": {

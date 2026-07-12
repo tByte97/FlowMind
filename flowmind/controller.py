@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 
 from .area_model import AreaModel, Intersection
 from .config import ControlConfig
+from .corridor_recovery import CorridorRecoveryPlanner
 from .decision_feed import DecisionEvent
 from .priority_flow import priority_links
 from .queue_forecast import QueueForecastEnsemble, QueueForecastModel
@@ -15,6 +16,7 @@ from .signal_policy import (
     effective_max_green,
     effective_min_green,
     lane_has_demand,
+    movement_has_blocked_downstream,
     score_phases,
 )
 from .traffic_state import TrafficState, TrafficStateReader
@@ -86,6 +88,9 @@ class ControllerStats:
     fallback_activations: int = 0
     safety_rejections: int = 0
     safety_rejection_reasons: dict[str, int] = field(default_factory=dict)
+    corridor_preparation_targets: int = 0
+    corridor_downstream_blocks: int = 0
+    corridor_recovery_actions: int = 0
     queue_forecast_samples: list[QueueForecastSample] = field(default_factory=list)
     decision_events: list[DecisionEvent] = field(default_factory=list)
 
@@ -140,6 +145,7 @@ class AreaSignalController:
         self._next_decision_at = float(config.decision_interval)
         self._fallback_active = False
         self._pending_queue_forecasts: list[PendingQueueForecast] = []
+        self._corridor_recovery = CorridorRecoveryPlanner()
         self.stats = ControllerStats()
 
     def set_corridor_manager(self, manager: object) -> None:
@@ -171,19 +177,46 @@ class AreaSignalController:
             simulation_time,
         )
         snapshot = self._area_snapshot(traffic, simulation_time)
+        recovery_handled = self._recover_corridor_offsets(simulation_time)
         if self._corridor_manager is not None:
-            overrides = self._corridor_manager.get_priority_overrides()
+            overrides = self._filter_corridor_targets(
+                self._corridor_manager.get_priority_overrides(),
+                traffic,
+                snapshot,
+                simulation_time,
+                priority=True,
+            )
+            preparation_overrides = self._filter_corridor_targets(
+                self._corridor_manager.get_preparation_overrides(),
+                traffic,
+                snapshot,
+                simulation_time,
+                priority=False,
+            )
+            self.stats.corridor_preparation_targets += len(preparation_overrides)
         else:
             overrides = priority_links(
                 self._traci, self._priority_vehicle, self._config
             )
+            preparation_overrides = {}
+        corridor_target_ids = set(overrides) | set(preparation_overrides)
         prepared: list[PreparedIntersectionDecision] = []
         for intersection in self._area.intersections:
             tls_id = intersection.tls_id
+            if tls_id in recovery_handled:
+                continue
             current_phase = int(self._traci.trafficlight.getPhase(tls_id))
             if not 0 <= current_phase < len(intersection.phases):
                 self.stats.phase_out_of_range_skips += 1
                 continue
+            spent = float(self._traci.trafficlight.getSpentDuration(tls_id))
+            if tls_id in corridor_target_ids:
+                self._corridor_recovery.capture(
+                    intersection,
+                    current_phase,
+                    spent,
+                    simulation_time,
+                )
             current_state = intersection.phases[current_phase]
             if "y" in current_state.lower() or not any(
                 signal in "Gg" for signal in current_state
@@ -191,7 +224,6 @@ class AreaSignalController:
                 self.stats.clearance_phase_skips += 1
                 continue
 
-            spent = float(self._traci.trafficlight.getSpentDuration(tls_id))
             min_green = effective_min_green(self._config, intersection, current_phase)
             max_green = effective_max_green(self._config, intersection, current_phase)
             if spent < min_green:
@@ -199,6 +231,7 @@ class AreaSignalController:
                 continue
 
             priority_link = overrides.get(tls_id)
+            preparation_link = preparation_overrides.get(tls_id)
             queue_forecast: dict[tuple[int, int], float] = {}
             if self._queue_forecast is not None:
                 try:
@@ -264,6 +297,7 @@ class AreaSignalController:
                 queue_forecast,
                 demand_wait_by_lane,
                 snapshot.downstream_risk_by_outgoing_lane,
+                preparation_link,
             )
             prepared.append(
                 PreparedIntersectionDecision(
@@ -278,6 +312,127 @@ class AreaSignalController:
 
         for decision in prepared:
             self._apply_prepared_decision(decision, simulation_time)
+
+    def _filter_corridor_targets(
+        self,
+        targets: dict[str, int],
+        traffic: TrafficState,
+        snapshot: AreaDecisionSnapshot,
+        simulation_time: float,
+        *,
+        priority: bool,
+    ) -> dict[str, int]:
+        if self._corridor_manager is None:
+            return targets
+        accepted: dict[str, int] = {}
+        for tls_id, signal_index in targets.items():
+            try:
+                intersection = self._area.intersection(tls_id)
+            except StopIteration:
+                reason = "TLS outside controlled emergency zone"
+            else:
+                movements = tuple(
+                    link
+                    for link in intersection.links
+                    if link.signal_index == signal_index
+                )
+                required_slots = (
+                    self._config.priority_min_storage_slots
+                    if priority
+                    else self._config.min_downstream_storage_slots
+                )
+                has_safe_exit = bool(movements) and all(
+                    (
+                        not movement_has_blocked_downstream(
+                            traffic.lane(link.outgoing_lane),
+                            self._config,
+                            required_storage_slots=required_slots,
+                        )
+                        and snapshot.downstream_risk_by_outgoing_lane.get(
+                            link.outgoing_lane,
+                            0.0,
+                        )
+                        < self._config.spillback_hard_gate_probability
+                    )
+                    for link in movements
+                )
+                if movements and has_safe_exit:
+                    accepted[tls_id] = signal_index
+                    continue
+                reason = (
+                    "no controlled movement for TLS signal index"
+                    if not movements
+                    else "downstream storage or graph spillback is blocked"
+                )
+            self.stats.corridor_downstream_blocks += 1
+            self._corridor_manager.record_downstream_block(
+                tls_id,
+                reason,
+                simulation_time,
+            )
+        return accepted
+
+    def _recover_corridor_offsets(self, simulation_time: float) -> set[str]:
+        manager = self._corridor_manager
+        if manager is None or getattr(manager.state, "name", "") != "RECOVERY":
+            return set()
+        handled: set[str] = set()
+        for tls_id in tuple(manager.recovery_tls):
+            try:
+                intersection = self._area.intersection(tls_id)
+            except StopIteration:
+                manager.confirm_recovery(tls_id, simulation_time)
+                continue
+            target = self._corridor_recovery.target(tls_id, simulation_time)
+            if target is None:
+                manager.confirm_recovery(tls_id, simulation_time)
+                continue
+            handled.add(tls_id)
+            current_phase = int(self._traci.trafficlight.getPhase(tls_id))
+            if not 0 <= current_phase < len(intersection.phases):
+                continue
+            spent = float(self._traci.trafficlight.getSpentDuration(tls_id))
+            if current_phase == target.phase_index:
+                self._traci.trafficlight.setPhaseDuration(
+                    tls_id,
+                    max(target.remaining_duration, 1.0),
+                )
+                self._corridor_recovery.mark_restored(tls_id)
+                manager.confirm_recovery(tls_id, simulation_time)
+                self.stats.corridor_recovery_actions += 1
+                self._record_decision(
+                    simulation_time,
+                    tls_id,
+                    "Відновлено базовий фазовий offset",
+                    (
+                        f"Перехрестя {tls_id}: фаза {target.phase_index}, "
+                        f"залишок {target.remaining_duration:.1f} с."
+                    ),
+                    "success",
+                )
+                continue
+            state = intersection.phases[current_phase]
+            if (
+                any(signal in "Gg" for signal in state)
+                and "y" not in state.lower()
+                and spent
+                >= effective_min_green(self._config, intersection, current_phase)
+            ):
+                if self._advance_to_clearance(
+                    intersection,
+                    current_phase,
+                    simulation_time,
+                    spent,
+                    priority=False,
+                    title="Recovery: перехід до базового offset",
+                    detail=(
+                        f"Перехрестя {tls_id}: безпечне просування до "
+                        f"цільової фази {target.phase_index}."
+                    ),
+                    level="info",
+                ):
+                    self.stats.corridor_recovery_actions += 1
+        return handled
 
     def _record_queue_forecast(
         self,

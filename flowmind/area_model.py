@@ -166,7 +166,10 @@ def load_zone_tls_ids(zone_path: str | Path) -> tuple[str, ...]:
     return tls_ids
 
 
-def _intersection_from_tls(tls: object) -> Intersection | None:
+def _intersection_from_tls(
+    tls: object,
+    minimum_green_phases: int = 2,
+) -> Intersection | None:
     programs = tls.getPrograms()
     if not programs:
         return None
@@ -197,7 +200,9 @@ def _intersection_from_tls(tls: object) -> Intersection | None:
         )
         for connection in tls.getConnections()
     )
-    if not links or len([state for state in phases if "G" in state or "g" in state]) < 2:
+    if not links or len(
+        [state for state in phases if "G" in state or "g" in state]
+    ) < minimum_green_phases:
         return None
 
     edge_centres = []
@@ -259,8 +264,19 @@ def discover_area(
     if not candidates:
         raise RuntimeError("No controllable traffic lights found in the SUMO network")
 
-    by_id = {item.tls_id: item for item in candidates}
     if requested_tls:
+        # Explicitly requested emergency-route TLS may have a single vehicle
+        # green phase.  They are still controllable and safety-valid even
+        # though they are too trivial for automatic zone discovery.
+        requested_set = set(requested_tls)
+        requested_candidates = [
+            item
+            for tls in network.getTrafficLights()
+            if str(tls.getID()) in requested_set
+            and (item := _intersection_from_tls(tls, minimum_green_phases=1))
+            is not None
+        ]
+        by_id = {item.tls_id: item for item in requested_candidates}
         missing = sorted(set(requested_tls) - set(by_id))
         if missing and strict_requested:
             raise ValueError(f"Unknown or unsupported traffic lights: {', '.join(missing)}")

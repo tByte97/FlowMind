@@ -46,6 +46,16 @@ class EmergencyTraceSample:
     y: float
 
 
+@dataclass(frozen=True)
+class CivilianImpactSample:
+    time: float
+    corridor_state: str
+    vehicle_count: int
+    stopped_vehicles: int
+    mean_speed: float
+    mean_waiting_time: float
+
+
 class MetricsCollector:
     def __init__(
         self,
@@ -75,6 +85,8 @@ class MetricsCollector:
         self._peak_active_vehicles = 0
         self.samples: list[MetricSample] = []
         self.emergency_trace: list[EmergencyTraceSample] = []
+        self.civilian_impact_samples: list[CivilianImpactSample] = []
+        self._corridor_state = "NORMAL"
         self._last_live_status: dict[str, Any] | None = None
         self._publisher: LiveTelemetryPublisher | None = None
         self._visual_lanes = area.visual_lanes
@@ -124,15 +136,16 @@ class MetricsCollector:
             )
             for vehicle_id in zone_vehicles
         }
-        waiting = [
-            max(
+        waiting_by_vehicle = {
+            vehicle_id: max(
                 float(
                     self._traci.vehicle.getAccumulatedWaitingTime(vehicle_id)
                 ),
                 0.0,
             )
             for vehicle_id in zone_vehicles
-        ]
+        }
+        waiting = list(waiting_by_vehicle.values())
         stopped = {
             vehicle_id
             for vehicle_id, speed in speeds.items()
@@ -140,6 +153,29 @@ class MetricsCollector:
         }
         self._stops += len(stopped - self._previously_stopped)
         self._previously_stopped = stopped
+        civilian_ids = {
+            vehicle_id
+            for vehicle_id in zone_vehicles
+            if vehicle_id != self._priority_vehicle
+        }
+        civilian_speeds = [speeds[vehicle_id] for vehicle_id in civilian_ids]
+        civilian_waiting = [
+            waiting_by_vehicle[vehicle_id] for vehicle_id in civilian_ids
+        ]
+        self.civilian_impact_samples.append(
+            CivilianImpactSample(
+                time=simulation_time,
+                corridor_state=self._corridor_state,
+                vehicle_count=len(civilian_ids),
+                stopped_vehicles=sum(
+                    speeds[vehicle_id] < 0.1 for vehicle_id in civilian_ids
+                ),
+                mean_speed=(fmean(civilian_speeds) if civilian_speeds else 0.0),
+                mean_waiting_time=(
+                    fmean(civilian_waiting) if civilian_waiting else 0.0
+                ),
+            )
+        )
         blocked = sum(
             occupancy >= self._control.blocked_occupancy
             for occupancy in outgoing_occupancies
@@ -179,7 +215,7 @@ class MetricsCollector:
         )
 
     def summary(self, mode: str, simulated_duration: float) -> dict[str, object]:
-        return {
+        result = {
             "mode": mode,
             "simulated_duration": round(simulated_duration, 2),
             "controlled_tls": len(self._area.tls_ids),
@@ -218,6 +254,47 @@ class MetricsCollector:
                 set(self._area.incoming_lanes) | set(self._area.outgoing_lanes)
             ),
         }
+        result.update(self._civilian_impact_summary())
+        return result
+
+    def set_corridor_state(self, state: object) -> None:
+        self._corridor_state = getattr(state, "name", str(state)).upper()
+
+    def _civilian_impact_summary(self) -> dict[str, object]:
+        normal = self._civilian_state_mean({"NORMAL"})
+        priority = self._civilian_state_mean({"PREPARE", "GREEN_WINDOW"})
+        recovery = self._civilian_state_mean({"CLEARANCE", "RECOVERY"})
+        reference = normal if normal is not None else recovery
+        reference_state = (
+            "NORMAL"
+            if normal is not None
+            else "RECOVERY"
+            if recovery is not None
+            else None
+        )
+        return {
+            "civilian_priority_samples": sum(
+                sample.corridor_state in {"PREPARE", "GREEN_WINDOW"}
+                for sample in self.civilian_impact_samples
+            ),
+            "civilian_normal_mean_waiting_time": normal,
+            "civilian_priority_mean_waiting_time": priority,
+            "civilian_recovery_mean_waiting_time": recovery,
+            "civilian_priority_reference_state": reference_state,
+            "civilian_priority_waiting_delta": (
+                round(priority - reference, 3)
+                if priority is not None and reference is not None
+                else None
+            ),
+        }
+
+    def _civilian_state_mean(self, states: set[str]) -> float | None:
+        values = [
+            sample.mean_waiting_time
+            for sample in self.civilian_impact_samples
+            if sample.corridor_state in states and sample.vehicle_count > 0
+        ]
+        return round(fmean(values), 3) if values else None
 
     def _collect_priority_trace(self, simulation_time: float) -> None:
         if self._priority_vehicle is None:
@@ -655,6 +732,16 @@ class MetricsCollector:
                 writer = csv.DictWriter(handle, fieldnames=fieldnames)
                 writer.writeheader()
                 writer.writerows(asdict(sample) for sample in self.emergency_trace)
+
+        if self.civilian_impact_samples:
+            impact_path = results_dir / f"{mode}_civilian_priority_impact.csv"
+            with impact_path.open("w", newline="", encoding="utf-8") as handle:
+                fieldnames = list(asdict(self.civilian_impact_samples[0]).keys())
+                writer = csv.DictWriter(handle, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(
+                    asdict(sample) for sample in self.civilian_impact_samples
+                )
 
         with (results_dir / f"{mode}_summary.json").open(
             "w", encoding="utf-8"

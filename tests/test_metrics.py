@@ -120,6 +120,19 @@ class ActiveFakeTraci(FakeTraci):
 
 
 class MetricsCollectorTest(unittest.TestCase):
+    @staticmethod
+    def active_area() -> AreaModel:
+        return AreaModel(
+            (
+                Intersection(
+                    tls_id="tls_1",
+                    position=(10.0, 20.0),
+                    phases=("Gr",),
+                    links=(ControlledLink("in_0", "out_0", 0),),
+                ),
+            )
+        )
+
     def test_summary_csv_keeps_all_four_control_modes_in_canonical_order(self) -> None:
         collector = MetricsCollector(
             FakeTraci(),
@@ -277,6 +290,25 @@ class MetricsCollectorTest(unittest.TestCase):
         self.assertEqual(zone["lanes"][0]["vehicle_count"], 1)
         self.assertEqual(zone["lanes"][0]["queue"], 1)
         self.assertEqual(zone["lanes"][0]["occupancy"], 0.0625)
+
+    def test_civilian_impact_uses_observed_corridor_state_samples(self) -> None:
+        collector = MetricsCollector(
+            ActiveFakeTraci(),
+            self.active_area(),
+            ControlConfig(decision_interval=3),
+            priority_vehicle="ambulance",
+        )
+
+        collector.set_corridor_state("NORMAL")
+        collector.collect(3.0)
+        collector.set_corridor_state("GREEN_WINDOW")
+        collector.collect(6.0)
+        summary = collector.summary("flowmind", 6.0)
+
+        self.assertEqual(summary["civilian_priority_samples"], 1)
+        self.assertEqual(summary["civilian_normal_mean_waiting_time"], 0.0)
+        self.assertEqual(summary["civilian_priority_mean_waiting_time"], 0.0)
+        self.assertEqual(summary["civilian_priority_waiting_delta"], 0.0)
 
     def test_live_flow_rates_use_changes_between_samples(self) -> None:
         traci = FakeTraci()

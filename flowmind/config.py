@@ -76,6 +76,10 @@ class ControlConfig:
     max_priority_override: int = 35
     clearance_seconds: int = 5
     sensor_last_known_good_ttl: float = 6.0
+    corridor_prepare_bonus: float = 12.0
+    corridor_prepare_tls_count: int = 3
+    corridor_pass_confirmation_distance: float = 35.0
+    corridor_reroute_lead_seconds: float = 15.0
 
     def __post_init__(self) -> None:
         positive = {
@@ -90,6 +94,10 @@ class ControlConfig:
             "max_priority_override": self.max_priority_override,
             "clearance_seconds": self.clearance_seconds,
             "sensor_last_known_good_ttl": self.sensor_last_known_good_ttl,
+            "corridor_prepare_tls_count": self.corridor_prepare_tls_count,
+            "corridor_pass_confirmation_distance": (
+                self.corridor_pass_confirmation_distance
+            ),
         }
         for name, value in positive.items():
             if float(value) <= 0:
@@ -127,6 +135,8 @@ class ControlConfig:
             "demand_wait_weight": self.demand_wait_weight,
             "max_demand_wait_bonus": self.max_demand_wait_bonus,
             "hysteresis": self.hysteresis,
+            "corridor_prepare_bonus": self.corridor_prepare_bonus,
+            "corridor_reroute_lead_seconds": self.corridor_reroute_lead_seconds,
         }
         for name, value in non_negative.items():
             if float(value) < 0:

@@ -77,6 +77,8 @@ results/* + FastAPI dashboard
 | `flowmind/queue_forecast.py` | LightGBM-прогноз черг на 30/60/90 секунд |
 | `flowmind/emergency_router.py` | маршрути для швидкої та оцінка альтернатив |
 | `flowmind/corridor_manager.py` | стан green corridor для екстреного транспорту |
+| `flowmind/sumo_corridor_adapter.py` | SUMO-specific підтвердження фактичного проїзду stop line |
+| `flowmind/corridor_recovery.py` | нейтральний recovery planner базової фази та cycle offset |
 | `flowmind/metrics.py` | KPI, history, emergency trace, summary |
 | `experiments/run_demo.py` | demo-запуск FlowMind з опціональним static fixed baseline |
 | `experiments/run_dataset.py` | генерація ML dataset через багато симуляцій |
@@ -98,9 +100,16 @@ models/queue_lgbm_90s_current.joblib
 - LightGBM;
 - 3 горизонти прогнозу: 30, 60, 90 секунд;
 - target: `target_incoming_queue_30s`, `target_incoming_queue_60s`, `target_incoming_queue_90s`;
-- input features: стан фази, elapsed time, incoming/outgoing queue, occupancy, speed, free slots, signal state, TLS id, movement hashes, control parameters.
+- контракт моделей: `current_policy`; фактичний `current_phase` не підміняється candidate-фазою;
+- input features: стан фази, elapsed time, incoming/outgoing queue, occupancy, speed, free slots, signal state, TLS/lane/movement ID як categorical features і control parameters;
+- кожен артефакт має SHA-256 dataset, network, feature schema та `.joblib` у sidecar metadata;
+- prediction обмежується фізичною lane capacity;
+- unseen TLS/lane, schema/hash mismatch або feature OOD автоматично вимикають ML-вплив.
 
-Прогноз не замінює контролер. Він додається як один із факторів у scoring фази.
+За замовчуванням ML працює у shadow mode: прогноз не впливає на
+світлофор, а trace після закінчення горизонту містить фактичну чергу і MAE.
+Явно дозволити лише in-domain/high-confidence ML-вплив можна прапором
+`--enable-queue-control`.
 
 ## Green corridor
 
@@ -109,9 +118,14 @@ models/queue_lgbm_90s_current.joblib
 - створення emergency vehicle у SUMO;
 - вибір маршруту до лікарні;
 - визначення світлофорів на маршруті;
-- priority override для потрібних фаз;
+- `PREPARE` м’яко готує до трьох наступних TLS, а `GREEN_WINDOW` дає hard priority лише активному TLS;
+- проїзд TLS зараховується лише після SUMO-adapter stop-line confirmation;
+- hard downstream storage/spillback gate може відхилити навіть emergency priority;
+- перед departure маршрут повторно оцінюється за актуальними чергами;
+- після corridor recovery planner повертає базову фазу і cycle offset без пропуску clearance;
+- emergency-route TLS, який не пройшов startup safety validation, залишається під штатною програмою і не отримує FlowMind-команд;
 - метрики `emergency_departure_time`, `emergency_arrival_time`, `emergency_eta`, `priority_decisions`;
-- повернення контролера до нормального режиму після проїзду.
+- `*_civilian_priority_impact.csv` і summary delta вимірюють фактичний вплив на цивільні авто.
 
 ## Dashboard
 
@@ -200,6 +214,9 @@ python experiments/run_experiment.py static_fixed --duration 600
 python experiments/run_experiment.py sumo_actuated --duration 600
 python experiments/run_experiment.py local --duration 600
 python experiments/run_experiment.py flowmind --duration 600
+python experiments/run_experiment.py flowmind --duration 600 --emergency
+# ML вплив лише після shadow-валідації:
+python experiments/run_experiment.py flowmind --duration 600 --enable-queue-control
 ```
 
 ## Docker

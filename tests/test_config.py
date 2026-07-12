@@ -25,6 +25,10 @@ class ControlConfigValidationTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unique"):
             ControlConfig(queue_forecast_horizon_weights=((30, 0.5), (30, 0.5)))
 
+    def test_rejects_invalid_corridor_lookahead(self) -> None:
+        with self.assertRaisesRegex(ValueError, "corridor_prepare_tls_count"):
+            ControlConfig(corridor_prepare_tls_count=0)
+
 
 if __name__ == "__main__":
     unittest.main()

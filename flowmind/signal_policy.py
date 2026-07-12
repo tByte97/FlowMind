@@ -180,6 +180,7 @@ def score_phases(
     queue_forecast: dict[tuple[int, int], float] | None = None,
     demand_wait_by_lane: dict[str, float] | None = None,
     downstream_risk_by_outgoing_lane: dict[str, float] | None = None,
+    preparation_link: int | None = None,
 ) -> tuple[PhaseScore, ...]:
     area_pressure = area_pressure or {}
     queue_forecast = queue_forecast or {}
@@ -204,12 +205,16 @@ def score_phases(
                 priority_link is not None
                 and link.signal_index == priority_link
             )
+            is_preparation_movement = (
+                preparation_link is not None
+                and link.signal_index == preparation_link
+            )
             graph_spillback_risk = downstream_risk_by_outgoing_lane.get(
                 link.outgoing_lane,
                 0.0,
             )
             if (
-                has_demand or is_priority_movement
+                has_demand or is_priority_movement or is_preparation_movement
             ) and graph_spillback_risk >= config.spillback_hard_gate_probability:
                 blocked_downstream = True
                 break
@@ -217,6 +222,12 @@ def score_phases(
                 outgoing,
                 config,
                 required_storage_slots=config.priority_min_storage_slots,
+            ):
+                blocked_downstream = True
+                break
+            if is_preparation_movement and movement_has_blocked_downstream(
+                outgoing,
+                config,
             ):
                 blocked_downstream = True
                 break
@@ -255,6 +266,8 @@ def score_phases(
                 movement_score -= (
                     graph_spillback_risk * config.downstream_graph_weight
                 )
+            if is_preparation_movement:
+                movement_score += float(config.corridor_prepare_bonus)
             if has_demand:
                 movement_score += demand_wait_bonus(
                     demand_wait_by_lane.get(link.incoming_lane, 0.0),

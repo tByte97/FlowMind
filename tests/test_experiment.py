@@ -56,6 +56,16 @@ class ExperimentEnvironmentTest(unittest.TestCase):
             with self.subTest(mode=mode):
                 self.assertEqual(parser.parse_args([mode]).mode, mode)
 
+    def test_ml_control_requires_explicit_cli_opt_in(self) -> None:
+        parser = build_parser()
+
+        self.assertFalse(parser.parse_args(["flowmind"]).enable_queue_control)
+        self.assertTrue(
+            parser.parse_args(
+                ["flowmind", "--enable-queue-control"]
+            ).enable_queue_control
+        )
+
     def test_packaged_projection_database_is_configured(self) -> None:
         with patch.dict(os.environ, {}, clear=True):
             projection_dir = configure_projection_data()

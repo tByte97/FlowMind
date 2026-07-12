@@ -5,6 +5,7 @@ import unittest
 from flowmind.area_model import AreaModel, ControlledLink, Intersection
 from flowmind.config import ControlConfig
 from flowmind.controller import AreaSignalController
+from flowmind.corridor_manager import CorridorManager, CorridorState
 from flowmind.queue_forecast import ForecastDiagnostics
 from flowmind.safety_validator import SafetyDecision
 
@@ -311,6 +312,66 @@ class AreaSignalControllerTest(unittest.TestCase):
             controller.stats.queue_forecast_rejection_reasons,
             {"unseen_lane": 1, "confidence_below_threshold": 1},
         )
+
+    def test_emergency_override_is_hard_gated_by_downstream_storage(self) -> None:
+        traci = FakeTraci()
+        traci.lane.counts = {
+            "north": 0,
+            "south": 0,
+            "east": 10,
+            "west": 16,
+        }
+        manager = CorridorManager("ambulance")
+        manager.step(
+            10.0,
+            vehicle_in_network=True,
+            next_tls_info=("tls", 1, 100.0),
+        )
+        controller = AreaSignalController(
+            traci,
+            self.area(),
+            "flowmind",
+            ControlConfig(),
+        )
+        controller.set_corridor_manager(manager)
+
+        controller.step(12.0)
+
+        self.assertEqual(controller.stats.priority_decisions, 0)
+        self.assertEqual(controller.stats.corridor_downstream_blocks, 1)
+        self.assertEqual(manager.downstream_block_count, 1)
+        self.assertIn(
+            "downstream storage or graph spillback is blocked",
+            manager.downstream_block_reasons,
+        )
+
+    def test_recovery_restores_captured_phase_offset(self) -> None:
+        traci = FakeTraci()
+        traci.trafficlight.spent = 2.0
+        manager = CorridorManager("ambulance")
+        manager.state = CorridorState.RECOVERY
+        manager.affected_tls = ["tls"]
+        manager.recovery_tls = ["tls"]
+        controller = AreaSignalController(
+            traci,
+            self.area(),
+            "flowmind",
+            ControlConfig(),
+        )
+        controller.set_corridor_manager(manager)
+        controller._corridor_recovery.capture(  # type: ignore[attr-defined]
+            self.area().intersection("tls"),
+            phase_index=0,
+            phase_elapsed=2.0,
+            simulation_time=12.0,
+        )
+
+        controller.step(12.0)
+
+        self.assertEqual(traci.trafficlight.phase_durations, [("tls", 4.0)])
+        self.assertEqual(controller.stats.corridor_recovery_actions, 1)
+        self.assertEqual(manager.state, CorridorState.NORMAL)
+        self.assertEqual(manager.restored_tls, ["tls"])
 
 
 if __name__ == "__main__":

@@ -182,6 +182,61 @@ class SignalPolicyTest(unittest.TestCase):
         self.assertIsNotNone(best)
         self.assertEqual(best.phase_index, 2)
 
+    def test_prepare_target_is_a_soft_bonus_not_hard_priority(self) -> None:
+        state = TrafficState(
+            {
+                "north": LaneState(3, 3, 0.2, 0.0, 8.0),
+                "south": LaneState(0, 0, 0.0, 10.0, 15.0),
+                "east": LaneState(3, 3, 0.2, 0.0, 8.0),
+                "west": LaneState(0, 0, 0.0, 10.0, 15.0),
+            }
+        )
+        regular = {
+            item.phase_index: item.score
+            for item in score_phases(
+                self.intersection,
+                state,
+                "flowmind",
+                self.config,
+            )
+        }
+        prepared = {
+            item.phase_index: item.score
+            for item in score_phases(
+                self.intersection,
+                state,
+                "flowmind",
+                self.config,
+                preparation_link=1,
+            )
+        }
+
+        self.assertEqual(
+            prepared[2] - regular[2],
+            self.config.corridor_prepare_bonus,
+        )
+        self.assertLess(prepared[2] - regular[2], 1_000.0)
+
+    def test_prepare_target_cannot_open_a_blocked_downstream(self) -> None:
+        state = TrafficState(
+            {
+                "north": LaneState(1, 1, 0.1, 0.0, 8.0),
+                "south": LaneState(0, 0, 0.0, 10.0, 15.0),
+                "east": LaneState(0, 0, 0.0, 0.0, 8.0),
+                "west": LaneState(8, 16, 0.95, 0.0, 0.0),
+            }
+        )
+
+        scores = score_phases(
+            self.intersection,
+            state,
+            "flowmind",
+            self.config,
+            preparation_link=1,
+        )
+
+        self.assertNotIn(2, [item.phase_index for item in scores])
+
     def test_flowmind_can_use_area_pressure_bias(self) -> None:
         state = TrafficState(
             {

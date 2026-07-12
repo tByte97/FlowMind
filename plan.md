@@ -275,44 +275,44 @@
 
   ### Етап 3 — відмовостійкість
 
-  - [ ] Додати повну валідацію ControlConfig.
-  - [ ] Замінити modulo scheduler на next_decision_at.
-  - [ ] Ввести LaneState.valid, sample_time, error.
-  - [ ] Використовувати last-known-good із коротким TTL.
-  - [ ] При втраті даних переходити на перевірений fallback plan.
-  - [ ] Логувати причину кожного safety rejection.
-  - [ ] Окремо рахувати sensor failures, stale lanes і fallback activations.
-  - [ ] Не дозволяти telemetry/dashboard failure зупиняти control loop.
+  - [x] Додати повну валідацію ControlConfig.
+  - [x] Замінити modulo scheduler на next_decision_at.
+  - [x] Ввести LaneState.valid, sample_time, error.
+  - [x] Використовувати last-known-good із коротким TTL.
+  - [x] При втраті даних переходити на перевірений fallback plan.
+  - [x] Логувати причину кожного safety rejection.
+  - [x] Окремо рахувати sensor failures, stale lanes і fallback activations.
+  - [x] Не дозволяти telemetry/dashboard failure зупиняти control loop.
 
   ### Етап 4 — ML
 
-  - [ ] Визначити, модель є forecast current-policy чи counterfactual phase
+  - [x] Визначити, модель є forecast current-policy чи counterfactual phase
     model.
 
-  - [ ] Не подавати candidate phase як фактичний current_phase без відповідного
+  - [x] Не подавати candidate phase як фактичний current_phase без відповідного
     train dataset.
 
-  - [ ] Прибрати raw numeric hashes або перейти на контрольовані categorical
+  - [x] Прибрати raw numeric hashes або перейти на контрольовані categorical
     buckets.
 
-  - [ ] Додати prediction bounds відповідно до lane capacity.
-  - [ ] Додати confidence/OOD detector.
-  - [ ] Для unseen TLS/lane автоматично вимикати ML-вплив.
-  - [ ] Перенавчити модель на тому самому map/demand, що й demo.
-  - [ ] Окремо перевірити 3600 авто/год і emergency-expanded zone.
-  - [ ] Спочатку запустити ML у shadow mode і порівняти з фактичними чергами.
-  - [ ] Версіонувати dataset hash, network hash, feature schema і model
+  - [x] Додати prediction bounds відповідно до lane capacity.
+  - [x] Додати confidence/OOD detector.
+  - [x] Для unseen TLS/lane автоматично вимикати ML-вплив.
+  - [x] Перенавчити модель на тому самому map/demand, що й demo.
+  - [x] Окремо перевірити 3600 авто/год і emergency-expanded zone.
+  - [x] Спочатку запускати ML у shadow mode і порівнювати з фактичними чергами.
+  - [x] Версіонувати dataset hash, network hash, feature schema і model
     artifact.
 
   ### Етап 5 — emergency corridor
 
-  - [ ] Розділити дії PREPARE та GREEN_WINDOW.
-  - [ ] Готувати декілька наступних TLS, а не лише один.
-  - [ ] Не позначати TLS завершеним до підтвердженого факту проїзду.
-  - [ ] Додати hard downstream safety для швидкої.
-  - [ ] Реалізувати справжній recovery phase/offset plan.
-  - [ ] Додати динамічне rerouting або повторну оцінку маршруту перед departure.
-  - [ ] Вимірювати вплив пріоритету на цивільний транспорт, а не оцінювати його
+  - [x] Розділити дії PREPARE та GREEN_WINDOW.
+  - [x] Готувати декілька наступних TLS, а не лише один.
+  - [x] Не позначати TLS завершеним до підтвердженого факту проїзду.
+  - [x] Додати hard downstream safety для швидкої.
+  - [x] Реалізувати справжній recovery phase/offset plan.
+  - [x] Додати динамічне rerouting або повторну оцінку маршруту перед departure.
+  - [x] Вимірювати вплив пріоритету на цивільний транспорт, а не оцінювати його
     евристикою.
 
   ### Етап 6 — чесна оцінка

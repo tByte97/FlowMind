@@ -30,6 +30,10 @@ SUMO / field controllers / backend API
 перетворення зосереджене у `flowmind/sumo_tls_adapter.py`.
 Так само `flowmind/zone_graph.py` не залежить від SUMO; шляхи edges/lanes
 для pre-MVP готує `flowmind/sumo_zone_graph_adapter.py`.
+Emergency corridor та recovery offset також нейтральні. Лише
+`flowmind/sumo_corridor_adapter.py` читає `vehicle.getNextTLS` і перетворює
+його на upcoming/passed TLS events. У production цей adapter може бути
+замінений на GPS/V2X/backend event source.
 
 ## Зональне рішення
 
@@ -69,7 +73,7 @@ Signal Policy
   - Static fixed: детермінована fixed-time програма
   - SUMO actuated: окремий simulation baseline
   - Local: тільки вхідна черга конкретного перехрестя
-  - FlowMind: вхідна черга + стан наступної ділянки
+  - FlowMind: вхідна черга + zonal graph + shadow ML forecast
         |
         v
 AreaSignalController
@@ -78,18 +82,21 @@ AreaSignalController
         |
         +--> MetricsCollector --> results/*.csv, *.json
         |
-        +--> Streamlit dashboard
+        +--> FastAPI dashboard
 
 emergency.json
         |
         v
 EmergencyVehicleManager
   - створює тип швидкої
-  - будує маршрут через TraCI
+  - обирає 3–5 маршрутних альтернатив
+  - повторно оцінює маршрут перед departure
   - планує час виїзду
         |
-        +--> Priority Flow hook
-        +--> departure / arrival / ETA metrics
+        +--> PREPARE (soft look-ahead for 3 TLS)
+        +--> GREEN_WINDOW (hard priority + downstream gate)
+        +--> confirmed passage -> clearance -> phase/offset recovery
+        +--> departure / arrival / ETA + measured civilian impact
 ```
 
 ## Модулі
@@ -105,6 +112,10 @@ EmergencyVehicleManager
 | `flowmind/signal_policy.py` | Рахує оцінки фаз для Local та FlowMind |
 | `flowmind/controller.py` | Застосовує рішення з min/max green та безпечним порядком фаз |
 | `flowmind/priority_flow.py` | Підсилює фазу для вказаного пріоритетного авто |
+| `flowmind/queue_forecast.py` | Current-policy/counterfactual contract, capacity bounds, OOD/confidence і artifact provenance |
+| `flowmind/corridor_manager.py` | Нейтральний state machine PREPARE/GREEN_WINDOW/CLEARANCE/RECOVERY |
+| `flowmind/sumo_corridor_adapter.py` | Підтверджує stop-line passage з SUMO telemetry |
+| `flowmind/corridor_recovery.py` | Відновлює базову фазу та cycle offset |
 | `flowmind/metrics.py` | Збирає часові ряди й агреговані KPI |
 | `flowmind/experiment.py` | Запускає SUMO та координує один експеримент |
 | `flowmind/emergency_vehicle.py` | Створює швидку, маршрут і планує її виїзд |
@@ -132,7 +143,8 @@ manifest додатково підтверджує покриття всіх ш�
 
 - Контролюється компактна центральна зона на повній мапі Рівного; окрему
   обрізану SUMO-мережу ще не створено.
-- Контролер використовує пояснювану pressure-based евристику, а не навчену нейромережу.
-- Автоматична швидка та один маршрут до лікарні готові; побудова й
-  порівняння 3–5 альтернативних маршрутів ще не реалізовані.
+- ML-моделі навмисно залишаються у shadow mode, доки парна оцінка на
+  більшій кількості seed не пройде regression gates.
+- TLS на emergency-маршруті, що не пройшов startup safety validation,
+  не керується FlowMind і залишається на штатній TLS-програмі.
 - Throughput і travel time рахуються глобально для однакового сценарію, а черги, очікування, зупинки та gridlock risk — для керованої зони.
