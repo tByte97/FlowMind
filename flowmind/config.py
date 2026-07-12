@@ -73,6 +73,70 @@ class ControlConfig:
     priority_distance: float = 500.0
     max_priority_override: int = 35
     clearance_seconds: int = 5
+    sensor_last_known_good_ttl: float = 6.0
+
+    def __post_init__(self) -> None:
+        positive = {
+            "decision_interval": self.decision_interval,
+            "sensor_range_meters": self.sensor_range_meters,
+            "min_green": self.min_green,
+            "max_green": self.max_green,
+            "min_downstream_storage_slots": self.min_downstream_storage_slots,
+            "priority_min_storage_slots": self.priority_min_storage_slots,
+            "downstream_graph_hops": self.downstream_graph_hops,
+            "priority_distance": self.priority_distance,
+            "max_priority_override": self.max_priority_override,
+            "clearance_seconds": self.clearance_seconds,
+            "sensor_last_known_good_ttl": self.sensor_last_known_good_ttl,
+        }
+        for name, value in positive.items():
+            if float(value) <= 0:
+                raise ValueError(f"{name} must be positive")
+        if self.min_green > self.max_green:
+            raise ValueError("min_green cannot exceed max_green")
+
+        probabilities = {
+            "blocked_occupancy": self.blocked_occupancy,
+            "downstream_graph_decay": self.downstream_graph_decay,
+            "spillback_start_occupancy": self.spillback_start_occupancy,
+            "spillback_hard_gate_probability": (
+                self.spillback_hard_gate_probability
+            ),
+            "congested_occupancy_threshold": (
+                self.congested_occupancy_threshold
+            ),
+        }
+        for name, value in probabilities.items():
+            if not 0.0 <= float(value) <= 1.0:
+                raise ValueError(f"{name} must be between 0 and 1")
+
+        non_negative = {
+            "default_green_extension": self.default_green_extension,
+            "downstream_weight": self.downstream_weight,
+            "downstream_graph_weight": self.downstream_graph_weight,
+            "area_pressure_weight": self.area_pressure_weight,
+            "queue_forecast_weight": self.queue_forecast_weight,
+            "empty_approach_penalty": self.empty_approach_penalty,
+            "empty_phase_penalty": self.empty_phase_penalty,
+            "congested_queue_threshold": self.congested_queue_threshold,
+            "congested_approach_bonus": self.congested_approach_bonus,
+            "demand_timer_seconds": self.demand_timer_seconds,
+            "demand_wait_weight": self.demand_wait_weight,
+            "max_demand_wait_bonus": self.max_demand_wait_bonus,
+            "hysteresis": self.hysteresis,
+        }
+        for name, value in non_negative.items():
+            if float(value) < 0:
+                raise ValueError(f"{name} cannot be negative")
+
+        horizons = tuple(int(horizon) for horizon, _ in self.queue_forecast_horizon_weights)
+        weights = tuple(float(weight) for _, weight in self.queue_forecast_horizon_weights)
+        if not horizons or any(horizon <= 0 for horizon in horizons):
+            raise ValueError("queue forecast horizons must be positive")
+        if len(set(horizons)) != len(horizons):
+            raise ValueError("queue forecast horizons must be unique")
+        if any(weight < 0 for weight in weights) or sum(weights) <= 0:
+            raise ValueError("queue forecast weights must be non-negative and non-zero")
 
 
 @dataclass(frozen=True)
