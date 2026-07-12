@@ -375,13 +375,30 @@ def discover_sample_paths(
     modes: tuple[str, ...] | list[str],
     max_files: int | None,
 ) -> list[Path]:
-    mode_tokens = {f"_{mode}_" for mode in modes}
+    mode_tokens = {
+        token
+        for mode in modes
+        for token in (
+            ("_static_fixed_", "_fixed_")
+            if mode in {"static_fixed", "fixed"}
+            else (f"_{mode}_",)
+        )
+    }
     paths = [
         path
         for path in sorted(samples_dir.glob("*.csv"))
         if any(token in path.name for token in mode_tokens)
     ]
-    return paths[:max_files] if max_files is not None else paths
+    if max_files is None or max_files >= len(paths):
+        return paths
+    if max_files <= 0:
+        return []
+    # Pick evenly across the sorted mode/run list instead of taking a prefix,
+    # which would silently train on only the alphabetically first mode.
+    return [
+        paths[int(index * len(paths) / max_files)]
+        for index in range(max_files)
+    ]
 
 
 def load_dataset(
