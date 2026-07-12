@@ -251,7 +251,7 @@
   - [x] Додати в Intersection program_id, program_type, minDur, maxDur.
   - [x] Заборонити transition раніше SUMO minDur.
   - [x] Узгодити clearance_seconds із реальними yellow/all-red фазами.
-  - [ ] Додати hard gate для blocked downstream.
+  - [x] Додати hard gate для blocked downstream.
   - [ ] Для emergency дозволяти рух лише за наявності гарантованого storage
     space.
 
