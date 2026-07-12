@@ -177,10 +177,12 @@ def score_phases(
     area_pressure: dict[str, float] | None = None,
     queue_forecast: dict[tuple[int, int], float] | None = None,
     demand_wait_by_lane: dict[str, float] | None = None,
+    downstream_risk_by_outgoing_lane: dict[str, float] | None = None,
 ) -> tuple[PhaseScore, ...]:
     area_pressure = area_pressure or {}
     queue_forecast = queue_forecast or {}
     demand_wait_by_lane = demand_wait_by_lane or {}
+    downstream_risk_by_outgoing_lane = downstream_risk_by_outgoing_lane or {}
     scores: list[PhaseScore] = []
     for phase_index in intersection.green_phase_indices:
         phase_state = intersection.phases[phase_index]
@@ -200,6 +202,15 @@ def score_phases(
                 priority_link is not None
                 and link.signal_index == priority_link
             )
+            graph_spillback_risk = downstream_risk_by_outgoing_lane.get(
+                link.outgoing_lane,
+                0.0,
+            )
+            if (
+                has_demand or is_priority_movement
+            ) and graph_spillback_risk >= config.spillback_hard_gate_probability:
+                blocked_downstream = True
+                break
             if is_priority_movement and movement_has_blocked_downstream(
                 outgoing,
                 config,
@@ -238,6 +249,9 @@ def score_phases(
                 movement_score += (
                     queue_forecast.get((phase_index, link_index), 0.0)
                     * config.queue_forecast_weight
+                )
+                movement_score -= (
+                    graph_spillback_risk * config.downstream_graph_weight
                 )
             if has_demand:
                 movement_score += demand_wait_bonus(
