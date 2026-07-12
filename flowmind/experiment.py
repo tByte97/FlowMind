@@ -75,6 +75,7 @@ from .queue_forecast import (
     load_queue_forecast_models,
 )
 from .sumo_tls_adapter import SumoTlsSafetyAdapter
+from .sumo_zone_graph_adapter import SumoZoneGraphAdapter
 from .tls_programs import (
     ActiveTlsProgram,
     StaticProgramActivation,
@@ -88,6 +89,7 @@ from .tls_safety import (
     validate_tls_catalog,
 )
 from .tls_safety_audit import write_tls_safety_startup_audit
+from .zone_graph import AreaGraph, load_zone_definition
 
 
 def configure_projection_data() -> Path | None:
@@ -151,6 +153,7 @@ def run_experiment(config: RunConfig) -> dict[str, object]:
     connection = None
     try:
         area = load_area(config)
+        zone_definition = load_zone_definition(config.zone_path)
         net_path = config.config_path.resolve().parent / "osm.net.xml.gz"
         queue_forecast = load_queue_forecast(config)
         queue_forecast_stats = (
@@ -170,6 +173,7 @@ def run_experiment(config: RunConfig) -> dict[str, object]:
         tls_program_audit_path: Path | None = None
         tls_safety_report: TlsSafetyReport | None = None
         tls_safety_audit_path: Path | None = None
+        area_graph: AreaGraph | None = None
         dataset_collector = None
         session_events = [
             DecisionEvent(
@@ -311,6 +315,24 @@ def run_experiment(config: RunConfig) -> dict[str, object]:
                 level="success",
             )
         )
+        if config.mode in ADAPTIVE_CONTROL_MODES:
+            area_graph = SumoZoneGraphAdapter(net_path).build_graph(
+                zone_definition,
+                area,
+            )
+            session_events.append(
+                DecisionEvent(
+                    time=0.0,
+                    category="system",
+                    title="Зональний дорожній граф побудовано",
+                    detail=(
+                        f"{len(area_graph.segments)} directed segments, "
+                        f"{len(area_graph.node_storage)} storage nodes і "
+                        f"{len(area_graph.monitored_lane_ids)} monitored lanes."
+                    ),
+                    level="success",
+                )
+            )
         priority_vehicle = (
             config.emergency.vehicle_id
             if config.emergency is not None
@@ -325,6 +347,7 @@ def run_experiment(config: RunConfig) -> dict[str, object]:
                 priority_vehicle,
                 queue_forecast,
                 config.dataset_sample_interval,
+                area_graph,
             )
             if config.mode in ADAPTIVE_CONTROL_MODES
             else None
@@ -402,6 +425,7 @@ def run_experiment(config: RunConfig) -> dict[str, object]:
                     queue_forecast=queue_forecast,
                     active_tls_programs=active_tls_programs,
                     tls_safety_report=tls_safety_report,
+                    area_graph=area_graph,
                     running=True,
                 ),
                 decision_log=build_decision_log(
@@ -421,6 +445,7 @@ def run_experiment(config: RunConfig) -> dict[str, object]:
                 tls_program_audit_path,
             )
         )
+        summary.update(area_graph_summary(area_graph))
         summary.update(
             tls_safety_summary(
                 tls_safety_report,
@@ -509,6 +534,7 @@ def run_experiment(config: RunConfig) -> dict[str, object]:
                 queue_forecast=queue_forecast,
                 active_tls_programs=active_tls_programs,
                 tls_safety_report=tls_safety_report,
+                area_graph=area_graph,
                 running=False,
             ),
             decision_log=build_decision_log(
@@ -598,6 +624,12 @@ def write_live_run_status(
             "errors": 0,
             "warnings": 0,
         }
+        system["area_graph"] = {
+            "status": "waiting",
+            "segments": 0,
+            "storage_nodes": 0,
+            "monitored_lanes": 0,
+        }
     else:
         system.setdefault(
             "tls_programs",
@@ -612,6 +644,15 @@ def write_live_run_status(
                 "conflicts": 0,
                 "errors": 0,
                 "warnings": 0,
+            },
+        )
+        system.setdefault(
+            "area_graph",
+            {
+                "status": "waiting",
+                "segments": 0,
+                "storage_nodes": 0,
+                "monitored_lanes": 0,
             },
         )
     system.setdefault("queue_forecast", {"status": "waiting"})
@@ -651,6 +692,7 @@ def build_live_system_status(
     running: bool,
     active_tls_programs: tuple[ActiveTlsProgram, ...] = (),
     tls_safety_report: TlsSafetyReport | None = None,
+    area_graph: AreaGraph | None = None,
 ) -> dict[str, object]:
     controller_stats = controller.stats if controller is not None else None
     corridor_summary = (
@@ -720,6 +762,16 @@ def build_live_system_status(
             "errors": tls_safety_report.error_count if tls_safety_report else 0,
             "warnings": (
                 tls_safety_report.warning_count if tls_safety_report else 0
+            ),
+        },
+        "area_graph": {
+            "status": "active" if area_graph is not None else "disabled",
+            "segments": len(area_graph.segments) if area_graph is not None else 0,
+            "storage_nodes": (
+                len(area_graph.node_storage) if area_graph is not None else 0
+            ),
+            "monitored_lanes": (
+                len(area_graph.monitored_lane_ids) if area_graph is not None else 0
             ),
         },
         "queue_forecast": {
@@ -850,6 +902,17 @@ def tls_safety_summary(
             report.warning_count if report is not None else 0
         ),
         "tls_safety_startup_audit": str(audit_path) if audit_path else "",
+    }
+
+
+def area_graph_summary(graph: AreaGraph | None) -> dict[str, object]:
+    return {
+        "area_graph_enabled": graph is not None,
+        "area_graph_segment_count": len(graph.segments) if graph else 0,
+        "area_graph_storage_node_count": len(graph.node_storage) if graph else 0,
+        "area_graph_monitored_lane_count": (
+            len(graph.monitored_lane_ids) if graph else 0
+        ),
     }
 
 

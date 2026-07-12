@@ -113,6 +113,65 @@ class AreaSignalControllerTest(unittest.TestCase):
         self.assertEqual(controller.stats.scoreless_skips, 1)
         self.assertEqual(controller.stats.advances, 1)
 
+    def test_all_intersections_are_prepared_before_first_tls_write(self) -> None:
+        class MultiTrafficLightDomain:
+            def __init__(self) -> None:
+                self.events: list[str] = []
+                self.phases = {"tls-a": 0, "tls-b": 0}
+
+            def getPhase(self, tls_id: str) -> int:
+                self.events.append(f"read:{tls_id}")
+                return self.phases[tls_id]
+
+            def getSpentDuration(self, _tls_id: str) -> float:
+                return 12.0
+
+            def setPhase(self, tls_id: str, phase: int) -> None:
+                self.events.append(f"write:{tls_id}")
+                self.phases[tls_id] = phase
+
+            def setPhaseDuration(self, _tls_id: str, _duration: float) -> None:
+                return None
+
+        traci = FakeTraci()
+        traci.trafficlight = MultiTrafficLightDomain()
+        traci.lane.counts = {
+            "a-north": 0,
+            "a-south": 0,
+            "a-east": 10,
+            "a-west": 0,
+            "b-north": 0,
+            "b-south": 0,
+            "b-east": 10,
+            "b-west": 0,
+        }
+        area = AreaModel(
+            tuple(
+                Intersection(
+                    tls_id=f"tls-{suffix}",
+                    position=(0.0, 0.0),
+                    phases=("Gr", "yr", "rG", "ry"),
+                    links=(
+                        ControlledLink(f"{suffix}-north", f"{suffix}-south", 0),
+                        ControlledLink(f"{suffix}-east", f"{suffix}-west", 1),
+                    ),
+                )
+                for suffix in ("a", "b")
+            )
+        )
+        controller = AreaSignalController(
+            traci,
+            area,
+            "flowmind",
+            ControlConfig(),
+        )
+
+        controller.step(12.0)
+
+        events = traci.trafficlight.events
+        self.assertLess(events.index("read:tls-b"), events.index("write:tls-a"))
+        self.assertEqual(traci.trafficlight.phases, {"tls-a": 1, "tls-b": 1})
+
 
 if __name__ == "__main__":
     unittest.main()

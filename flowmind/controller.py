@@ -9,6 +9,7 @@ from .priority_flow import priority_links
 from .queue_forecast import QueueForecastEnsemble, QueueForecastModel
 from .safety_validator import SafetyValidator, clearance_duration
 from .signal_policy import (
+    PhaseScore,
     area_pressure_by_incoming_lane,
     choose_phase,
     effective_max_green,
@@ -16,7 +17,8 @@ from .signal_policy import (
     lane_has_demand,
     score_phases,
 )
-from .traffic_state import TrafficStateReader
+from .traffic_state import TrafficState, TrafficStateReader
+from .zone_graph import AreaGraph, AreaDecisionSnapshot, build_area_decision_snapshot
 
 
 @dataclass
@@ -27,6 +29,16 @@ class QueueForecastSample:
     min_prediction: float
     mean_prediction: float
     max_prediction: float
+
+
+@dataclass(frozen=True)
+class PreparedIntersectionDecision:
+    intersection: Intersection
+    current_phase: int
+    spent: float
+    max_green: float
+    priority_link: int | None
+    scores: tuple[PhaseScore, ...]
 
 
 @dataclass
@@ -61,6 +73,7 @@ class AreaSignalController:
         priority_vehicle: str | None = None,
         queue_forecast: QueueForecastModel | QueueForecastEnsemble | None = None,
         queue_forecast_sample_interval: int = 5,
+        area_graph: AreaGraph | None = None,
     ) -> None:
         if mode not in {"local", "flowmind"}:
             raise ValueError("Adaptive controller mode must be local or flowmind")
@@ -71,11 +84,13 @@ class AreaSignalController:
         self._priority_vehicle = priority_vehicle
         self._queue_forecast = queue_forecast if mode == "flowmind" else None
         self._queue_forecast_sample_interval = queue_forecast_sample_interval
+        self._area_graph = area_graph
         self._corridor_manager = None
         self._reader = TrafficStateReader(
             traci_connection,
             area,
             config.sensor_range_meters,
+            area_graph.monitored_lane_ids if area_graph is not None else (),
         )
         self._safety = SafetyValidator(traci_connection, area, config)
         self._lane_demand_started_at: dict[str, float] = {}
@@ -93,21 +108,18 @@ class AreaSignalController:
             traffic,
             simulation_time,
         )
-        area_pressure = (
-            area_pressure_by_incoming_lane(self._area, traffic, self._config)
-            if self._mode == "flowmind"
-            else {}
-        )
+        snapshot = self._area_snapshot(traffic, simulation_time)
         if self._corridor_manager is not None:
             overrides = self._corridor_manager.get_priority_overrides()
         else:
             overrides = priority_links(
                 self._traci, self._priority_vehicle, self._config
             )
+        prepared: list[PreparedIntersectionDecision] = []
         for intersection in self._area.intersections:
             tls_id = intersection.tls_id
             current_phase = int(self._traci.trafficlight.getPhase(tls_id))
-            if current_phase >= len(intersection.phases):
+            if not 0 <= current_phase < len(intersection.phases):
                 self.stats.phase_out_of_range_skips += 1
                 continue
             current_state = intersection.phases[current_phase]
@@ -160,97 +172,154 @@ class AreaSignalController:
                 self._mode,
                 self._config,
                 priority_link,
-                area_pressure,
+                snapshot.area_pressure_by_incoming_lane,
                 queue_forecast,
                 demand_wait_by_lane,
+                snapshot.downstream_risk_by_outgoing_lane,
             )
-            best = choose_phase(scores)
-            if best is None:
-                self.stats.scoreless_skips += 1
-                self.stats.decisions += 1
-                if priority_link is not None:
-                    self.stats.priority_decisions += 1
-                self._advance_to_clearance(
-                    intersection,
-                    current_phase,
-                    simulation_time,
-                    spent,
-                    priority=False,
-                    title="Закрито зелений через заповнений downstream",
-                    detail=(
-                        f"Перехрестя {tls_id}: безпечних зелених фаз "
-                        "немає; поточний рух закрито через "
-                        "clearance-фазу."
-                    ),
-                    level="warning",
+            prepared.append(
+                PreparedIntersectionDecision(
+                    intersection=intersection,
+                    current_phase=current_phase,
+                    spent=spent,
+                    max_green=max_green,
+                    priority_link=priority_link,
+                    scores=scores,
                 )
-                continue
-            current_score = next(
-                (item.score for item in scores if item.phase_index == current_phase),
-                float("-inf"),
             )
 
+        for decision in prepared:
+            self._apply_prepared_decision(decision, simulation_time)
+
+    def _area_snapshot(
+        self,
+        traffic: TrafficState,
+        simulation_time: float,
+    ) -> AreaDecisionSnapshot:
+        if self._area_graph is not None and self._mode == "flowmind":
+            return build_area_decision_snapshot(
+                self._area,
+                self._area_graph,
+                traffic,
+                simulation_time,
+                self._config,
+            )
+        return AreaDecisionSnapshot(
+            simulation_time=float(simulation_time),
+            traffic=traffic,
+            segment_states={},
+            node_states={},
+            downstream_risk_by_outgoing_lane={},
+            area_pressure_by_incoming_lane=(
+                area_pressure_by_incoming_lane(
+                    self._area,
+                    traffic,
+                    self._config,
+                )
+                if self._mode == "flowmind"
+                else {}
+            ),
+        )
+
+    def _apply_prepared_decision(
+        self,
+        decision: PreparedIntersectionDecision,
+        simulation_time: float,
+    ) -> None:
+        intersection = decision.intersection
+        tls_id = intersection.tls_id
+        current_phase = decision.current_phase
+        spent = decision.spent
+        max_green = decision.max_green
+        priority_link = decision.priority_link
+        scores = decision.scores
+        best = choose_phase(scores)
+        if best is None:
+            self.stats.scoreless_skips += 1
             self.stats.decisions += 1
             if priority_link is not None:
                 self.stats.priority_decisions += 1
+            self._advance_to_clearance(
+                intersection,
+                current_phase,
+                simulation_time,
+                spent,
+                priority=False,
+                title="Закрито зелений через заповнений downstream",
+                detail=(
+                    f"Перехрестя {tls_id}: безпечних зелених фаз "
+                    "немає; поточний рух закрито через "
+                    "clearance-фазу."
+                ),
+                level="warning",
+            )
+            return
+        current_score = next(
+            (item.score for item in scores if item.phase_index == current_phase),
+            float("-inf"),
+        )
 
-            should_extend = (
-                best.phase_index == current_phase
-                or current_score >= best.score - self._config.hysteresis
-            ) and spent < max_green
-            if should_extend:
-                safety = self._safety.validate_extension(
-                    tls_id,
-                    current_phase,
-                    simulation_time,
-                    spent_duration=spent,
-                    priority=priority_link is not None,
-                )
-                if not safety.allowed:
-                    continue
-                remaining = min(
-                    float(self._config.decision_interval),
-                    max_green - spent,
-                )
-                self._traci.trafficlight.setPhaseDuration(
-                    tls_id,
-                    max(remaining, 1.0),
-                )
-                self.stats.extensions += 1
-                self._record_decision(
-                    simulation_time,
-                    tls_id,
-                    (
-                        "Продовжено зелений для швидкої"
-                        if priority_link is not None
-                        else "Продовжено зелену фазу"
-                    ),
-                    (
-                        f"Перехрестя {tls_id}: фаза {current_phase} продовжена "
-                        f"на {max(remaining, 1.0):.0f} с; оцінка попиту "
-                        f"{best.score:.2f}."
-                    ),
-                    "success" if priority_link is not None else "info",
-                )
-            else:
-                self._advance_to_clearance(
-                    intersection,
-                    current_phase,
-                    simulation_time,
-                    spent,
-                    priority=priority_link is not None,
-                    title=(
-                        "Підготовлено фазу для швидкої"
-                        if priority_link is not None
-                        else "Змінено фазу через стан черги"
-                    ),
-                    detail=(
-                        f"Перехрестя {tls_id}: перехід із фази {current_phase} "
-                        f"до {(current_phase + 1) % len(intersection.phases)}; "
-                        f"найкраща оцінка {best.score:.2f}."
-                    ),
-                    level="warning" if priority_link is not None else "info",
-                )
+        self.stats.decisions += 1
+        if priority_link is not None:
+            self.stats.priority_decisions += 1
+
+        should_extend = (
+            best.phase_index == current_phase
+            or current_score >= best.score - self._config.hysteresis
+        ) and spent < max_green
+        if should_extend:
+            safety = self._safety.validate_extension(
+                tls_id,
+                current_phase,
+                simulation_time,
+                spent_duration=spent,
+                priority=priority_link is not None,
+            )
+            if not safety.allowed:
+                return
+            remaining = min(
+                float(self._config.decision_interval),
+                max_green - spent,
+            )
+            self._traci.trafficlight.setPhaseDuration(
+                tls_id,
+                max(remaining, 1.0),
+            )
+            self.stats.extensions += 1
+            self._record_decision(
+                simulation_time,
+                tls_id,
+                (
+                    "Продовжено зелений для швидкої"
+                    if priority_link is not None
+                    else "Продовжено зелену фазу"
+                ),
+                (
+                    f"Перехрестя {tls_id}: фаза {current_phase} продовжена "
+                    f"на {max(remaining, 1.0):.0f} с; оцінка попиту "
+                    f"{best.score:.2f}."
+                ),
+                "success" if priority_link is not None else "info",
+            )
+        else:
+            self._advance_to_clearance(
+                intersection,
+                current_phase,
+                simulation_time,
+                spent,
+                priority=priority_link is not None,
+                title=(
+                    "Підготовлено фазу для швидкої"
+                    if priority_link is not None
+                    else "Змінено фазу через стан черги"
+                ),
+                detail=(
+                    f"Перехрестя {tls_id}: перехід із фази {current_phase} "
+                    f"до {(current_phase + 1) % len(intersection.phases)}; "
+                    f"найкраща оцінка {best.score:.2f}."
+                ),
+                level="warning" if priority_link is not None else "info",
+            )
 
     def _advance_to_clearance(
         self,
