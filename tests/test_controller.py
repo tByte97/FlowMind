@@ -61,9 +61,9 @@ class FakeTraci:
 
 
 class AreaSignalControllerTest(unittest.TestCase):
-    def test_entering_clearance_applies_real_sumo_phase_duration(self) -> None:
-        traci = FakeTraci()
-        area = AreaModel(
+    @staticmethod
+    def area() -> AreaModel:
+        return AreaModel(
             (
                 Intersection(
                     tls_id="tls",
@@ -77,9 +77,12 @@ class AreaSignalControllerTest(unittest.TestCase):
                 ),
             )
         )
+
+    def test_entering_clearance_applies_real_sumo_phase_duration(self) -> None:
+        traci = FakeTraci()
         controller = AreaSignalController(
             traci,
-            area,
+            self.area(),
             "local",
             ControlConfig(clearance_seconds=5),
         )
@@ -88,6 +91,27 @@ class AreaSignalControllerTest(unittest.TestCase):
 
         self.assertEqual(traci.trafficlight.phase, 1)
         self.assertEqual(traci.trafficlight.phase_durations, [("tls", 3.0)])
+
+    def test_all_blocked_candidates_close_current_green(self) -> None:
+        traci = FakeTraci()
+        traci.lane.counts = {
+            "north": 10,
+            "south": 16,
+            "east": 10,
+            "west": 16,
+        }
+        controller = AreaSignalController(
+            traci,
+            self.area(),
+            "flowmind",
+            ControlConfig(),
+        )
+
+        controller.step(12.0)
+
+        self.assertEqual(traci.trafficlight.phase, 1)
+        self.assertEqual(controller.stats.scoreless_skips, 1)
+        self.assertEqual(controller.stats.advances, 1)
 
 
 if __name__ == "__main__":

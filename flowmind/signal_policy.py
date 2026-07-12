@@ -196,6 +196,17 @@ def score_phases(
             incoming = state.lane(link.incoming_lane)
             outgoing = state.lane(link.outgoing_lane)
             has_demand = lane_has_demand(incoming, config)
+            is_priority_movement = (
+                priority_link is not None
+                and link.signal_index == priority_link
+            )
+            if is_priority_movement and movement_has_blocked_downstream(
+                outgoing,
+                config,
+                required_storage_slots=config.priority_min_storage_slots,
+            ):
+                blocked_downstream = True
+                break
             if has_demand and movement_has_blocked_downstream(
                 outgoing,
                 config,

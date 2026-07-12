@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from .area_model import AreaModel
+from .area_model import AreaModel, Intersection
 from .config import ControlConfig
 from .decision_feed import DecisionEvent
 from .priority_flow import priority_links
@@ -167,6 +167,23 @@ class AreaSignalController:
             best = choose_phase(scores)
             if best is None:
                 self.stats.scoreless_skips += 1
+                self.stats.decisions += 1
+                if priority_link is not None:
+                    self.stats.priority_decisions += 1
+                self._advance_to_clearance(
+                    intersection,
+                    current_phase,
+                    simulation_time,
+                    spent,
+                    priority=False,
+                    title="Закрито зелений через заповнений downstream",
+                    detail=(
+                        f"Перехрестя {tls_id}: безпечних зелених фаз "
+                        "немає; поточний рух закрито через "
+                        "clearance-фазу."
+                    ),
+                    level="warning",
+                )
                 continue
             current_score = next(
                 (item.score for item in scores if item.phase_index == current_phase),
@@ -216,45 +233,71 @@ class AreaSignalController:
                     "success" if priority_link is not None else "info",
                 )
             else:
-                next_phase = (current_phase + 1) % len(intersection.phases)
-                safety = self._safety.validate_transition(
-                    tls_id,
+                self._advance_to_clearance(
+                    intersection,
                     current_phase,
-                    next_phase,
                     simulation_time,
-                    spent_duration=spent,
+                    spent,
                     priority=priority_link is not None,
-                )
-                if not safety.allowed:
-                    continue
-                self._traci.trafficlight.setPhase(tls_id, next_phase)
-                next_state = intersection.phases[next_phase]
-                if "y" in next_state.lower() or not any(
-                    signal in "GgYy" for signal in next_state
-                ):
-                    self._traci.trafficlight.setPhaseDuration(
-                        tls_id,
-                        clearance_duration(
-                            intersection,
-                            next_phase,
-                            self._config.clearance_seconds,
-                        ),
-                    )
-                self.stats.advances += 1
-                self._record_decision(
-                    simulation_time,
-                    tls_id,
-                    (
+                    title=(
                         "Підготовлено фазу для швидкої"
                         if priority_link is not None
                         else "Змінено фазу через стан черги"
                     ),
-                    (
+                    detail=(
                         f"Перехрестя {tls_id}: перехід із фази {current_phase} "
-                        f"до {next_phase}; найкраща оцінка {best.score:.2f}."
+                        f"до {(current_phase + 1) % len(intersection.phases)}; "
+                        f"найкраща оцінка {best.score:.2f}."
                     ),
-                    "warning" if priority_link is not None else "info",
+                    level="warning" if priority_link is not None else "info",
                 )
+
+    def _advance_to_clearance(
+        self,
+        intersection: Intersection,
+        current_phase: int,
+        simulation_time: float,
+        spent: float,
+        *,
+        priority: bool,
+        title: str,
+        detail: str,
+        level: str,
+    ) -> bool:
+        tls_id = intersection.tls_id
+        next_phase = (current_phase + 1) % len(intersection.phases)
+        safety = self._safety.validate_transition(
+            tls_id,
+            current_phase,
+            next_phase,
+            simulation_time,
+            spent_duration=spent,
+            priority=priority,
+        )
+        if not safety.allowed:
+            return False
+        self._traci.trafficlight.setPhase(tls_id, next_phase)
+        next_state = intersection.phases[next_phase]
+        if "y" in next_state.lower() or not any(
+            signal in "GgYy" for signal in next_state
+        ):
+            self._traci.trafficlight.setPhaseDuration(
+                tls_id,
+                clearance_duration(
+                    intersection,
+                    next_phase,
+                    self._config.clearance_seconds,
+                ),
+            )
+        self.stats.advances += 1
+        self._record_decision(
+            simulation_time,
+            tls_id,
+            title,
+            detail,
+            level,
+        )
+        return True
 
     def _update_demand_timers(
         self,

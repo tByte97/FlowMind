@@ -134,8 +134,42 @@ class SignalPolicyTest(unittest.TestCase):
         self.assertIsNotNone(best)
         self.assertEqual(best.phase_index, 2)
 
+    def test_priority_requires_storage_even_before_vehicle_reaches_sensor(self) -> None:
+        state = TrafficState(
+            {
+                "north": LaneState(0, 0, 0.0, 0.0, 15.0),
+                "south": LaneState(0, 12, 0.70, 8.0, 1.5),
+                "east": LaneState(3, 3, 0.2, 0.0, 8.0),
+                "west": LaneState(0, 0, 0.0, 10.0, 15.0),
+            }
+        )
+
+        regular_scores = score_phases(
+            self.intersection,
+            state,
+            "flowmind",
+            self.config,
+        )
+        priority_scores = score_phases(
+            self.intersection,
+            state,
+            "flowmind",
+            self.config,
+            priority_link=0,
+        )
+
+        self.assertIn(0, [item.phase_index for item in regular_scores])
+        self.assertNotIn(0, [item.phase_index for item in priority_scores])
+
     def test_priority_link_overrides_regular_score(self) -> None:
-        state = TrafficState({})
+        state = TrafficState(
+            {
+                "north": LaneState(0, 0, 0.0, 0.0, 15.0),
+                "south": LaneState(0, 0, 0.0, 10.0, 15.0),
+                "east": LaneState(0, 0, 0.0, 0.0, 15.0),
+                "west": LaneState(0, 0, 0.0, 10.0, 15.0),
+            }
+        )
         best = choose_phase(
             score_phases(
                 self.intersection,

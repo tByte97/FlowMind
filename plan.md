@@ -250,10 +250,12 @@
   - [x] На старті логувати active SUMO program ID і type для кожного TLS.
   - [x] Додати в Intersection program_id, program_type, minDur, maxDur.
   - [x] Заборонити transition раніше SUMO minDur.
-  - [x] Узгодити clearance_seconds із реальними yellow/all-red фазами.
-  - [x] Додати hard gate для blocked downstream.
-  - [x] Для emergency дозволяти рух лише за наявності гарантованого storage
-    space.
+  - [x] При вході в yellow/all-red застосовувати реальні SUMO
+    duration/minDur; clearance_seconds використовувати лише як fallback.
+  - [x] Додати demand-aware hard gate для blocked downstream з
+    мінімальним запасом free storage slots.
+  - [x] Для emergency вимагати окремий гарантований storage buffer,
+    навіть якщо авто ще не потрапило в sensor window.
 
   - [ ] Додати конфліктну матрицю рухів та startup-validation усіх TLS plans.
 
