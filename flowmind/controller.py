@@ -57,6 +57,12 @@ class ControllerStats:
     scoreless_skips: int = 0
     queue_forecast_predictions: int = 0
     queue_forecast_failures: int = 0
+    sensor_failures: int = 0
+    stale_lane_samples: int = 0
+    invalid_state_skips: int = 0
+    fallback_activations: int = 0
+    safety_rejections: int = 0
+    safety_rejection_reasons: dict[str, int] = field(default_factory=dict)
     queue_forecast_samples: list[QueueForecastSample] = field(default_factory=list)
     decision_events: list[DecisionEvent] = field(default_factory=list)
 
@@ -95,19 +101,37 @@ class AreaSignalController:
             area,
             config.sensor_range_meters,
             area_graph.monitored_lane_ids if area_graph is not None else (),
+            config.sensor_last_known_good_ttl,
         )
         self._safety = SafetyValidator(traci_connection, area, config)
         self._lane_demand_started_at: dict[str, float] = {}
+        self._next_decision_at = float(config.decision_interval)
+        self._fallback_active = False
         self.stats = ControllerStats()
 
     def set_corridor_manager(self, manager: object) -> None:
         self._corridor_manager = manager
 
     def step(self, simulation_time: float) -> None:
-        if int(simulation_time) % self._config.decision_interval:
+        if not self._decision_due(simulation_time):
             return
 
-        traffic = self._reader.read()
+        traffic = self._reader.read(simulation_time)
+        self.stats.sensor_failures += len(traffic.sensor_error_lane_ids)
+        self.stats.stale_lane_samples += len(traffic.stale_lane_ids)
+        if not traffic.usable:
+            self.stats.invalid_state_skips += 1
+            self._activate_fallback(simulation_time, traffic.invalid_lane_ids)
+            return
+        if self._fallback_active:
+            self._fallback_active = False
+            self._record_decision(
+                simulation_time,
+                "",
+                "Сенсорні дані відновлено",
+                "FlowMind повернувся з перевіреного TLS fallback до адаптивного керування.",
+                "success",
+            )
         demand_wait_by_lane = self._update_demand_timers(
             traffic,
             simulation_time,
@@ -195,6 +219,43 @@ class AreaSignalController:
         for decision in prepared:
             self._apply_prepared_decision(decision, simulation_time)
 
+    def _activate_fallback(
+        self,
+        simulation_time: float,
+        invalid_lane_ids: tuple[str, ...],
+    ) -> None:
+        if self._fallback_active:
+            return
+        trafficlight = self._traci.trafficlight
+        set_program = getattr(trafficlight, "setProgram", None)
+        if callable(set_program):
+            for intersection in self._area.intersections:
+                if intersection.program_id:
+                    set_program(intersection.tls_id, intersection.program_id)
+        self._fallback_active = True
+        self.stats.fallback_activations += 1
+        preview = ", ".join(invalid_lane_ids[:3])
+        suffix = "…" if len(invalid_lane_ids) > 3 else ""
+        self._record_decision(
+            simulation_time,
+            "",
+            "Активовано перевірений TLS fallback",
+            (
+                f"Невалідні lane samples: {preview}{suffix}. "
+                "Адаптивні команди призупинено."
+            ),
+            "warning",
+        )
+
+    def _decision_due(self, simulation_time: float) -> bool:
+        now = float(simulation_time)
+        if now + 1e-9 < self._next_decision_at:
+            return False
+        interval = float(self._config.decision_interval)
+        elapsed_intervals = int((now - self._next_decision_at) // interval) + 1
+        self._next_decision_at += elapsed_intervals * interval
+        return True
+
     def _area_snapshot(
         self,
         traffic: TrafficState,
@@ -280,6 +341,11 @@ class AreaSignalController:
                 priority=priority_link is not None,
             )
             if not safety.allowed:
+                self._record_safety_rejection(
+                    simulation_time,
+                    tls_id,
+                    safety.reason,
+                )
                 return
             remaining = min(
                 float(self._config.decision_interval),
@@ -348,6 +414,11 @@ class AreaSignalController:
             priority=priority,
         )
         if not safety.allowed:
+            self._record_safety_rejection(
+                simulation_time,
+                tls_id,
+                safety.reason,
+            )
             return False
         self._traci.trafficlight.setPhase(tls_id, next_phase)
         next_state = intersection.phases[next_phase]
@@ -371,6 +442,24 @@ class AreaSignalController:
             level,
         )
         return True
+
+    def _record_safety_rejection(
+        self,
+        simulation_time: float,
+        tls_id: str,
+        reason: str,
+    ) -> None:
+        self.stats.safety_rejections += 1
+        self.stats.safety_rejection_reasons[reason] = (
+            self.stats.safety_rejection_reasons.get(reason, 0) + 1
+        )
+        self._record_decision(
+            simulation_time,
+            tls_id,
+            "Safety відхилив команду",
+            f"Перехрестя {tls_id}: {reason}.",
+            "warning",
+        )
 
     def _update_demand_timers(
         self,

@@ -174,6 +174,7 @@ def run_experiment(config: RunConfig) -> dict[str, object]:
         tls_safety_report: TlsSafetyReport | None = None
         tls_safety_audit_path: Path | None = None
         area_graph: AreaGraph | None = None
+        telemetry_failures = 0
         dataset_collector = None
         session_events = [
             DecisionEvent(
@@ -358,7 +359,18 @@ def run_experiment(config: RunConfig) -> dict[str, object]:
             host="127.0.0.1",
             port=config.websocket_port,
         )
-        publisher.start()
+        publisher_error = start_publisher_resilient(publisher)
+        if publisher_error is not None:
+            telemetry_failures += 1
+            session_events.append(
+                DecisionEvent(
+                    time=0.0,
+                    category="system",
+                    title="Live telemetry недоступна",
+                    detail=publisher_error,
+                    level="warning",
+                )
+            )
         metrics = MetricsCollector(
             connection, area, config.control, priority_vehicle
         )
@@ -412,7 +424,8 @@ def run_experiment(config: RunConfig) -> dict[str, object]:
             if controller is not None:
                 controller.step(simulated_time)
             metrics.collect(simulated_time)
-            metrics.write_live_status(
+            if not write_live_status_resilient(
+                metrics,
                 config.results_dir,
                 config.mode,
                 simulated_time,
@@ -433,7 +446,8 @@ def run_experiment(config: RunConfig) -> dict[str, object]:
                     controller,
                     corridor_manager,
                 ),
-            )
+            ):
+                telemetry_failures += 1
             if dataset_collector is not None:
                 dataset_collector.collect(simulated_time)
 
@@ -480,6 +494,14 @@ def run_experiment(config: RunConfig) -> dict[str, object]:
                     "queue_forecast_trace_samples": len(
                         controller.stats.queue_forecast_samples
                     ),
+                    "sensor_failures": controller.stats.sensor_failures,
+                    "stale_lane_samples": controller.stats.stale_lane_samples,
+                    "invalid_state_skips": controller.stats.invalid_state_skips,
+                    "fallback_activations": controller.stats.fallback_activations,
+                    "safety_rejections": controller.stats.safety_rejections,
+                    "safety_rejection_reasons": (
+                        controller.stats.safety_rejection_reasons
+                    ),
                 }
             )
             write_queue_forecast_trace(
@@ -502,8 +524,15 @@ def run_experiment(config: RunConfig) -> dict[str, object]:
                     "queue_forecast_predictions": 0,
                     "queue_forecast_failures": 0,
                     "queue_forecast_trace_samples": 0,
+                    "sensor_failures": 0,
+                    "stale_lane_samples": 0,
+                    "invalid_state_skips": 0,
+                    "fallback_activations": 0,
+                    "safety_rejections": 0,
+                    "safety_rejection_reasons": {},
                 }
             )
+        summary["telemetry_failures"] = telemetry_failures
         summary.update(queue_forecast_summary(queue_forecast_stats))
         if dataset_collector is not None:
             summary.update(dataset_collector.write())
@@ -520,8 +549,8 @@ def run_experiment(config: RunConfig) -> dict[str, object]:
                 level="success",
             )
         )
-        metrics.write(config.results_dir, summary)
-        metrics.write_live_status(
+        if not write_live_status_resilient(
+            metrics,
             config.results_dir,
             config.mode,
             simulated_time,
@@ -542,7 +571,10 @@ def run_experiment(config: RunConfig) -> dict[str, object]:
                 controller,
                 corridor_manager,
             ),
-        )
+        ):
+            telemetry_failures += 1
+            summary["telemetry_failures"] = telemetry_failures
+        metrics.write(config.results_dir, summary)
         return summary
     except Exception as error:
         write_live_run_status(config, "failed", str(error))
@@ -738,6 +770,15 @@ def build_live_system_status(
                 if controller_stats
                 else 0
             ),
+            "sensor_failures": (
+                controller_stats.sensor_failures if controller_stats else 0
+            ),
+            "stale_lane_samples": (
+                controller_stats.stale_lane_samples if controller_stats else 0
+            ),
+            "fallback_activations": (
+                controller_stats.fallback_activations if controller_stats else 0
+            ),
         },
         "tls_programs": {
             "status": "audited" if active_tls_programs else "waiting",
@@ -814,6 +855,26 @@ def build_decision_log(
         controller_events,
         corridor_events,
     )
+
+
+def start_publisher_resilient(publisher: LiveTelemetryPublisher) -> str | None:
+    try:
+        publisher.start()
+    except Exception as error:
+        return str(error) or type(error).__name__
+    return None
+
+
+def write_live_status_resilient(
+    metrics: MetricsCollector,
+    *args: object,
+    **kwargs: object,
+) -> bool:
+    try:
+        metrics.write_live_status(*args, **kwargs)
+    except Exception:
+        return False
+    return True
 
 
 def load_queue_forecast(

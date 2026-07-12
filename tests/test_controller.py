@@ -5,12 +5,18 @@ import unittest
 from flowmind.area_model import AreaModel, ControlledLink, Intersection
 from flowmind.config import ControlConfig
 from flowmind.controller import AreaSignalController
+from flowmind.safety_validator import SafetyDecision
 
 
 class FakeLaneDomain:
     counts = {"north": 0, "south": 0, "east": 10, "west": 0}
 
+    def __init__(self) -> None:
+        self.fail = False
+
     def getLength(self, _lane_id: str) -> float:
+        if self.fail:
+            raise RuntimeError("sensor unavailable")
         return 120.0
 
     def getLastStepVehicleIDs(self, _lane_id: str) -> tuple[str, ...]:
@@ -39,8 +45,11 @@ class FakeTrafficLightDomain:
         self.phase = 0
         self.spent = 12.0
         self.phase_durations: list[tuple[str, float]] = []
+        self.get_phase_calls = 0
+        self.programs: list[tuple[str, str]] = []
 
     def getPhase(self, _tls_id: str) -> int:
+        self.get_phase_calls += 1
         return self.phase
 
     def getSpentDuration(self, _tls_id: str) -> float:
@@ -51,6 +60,9 @@ class FakeTrafficLightDomain:
 
     def setPhaseDuration(self, tls_id: str, duration: float) -> None:
         self.phase_durations.append((tls_id, duration))
+
+    def setProgram(self, tls_id: str, program_id: str) -> None:
+        self.programs.append((tls_id, program_id))
 
 
 class FakeTraci:
@@ -74,6 +86,7 @@ class AreaSignalControllerTest(unittest.TestCase):
                         ControlledLink("east", "west", 1),
                     ),
                     phase_durations=(6.0, 3.0, 6.0, 3.0),
+                    program_id="0",
                 ),
             )
         )
@@ -171,6 +184,69 @@ class AreaSignalControllerTest(unittest.TestCase):
         events = traci.trafficlight.events
         self.assertLess(events.index("read:tls-b"), events.index("write:tls-a"))
         self.assertEqual(traci.trafficlight.phases, {"tls-a": 1, "tls-b": 1})
+
+    def test_fractional_steps_trigger_only_one_decision_per_interval(self) -> None:
+        traci = FakeTraci()
+        controller = AreaSignalController(
+            traci,
+            self.area(),
+            "local",
+            ControlConfig(decision_interval=3),
+        )
+
+        controller.step(3.1)
+        calls_after_first_tick = traci.trafficlight.get_phase_calls
+        controller.step(3.5)
+        controller.step(3.9)
+
+        self.assertEqual(calls_after_first_tick, 1)
+        self.assertEqual(traci.trafficlight.get_phase_calls, 1)
+
+    def test_invalid_sensor_state_activates_verified_program_fallback(self) -> None:
+        traci = FakeTraci()
+        traci.lane.fail = True
+        controller = AreaSignalController(
+            traci,
+            self.area(),
+            "flowmind",
+            ControlConfig(sensor_last_known_good_ttl=2.0),
+        )
+
+        controller.step(3.0)
+        controller.step(6.0)
+
+        self.assertEqual(controller.stats.fallback_activations, 1)
+        self.assertEqual(controller.stats.invalid_state_skips, 2)
+        self.assertGreater(controller.stats.sensor_failures, 0)
+        self.assertEqual(traci.trafficlight.programs, [("tls", "0")])
+        self.assertEqual(traci.trafficlight.get_phase_calls, 0)
+
+    def test_safety_rejection_reason_is_counted_and_logged(self) -> None:
+        class RejectingSafety:
+            @staticmethod
+            def validate_transition(*_args: object, **_kwargs: object) -> SafetyDecision:
+                return SafetyDecision(False, "test safety reason")
+
+        traci = FakeTraci()
+        controller = AreaSignalController(
+            traci,
+            self.area(),
+            "local",
+            ControlConfig(),
+        )
+        controller._safety = RejectingSafety()  # type: ignore[assignment]
+
+        controller.step(12.0)
+
+        self.assertEqual(controller.stats.safety_rejections, 1)
+        self.assertEqual(
+            controller.stats.safety_rejection_reasons,
+            {"test safety reason": 1},
+        )
+        self.assertEqual(
+            controller.stats.decision_events[-1].title,
+            "Safety відхилив команду",
+        )
 
 
 if __name__ == "__main__":

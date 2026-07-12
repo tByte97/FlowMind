@@ -18,6 +18,25 @@ from flowmind.tls_safety import TlsSafetyReport
 
 
 class ExperimentEnvironmentTest(unittest.TestCase):
+    def test_telemetry_failures_are_isolated_from_control_loop(self) -> None:
+        class BrokenPublisher:
+            @staticmethod
+            def start() -> None:
+                raise RuntimeError("port busy")
+
+        class BrokenMetrics:
+            @staticmethod
+            def write_live_status(*_args: object, **_kwargs: object) -> None:
+                raise OSError("dashboard storage unavailable")
+
+        self.assertEqual(
+            experiment.start_publisher_resilient(BrokenPublisher()),  # type: ignore[arg-type]
+            "port busy",
+        )
+        self.assertFalse(
+            experiment.write_live_status_resilient(BrokenMetrics())  # type: ignore[arg-type]
+        )
+
     def test_all_explicit_control_modes_are_accepted(self) -> None:
         self.assertEqual(
             tuple(RunConfig(mode=mode).mode for mode in CONTROL_MODES),
