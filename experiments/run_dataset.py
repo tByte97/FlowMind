@@ -387,6 +387,7 @@ def main() -> None:
                     dataset_scenario=args.scenario_name,
                     dataset_sample_interval=run.sample_interval,
                     dataset_target_horizons=tuple(args.target_horizons),
+                    enable_live_telemetry=False,
                 )
             )
             row.update(summary)

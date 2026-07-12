@@ -269,11 +269,42 @@ docker compose -f compose.yaml -f compose.server.yaml up -d --build web
 FLOWMIND_RESULTS_DIR=/app/results
 FLOWMIND_WEB_RESULTS_DIR=/app/results/web_demo
 FLOWMIND_CPU_THREADS=4
+FLOWMIND_EVALUATION_REPLICATES=30
+FLOWMIND_EVALUATION_DURATION=1800
+FLOWMIND_EVALUATION_WORKERS=4
+FLOWMIND_EVALUATION_ID=rivne_full_v1
 GEMINI_API_KEY=
 GEMINI_MODEL=gemini-3.1-flash-lite
 ```
 
-`/app/results` винесено в persistent Docker volume `flowmind_results`.
+`/app/results` винесено в persistent volume `flowmind_results`, а активні
+моделі — у `flowmind_models`. Перший запуск копіює bundled models з image у
+порожній models volume; trainer потім оновлює цей volume.
+
+Серверний workflow:
+
+```bash
+# 1. Зібрати образ і підняти web.
+docker compose -f compose.yaml -f compose.server.yaml build web
+docker compose -f compose.yaml -f compose.server.yaml up -d web
+
+# 2. Зібрати повний training dataset (400 resumable runs).
+docker compose --profile dataset \
+  -f compose.yaml -f compose.server.yaml up dataset
+
+# 3. Навчити ensemble; під час цього не запускати нові симуляції.
+docker compose --profile training \
+  -f compose.yaml -f compose.server.yaml up trainer
+
+# 4. Виконати resumable 30-pair evaluation на нових моделях.
+docker compose --profile evaluation \
+  -f compose.yaml -f compose.server.yaml up evaluation
+```
+
+Jobs можна від'єднати від terminal через `up -d`, а стан дивитися командами
+`docker compose logs -f dataset`, `docker compose logs -f trainer` і
+`docker compose logs -f evaluation`. Повторний `up` використовує `--resume`
+для dataset/evaluation і не приймає неповні summaries як завершені runs.
 
 ## Dataset і тренування
 
