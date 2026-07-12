@@ -74,6 +74,7 @@ from .queue_forecast import (
     QueueForecastStats,
     load_queue_forecast_models,
 )
+from .sumo_tls_adapter import SumoTlsSafetyAdapter
 from .tls_programs import (
     ActiveTlsProgram,
     StaticProgramActivation,
@@ -81,6 +82,12 @@ from .tls_programs import (
     inspect_active_tls_programs,
     write_tls_program_startup_audit,
 )
+from .tls_safety import (
+    ActivePlanExpectation,
+    TlsSafetyReport,
+    validate_tls_catalog,
+)
+from .tls_safety_audit import write_tls_safety_startup_audit
 
 
 def configure_projection_data() -> Path | None:
@@ -161,6 +168,8 @@ def run_experiment(config: RunConfig) -> dict[str, object]:
         static_programs: tuple[StaticProgramActivation, ...] = ()
         active_tls_programs: tuple[ActiveTlsProgram, ...] = ()
         tls_program_audit_path: Path | None = None
+        tls_safety_report: TlsSafetyReport | None = None
+        tls_safety_audit_path: Path | None = None
         dataset_collector = None
         session_events = [
             DecisionEvent(
@@ -248,6 +257,32 @@ def run_experiment(config: RunConfig) -> dict[str, object]:
             config.mode,
             active_tls_programs,
         )
+        tls_safety_catalog = SumoTlsSafetyAdapter(
+            net_path,
+            connection,
+        ).load_catalog(area.tls_ids)
+        expected_active_plans = (
+            {}
+            if config.mode == STATIC_FIXED_MODE
+            else {
+                intersection.tls_id: ActivePlanExpectation(
+                    program_id=intersection.program_id,
+                    phase_states=intersection.phases,
+                )
+                for intersection in area.intersections
+            }
+        )
+        tls_safety_report = validate_tls_catalog(
+            tls_safety_catalog,
+            expected_active_plans,
+        )
+        tls_safety_audit_path = write_tls_safety_startup_audit(
+            config.results_dir,
+            config.mode,
+            tls_safety_catalog,
+            tls_safety_report,
+        )
+        tls_safety_report.raise_for_errors()
         session_events.extend(
             DecisionEvent(
                 time=0.0,
@@ -261,6 +296,20 @@ def run_experiment(config: RunConfig) -> dict[str, object]:
                 tls_id=program.tls_id,
             )
             for program in active_tls_programs
+        )
+        session_events.append(
+            DecisionEvent(
+                time=0.0,
+                category="system",
+                title="TLS safety-плани перевірено",
+                detail=(
+                    f"{tls_safety_report.plan_count} програм, "
+                    f"{tls_safety_report.movement_count} рухів і "
+                    f"{tls_safety_report.conflict_count} конфліктних пар; "
+                    f"warnings: {tls_safety_report.warning_count}."
+                ),
+                level="success",
+            )
         )
         priority_vehicle = (
             config.emergency.vehicle_id
@@ -352,6 +401,7 @@ def run_experiment(config: RunConfig) -> dict[str, object]:
                     publisher=publisher,
                     queue_forecast=queue_forecast,
                     active_tls_programs=active_tls_programs,
+                    tls_safety_report=tls_safety_report,
                     running=True,
                 ),
                 decision_log=build_decision_log(
@@ -369,6 +419,12 @@ def run_experiment(config: RunConfig) -> dict[str, object]:
             active_tls_program_summary(
                 active_tls_programs,
                 tls_program_audit_path,
+            )
+        )
+        summary.update(
+            tls_safety_summary(
+                tls_safety_report,
+                tls_safety_audit_path,
             )
         )
         if emergency_details is not None:
@@ -452,6 +508,7 @@ def run_experiment(config: RunConfig) -> dict[str, object]:
                 publisher=publisher,
                 queue_forecast=queue_forecast,
                 active_tls_programs=active_tls_programs,
+                tls_safety_report=tls_safety_report,
                 running=False,
             ),
             decision_log=build_decision_log(
@@ -533,10 +590,29 @@ def write_live_run_status(
             "count": 0,
             "items": [],
         }
+        system["tls_safety"] = {
+            "status": "waiting",
+            "plans": 0,
+            "movements": 0,
+            "conflicts": 0,
+            "errors": 0,
+            "warnings": 0,
+        }
     else:
         system.setdefault(
             "tls_programs",
             {"status": "waiting", "count": 0, "items": []},
+        )
+        system.setdefault(
+            "tls_safety",
+            {
+                "status": "waiting",
+                "plans": 0,
+                "movements": 0,
+                "conflicts": 0,
+                "errors": 0,
+                "warnings": 0,
+            },
         )
     system.setdefault("queue_forecast", {"status": "waiting"})
     system.setdefault("corridor", {"corridor_state": "waiting"})
@@ -574,6 +650,7 @@ def build_live_system_status(
     queue_forecast: QueueForecastModel | QueueForecastEnsemble | None,
     running: bool,
     active_tls_programs: tuple[ActiveTlsProgram, ...] = (),
+    tls_safety_report: TlsSafetyReport | None = None,
 ) -> dict[str, object]:
     controller_stats = controller.stats if controller is not None else None
     corridor_summary = (
@@ -626,6 +703,24 @@ def build_live_system_status(
             "items": [
                 program.as_payload() for program in active_tls_programs
             ],
+        },
+        "tls_safety": {
+            "status": (
+                "valid"
+                if tls_safety_report is not None and tls_safety_report.valid
+                else "waiting"
+            ),
+            "plans": tls_safety_report.plan_count if tls_safety_report else 0,
+            "movements": (
+                tls_safety_report.movement_count if tls_safety_report else 0
+            ),
+            "conflicts": (
+                tls_safety_report.conflict_count if tls_safety_report else 0
+            ),
+            "errors": tls_safety_report.error_count if tls_safety_report else 0,
+            "warnings": (
+                tls_safety_report.warning_count if tls_safety_report else 0
+            ),
         },
         "queue_forecast": {
             "status": "active" if queue_forecast is not None else "disabled",
@@ -735,6 +830,26 @@ def active_tls_program_summary(
             for program in programs
         ),
         "tls_program_startup_audit": str(audit_path) if audit_path else "",
+    }
+
+
+def tls_safety_summary(
+    report: TlsSafetyReport | None,
+    audit_path: Path | None,
+) -> dict[str, object]:
+    return {
+        "tls_safety_valid": report.valid if report is not None else False,
+        "tls_safety_plan_count": report.plan_count if report is not None else 0,
+        "tls_safety_movement_count": (
+            report.movement_count if report is not None else 0
+        ),
+        "tls_safety_conflict_count": (
+            report.conflict_count if report is not None else 0
+        ),
+        "tls_safety_warning_count": (
+            report.warning_count if report is not None else 0
+        ),
+        "tls_safety_startup_audit": str(audit_path) if audit_path else "",
     }
 
 

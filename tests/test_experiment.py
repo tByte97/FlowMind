@@ -14,6 +14,7 @@ from experiments.run_experiment import build_parser
 from flowmind.config import CONTROL_MODES, RunConfig
 from flowmind.experiment import configure_projection_data
 from flowmind.tls_programs import ActiveTlsProgram
+from flowmind.tls_safety import TlsSafetyReport
 
 
 class ExperimentEnvironmentTest(unittest.TestCase):
@@ -187,6 +188,14 @@ class ExperimentEnvironmentTest(unittest.TestCase):
             current_phase=1,
             phase_count=4,
         )
+        safety_report = TlsSafetyReport(
+            source="test",
+            tls_count=1,
+            plan_count=2,
+            movement_count=8,
+            conflict_count=12,
+            issues=(),
+        )
 
         status = experiment.build_live_system_status(
             config=RunConfig(mode="sumo_actuated"),
@@ -197,6 +206,7 @@ class ExperimentEnvironmentTest(unittest.TestCase):
             queue_forecast=None,
             running=True,
             active_tls_programs=(program,),
+            tls_safety_report=safety_report,
         )
 
         self.assertEqual(status["tls_programs"]["status"], "audited")
@@ -205,6 +215,9 @@ class ExperimentEnvironmentTest(unittest.TestCase):
             status["tls_programs"]["items"][0]["program_type_name"],
             "actuated",
         )
+        self.assertEqual(status["tls_safety"]["status"], "valid")
+        self.assertEqual(status["tls_safety"]["plans"], 2)
+        self.assertEqual(status["tls_safety"]["conflicts"], 12)
 
 
 if __name__ == "__main__":
