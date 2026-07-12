@@ -46,6 +46,7 @@ class ControlConfig:
     use_default_phase_timing: bool = True
     default_green_extension: float = 8.0
     blocked_occupancy: float = 0.82
+    min_downstream_storage_slots: float = 1.0
     downstream_weight: float = 10.0
     area_pressure_weight: float = 0.35
     queue_forecast_weight: float = 0.75

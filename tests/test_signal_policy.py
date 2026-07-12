@@ -74,6 +74,43 @@ class SignalPolicyTest(unittest.TestCase):
         self.assertEqual(best.phase_index, 2)
         self.assertNotIn(0, [item.phase_index for item in scores])
 
+    def test_full_moving_downstream_is_blocked_even_without_a_queue(self) -> None:
+        state = TrafficState(
+            {
+                "north": LaneState(8, 8, 0.4, 0.0, 5.0),
+                "south": LaneState(0, 16, 0.75, 8.0, 0.0),
+                "east": LaneState(4, 4, 0.2, 0.0, 8.0),
+                "west": LaneState(0, 0, 0.0, 10.0, 15.0),
+            }
+        )
+
+        scores = score_phases(self.intersection, state, "flowmind", self.config)
+
+        self.assertNotIn(0, [item.phase_index for item in scores])
+
+    def test_idle_blocked_movement_does_not_disable_useful_shared_phase(self) -> None:
+        intersection = Intersection(
+            tls_id="shared",
+            position=(0.0, 0.0),
+            phases=("GG", "yy", "rr"),
+            links=(
+                ControlledLink("idle", "blocked", 0),
+                ControlledLink("busy", "open", 1),
+            ),
+        )
+        state = TrafficState(
+            {
+                "idle": LaneState(0, 0, 0.0, 0.0, 10.0),
+                "blocked": LaneState(12, 12, 0.95, 0.0, 0.0),
+                "busy": LaneState(8, 8, 0.5, 0.0, 4.0),
+                "open": LaneState(0, 0, 0.0, 10.0, 15.0),
+            }
+        )
+
+        scores = score_phases(intersection, state, "flowmind", self.config)
+
+        self.assertEqual([item.phase_index for item in scores], [0])
+
     def test_priority_cannot_force_blocked_downstream_phase(self) -> None:
         state = TrafficState(
             {

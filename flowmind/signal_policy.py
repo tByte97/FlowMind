@@ -59,14 +59,22 @@ def movement_pressure(
 
 
 def movement_has_blocked_downstream(
-    outgoing_queue: int,
-    outgoing_occupancy: float,
-    outgoing_free_slots: float,
+    outgoing: LaneState,
     config: ControlConfig,
+    *,
+    required_storage_slots: float | None = None,
 ) -> bool:
-    if outgoing_occupancy >= config.blocked_occupancy:
-        return True
-    return outgoing_queue > 0 and outgoing_free_slots <= 0.0
+    """Hard gate a movement that cannot fit another vehicle downstream."""
+
+    required_slots = (
+        float(config.min_downstream_storage_slots)
+        if required_storage_slots is None
+        else float(required_storage_slots)
+    )
+    return (
+        outgoing.occupancy >= config.blocked_occupancy
+        or outgoing.free_slots < max(required_slots, 0.0)
+    )
 
 
 def lane_has_demand(lane: LaneState, config: ControlConfig) -> bool:
@@ -187,15 +195,13 @@ def score_phases(
                 continue
             incoming = state.lane(link.incoming_lane)
             outgoing = state.lane(link.outgoing_lane)
-            if movement_has_blocked_downstream(
-                outgoing.queue,
-                outgoing.occupancy,
-                outgoing.free_slots,
+            has_demand = lane_has_demand(incoming, config)
+            if has_demand and movement_has_blocked_downstream(
+                outgoing,
                 config,
             ):
                 blocked_downstream = True
                 break
-            has_demand = lane_has_demand(incoming, config)
             if has_demand:
                 demand_movements += 1
             if mode == "local":
@@ -235,7 +241,7 @@ def score_phases(
             score /= movements
         if movements and not demand_movements:
             score -= float(config.empty_phase_penalty)
-        if priority_link is not None and priority_link < len(phase_state):
+        if priority_link is not None and 0 <= priority_link < len(phase_state):
             if phase_state[priority_link] in "Gg":
                 score += 1_000.0
         scores.append(PhaseScore(phase_index, score))
