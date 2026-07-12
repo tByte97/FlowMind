@@ -78,6 +78,8 @@ def movement_has_blocked_downstream(
 
 
 def lane_has_demand(lane: LaneState, config: ControlConfig) -> bool:
+    if not lane.valid:
+        return False
     return (
         lane.queue > 0
         or lane.vehicle_count > 0

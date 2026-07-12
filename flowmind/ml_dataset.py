@@ -55,7 +55,7 @@ class MLDatasetCollector:
         if int(simulation_time) % self._config.sample_interval:
             return
 
-        state = self._reader.read()
+        state = self._reader.read(simulation_time)
         for intersection in self._area.intersections:
             tls_id = intersection.tls_id
             current_phase = self._safe_int(

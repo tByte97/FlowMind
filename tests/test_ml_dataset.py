@@ -17,6 +17,9 @@ class FakeLane:
     def getLastStepVehicleNumber(self, lane_id: str) -> int:
         return self.queue[lane_id]
 
+    def getLastStepVehicleIDs(self, _lane_id: str) -> tuple[str, ...]:
+        return ()
+
     def getLength(self, _lane_id: str) -> float:
         return 100.0
 

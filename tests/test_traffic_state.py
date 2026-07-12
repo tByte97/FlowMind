@@ -8,12 +8,15 @@ from flowmind.traffic_state import TrafficStateReader
 
 class FakeLane:
     def __init__(self) -> None:
+        self.fail = False
         self.vehicle_ids = {
             "in_0": ("near_stop", "far_approach"),
             "out_0": ("near_exit", "far_exit"),
         }
 
     def getLength(self, _lane_id: str) -> float:
+        if self.fail:
+            raise RuntimeError("camera offline")
         return 200.0
 
     def getLastStepVehicleIDs(self, lane_id: str) -> tuple[str, ...]:
@@ -108,6 +111,38 @@ class TrafficStateReaderTest(unittest.TestCase):
 
         self.assertEqual(state.lane("middle_0").vehicle_ids, ("far_exit",))
         self.assertEqual(state.lane("middle_0").vehicle_count, 1)
+
+    def test_last_known_good_expires_after_ttl(self) -> None:
+        area = AreaModel(
+            (
+                Intersection(
+                    tls_id="tls",
+                    position=(0.0, 0.0),
+                    phases=("G", "y"),
+                    links=(ControlledLink("in_0", "out_0", 0),),
+                ),
+            )
+        )
+        traci = FakeTraci()
+        reader = TrafficStateReader(
+            traci,
+            area,
+            sensor_range_meters=60.0,
+            last_known_good_ttl=5.0,
+        )
+
+        fresh = reader.read(1.0)
+        traci.lane.fail = True
+        stale = reader.read(4.0)
+        expired = reader.read(7.0)
+
+        self.assertTrue(fresh.usable)
+        self.assertTrue(stale.usable)
+        self.assertTrue(stale.lane("in_0").stale)
+        self.assertEqual(stale.lane("in_0").sample_time, 1.0)
+        self.assertEqual(stale.lane("in_0").error, "camera offline")
+        self.assertFalse(expired.usable)
+        self.assertIn("in_0", expired.invalid_lane_ids)
 
 
 if __name__ == "__main__":
