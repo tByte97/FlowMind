@@ -262,16 +262,16 @@
 
   ### Етап 2 — справжній зональний граф
 
-  - [ ] Завантажувати corridors із central_zone.json.
-  - [ ] Побудувати directed graph TLS → road segments → TLS.
-  - [ ] Зв’язати outgoing lane одного вузла з downstream incoming lane іншого
+  - [x] Завантажувати corridors із central_zone.json.
+  - [x] Побудувати directed graph TLS → road segments → TLS.
+  - [x] Зв’язати outgoing lane одного вузла з downstream incoming lane іншого
     через проміжні edges.
 
-  - [ ] Передавати downstream pressure на 1–2 наступні перехрестя.
-  - [ ] Ввести node storage capacity та spillback probability.
-  - [ ] Робити один area decision snapshot, а не незалежні локальні рішення.
-  - [ ] Додати тест: затор на I-03 повинен змінювати рішення I-02.
-  - [ ] Додати тест: віддалений, не пов’язаний TLS не повинен впливати на I-02.
+  - [x] Передавати downstream pressure на 1–2 наступні перехрестя.
+  - [x] Ввести node storage capacity та spillback probability.
+  - [x] Робити один area decision snapshot, а не незалежні локальні рішення.
+  - [x] Додати тест: затор на I-03 повинен змінювати рішення I-02.
+  - [x] Додати тест: віддалений, не пов’заний TLS не повинен впливати на I-02.
 
   ### Етап 3 — відмовостійкість
 

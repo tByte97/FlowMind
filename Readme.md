@@ -47,6 +47,8 @@ replaceable adapter
         ↓
 neutral TrafficState + TLS safety catalog
         ↓
+directed AreaGraph + one AreaDecisionSnapshot
+        ↓
 AreaSignalController
         ↓
 signal_policy + queue_forecast + safety_validator
@@ -66,6 +68,8 @@ results/* + FastAPI dashboard
 | `flowmind/tls_programs.py` | static fixed-time програма й startup-аудит активних SUMO TLS-програм |
 | `flowmind/tls_safety.py` | незалежна від джерела модель рухів, конфліктів і startup-validation всіх TLS plans |
 | `flowmind/sumo_tls_adapter.py` | ізольований адаптер SUMO topology/TraCI до нейтрального safety-каталогу |
+| `flowmind/zone_graph.py` | corridors, directed road segments, node storage, spillback probability і area decision snapshot |
+| `flowmind/sumo_zone_graph_adapter.py` | pre-MVP адаптер, який зв’язує TLS через реальні SUMO edges/lanes |
 | `flowmind/traffic_state.py` | читання стану смуг у sensor range |
 | `flowmind/signal_policy.py` | scoring фаз для `local` і `flowmind` |
 | `flowmind/controller.py` | прийняття рішень і керування світлофорами через TraCI |

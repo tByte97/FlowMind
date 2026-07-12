@@ -30,6 +30,7 @@ class SumoZoneGraphAdapter:
             str(self._net_path),
             withConnections=True,
         )
+        zone_tls_ids = set(zone.tls_ids)
         by_tls = {item.tls_id: item for item in area.intersections}
         segments: list[RoadSegment] = []
         for corridor in zone.corridors:
@@ -57,7 +58,7 @@ class SumoZoneGraphAdapter:
         storage = tuple(
             self._build_storage(network, intersection)
             for intersection in area.intersections
-            if intersection.tls_id in set(zone.tls_ids)
+            if intersection.tls_id in zone_tls_ids
         )
         return AreaGraph(zone, tuple(segments), storage)
 

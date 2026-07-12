@@ -17,6 +17,9 @@ SUMO / field controllers / backend API
  TrafficState + TlsSafetyCatalog
                  |
                  v
+ Directed AreaGraph + AreaDecisionSnapshot
+                 |
+                 v
  FlowMind policy + safety + area controller
                  |
                  v
@@ -25,6 +28,24 @@ SUMO / field controllers / backend API
 
 `flowmind/tls_safety.py` не імпортує SUMO або TraCI. SUMO-специфічне
 перетворення зосереджене у `flowmind/sumo_tls_adapter.py`.
+Так само `flowmind/zone_graph.py` не залежить від SUMO; шляхи edges/lanes
+для pre-MVP готує `flowmind/sumo_zone_graph_adapter.py`.
+
+## Зональне рішення
+
+Corridors з `central_zone.json` розгортаються у directed segments для
+обох напрямків. Кожен segment зберігає:
+
+- upstream/downstream TLS;
+- проміжні edges і lanes;
+- довжину та storage capacity;
+- occupancy, queue, free slots і spillback probability.
+
+На кожному control tick система спочатку формує один
+`AreaDecisionSnapshot` для всіх TLS. Downstream risk передається на
+1–2 наступні перехрестя лише вздовж directed graph. Усі рішення
+обчислюються до першої TraCI-команди, тому порядок TLS у циклі
+не змінює зональний вибір.
 
 ## Потік даних pre-MVP
 
@@ -78,6 +99,8 @@ EmergencyVehicleManager
 | `flowmind/area_model.py` | Читає SUMO network, знаходить керовані світлофори й формує зону |
 | `flowmind/tls_safety.py` | Нейтральна модель TLS plans, конфліктна матриця і fail-fast validation |
 | `flowmind/sumo_tls_adapter.py` | Перетворює SUMO topology/right-of-way і TraCI Logic на `TlsSafetyCatalog` |
+| `flowmind/zone_graph.py` | Нейтральний zonal graph, storage/spillback state і спільний decision snapshot |
+| `flowmind/sumo_zone_graph_adapter.py` | Знаходить SUMO road paths між сусідніми TLS з corridor definition |
 | `flowmind/traffic_state.py` | Нормалізує телеметрію смуг із TraCI |
 | `flowmind/signal_policy.py` | Рахує оцінки фаз для Local та FlowMind |
 | `flowmind/controller.py` | Застосовує рішення з min/max green та безпечним порядком фаз |
