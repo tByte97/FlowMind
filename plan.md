@@ -317,17 +317,20 @@
 
   ### Етап 6 — чесна оцінка
 
-  - [ ] Додати у summary seed, scenario, demand, network hash, controller/model
+  - [x] Додати у summary seed, scenario, demand, network hash, controller/model
     version.
 
-  - [ ] Рахувати zone inflow/outflow через boundary edges.
-  - [ ] Додати completed і unfinished/censored travel times.
-  - [ ] Не повертати 0 для відсутньої метрики — використовувати null.
-  - [ ] Перейменувати поточний gridlock_risk на blocked_outgoing_share.
+  - [x] Рахувати zone inflow/outflow через boundary edges.
+  - [x] Додати completed і unfinished/censored travel times.
+  - [x] Не повертати 0 для відсутньої метрики — використовувати null.
+  - [x] Перейменувати поточний gridlock_risk на blocked_outgoing_share.
   - [ ] Виконати щонайменше 30–50 повних пар для кожного режиму.
-  - [ ] Порівнювати однакові seed/config/demand/emergency route.
-  - [ ] Додати confidence intervals і paired statistical tests.
-  - [ ] Ввести regression gates: waiting, throughput, stops, spillback та
+    Локально збережено 6/30 checkpoint-пар; за рішенням користувача локальний
+    прогін зупинено, а повний запуск перенесено на сервер командою
+    `experiments/run_evaluation.py ... --resume`.
+  - [x] Порівнювати однакові seed/config/demand/emergency route.
+  - [x] Додати confidence intervals і paired statistical tests.
+  - [x] Ввести regression gates: waiting, throughput, stops, spillback та
     emergency ETA.
 
   Рекомендований порядок: спочатку fixed baseline і safety timing, потім
