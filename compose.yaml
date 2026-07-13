@@ -1,6 +1,18 @@
 name: flowmind
 
 services:
+  model-init:
+    image: flowmind:local
+    container_name: flowmind-model-init
+    user: "0:0"
+    restart: "no"
+    volumes:
+      - flowmind_models:/models
+    entrypoint: ["/bin/sh", "-ec"]
+    command: ["mkdir -p /models && chown -R 10001:10001 /models"]
+    security_opt:
+      - no-new-privileges:true
+
   web:
     build:
       context: .
@@ -9,6 +21,9 @@ services:
     container_name: flowmind-web
     init: true
     restart: unless-stopped
+    depends_on:
+      model-init:
+        condition: service_completed_successfully
     environment:
       FLOWMIND_RESULTS_DIR: /app/results
       FLOWMIND_WEB_RESULTS_DIR: /app/results/web_demo
@@ -82,6 +97,10 @@ services:
       - --output-dir
       - /app/results/dataset
       - --no-queue-model
+      - --config
+      - /app/simulation/rivne_area/focused.sumocfg
+      - --zone
+      - /app/simulation/rivne_area/central_zone.json
 
   trainer:
     image: flowmind:local
@@ -90,6 +109,9 @@ services:
       - training
     init: true
     restart: "no"
+    depends_on:
+      model-init:
+        condition: service_completed_successfully
     environment:
       OMP_NUM_THREADS: ${FLOWMIND_CPU_THREADS:-4}
       OPENBLAS_NUM_THREADS: ${FLOWMIND_CPU_THREADS:-4}
@@ -129,6 +151,9 @@ services:
       - evaluation
     init: true
     restart: "no"
+    depends_on:
+      model-init:
+        condition: service_completed_successfully
     environment:
       FLOWMIND_RESULTS_DIR: /app/results
       OMP_NUM_THREADS: ${FLOWMIND_CPU_THREADS:-4}
