@@ -4,7 +4,7 @@ import argparse
 import json
 import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Mapping
@@ -19,6 +19,7 @@ from flowmind.config import (
     RunConfig,
 )
 from flowmind.emergency_vehicle import EmergencyVehicleConfig, load_emergency_config
+from flowmind.control_config_io import load_control_config
 from flowmind.evaluation import (
     DEFAULT_MAX_PAIRS,
     DEFAULT_MIN_PAIRS,
@@ -125,6 +126,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Enable accepted ML predictions; default evaluation is shadow mode.",
     )
+    parser.add_argument(
+        "--control-config",
+        type=Path,
+        help="Load a tuned ControlConfig JSON artifact.",
+    )
     return parser
 
 
@@ -175,7 +181,13 @@ def main() -> None:
         if args.no_queue_model
         else tuple(args.queue_models or DEFAULT_QUEUE_MODEL_PATHS)
     )
-    control = ControlConfig(
+    base_control = (
+        load_control_config(args.control_config)
+        if args.control_config is not None
+        else ControlConfig()
+    )
+    control = replace(
+        base_control,
         sensor_range_meters=args.sensor_range,
         queue_forecast_shadow_mode=not args.enable_queue_control,
     )
@@ -186,6 +198,7 @@ def main() -> None:
         evaluation_dir=evaluation_dir,
         emergency_enabled=emergency is not None,
         queue_model_paths=queue_model_paths,
+        control=control,
     )
     if args.resume and manifest_path.is_file():
         _validate_resume_manifest(manifest_path, manifest)
@@ -290,6 +303,7 @@ def _initial_manifest(
     evaluation_dir: Path,
     emergency_enabled: bool,
     queue_model_paths: tuple[Path, ...],
+    control: ControlConfig,
 ) -> dict[str, object]:
     return {
         "evaluation_runner_schema_version": EVALUATION_RUNNER_SCHEMA_VERSION,
@@ -312,6 +326,7 @@ def _initial_manifest(
         "emergency_route_policy": "fixed_within_each_pair",
         "queue_forecast_shadow_mode": not args.enable_queue_control,
         "queue_model_paths": [str(path.resolve()) for path in queue_model_paths],
+        "control_config": asdict(control),
         "live_telemetry": False,
         "workers": args.workers,
         "evaluation_dir": str(evaluation_dir),
@@ -346,6 +361,7 @@ def _validate_resume_manifest(
         "emergency_route_policy",
         "queue_forecast_shadow_mode",
         "queue_model_paths",
+        "control_config",
     )
     mismatched = [
         field

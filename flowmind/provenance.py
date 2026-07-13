@@ -21,12 +21,16 @@ _CONTROLLER_SOURCE_FILES = (
     "controller.py",
     "corridor_manager.py",
     "corridor_recovery.py",
+    "experiment.py",
+    "ml_dataset.py",
     "queue_forecast.py",
     "safety_validator.py",
     "signal_policy.py",
     "tls_safety.py",
     "traffic_state.py",
     "zone_graph.py",
+    "zone_optimizer.py",
+    "sumo_zone_graph_adapter.py",
 )
 
 

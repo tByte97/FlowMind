@@ -193,6 +193,32 @@ class QueueForecastModelTest(unittest.TestCase):
 
         self.assertEqual(predictions, {(0, 0): 12.0, (2, 1): 12.0})
 
+    def test_queue_reduction_prediction_preserves_bounded_negative_value(self) -> None:
+        model = QueueForecastModel(
+            FakePipeline(prediction=-99.0),
+            pd.DataFrame,
+            Path("model.joblib"),
+            {
+                "target": "target_queue_reduction_60s",
+                "forecast_contract": "counterfactual",
+                "feature_columns": ["time", "incoming_queue"],
+            },
+        )
+        intersection, state = self._two_direction_state()
+
+        predictions = model.predict_intersection(
+            mode="flowmind",
+            simulation_time=12.0,
+            intersection=intersection,
+            state=state,
+            current_phase=0,
+            phase_elapsed=11.0,
+            control=ControlConfig(),
+            sample_interval=5,
+        )
+
+        self.assertEqual(predictions, {(0, 0): -12.0, (2, 1): -12.0})
+
     def test_unseen_lane_disables_model_influence(self) -> None:
         pipeline = FakePipeline()
         columns = ["time", "tls_id", "incoming_lane"]

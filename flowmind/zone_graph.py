@@ -145,6 +145,10 @@ class AreaDecisionSnapshot:
     node_states: dict[str, NodeStorageState]
     downstream_risk_by_outgoing_lane: dict[str, float]
     area_pressure_by_incoming_lane: dict[str, float]
+    platoon_arrival_by_incoming_lane: dict[str, float]
+    downstream_storage_by_outgoing_lane: dict[str, float]
+    upstream_queue_by_incoming_lane: dict[str, float]
+    downstream_occupancy_by_outgoing_lane: dict[str, float]
 
 
 def load_zone_definition(zone_path: str | Path) -> ZoneDefinition:
@@ -236,6 +240,10 @@ def build_area_decision_snapshot(
         for storage in graph.node_storage
     }
     downstream_risk: dict[str, float] = {}
+    platoon_arrival: dict[str, float] = {}
+    downstream_storage: dict[str, float] = {}
+    upstream_queue: dict[str, float] = {}
+    downstream_occupancy: dict[str, float] = {}
     max_hops = max(int(config.downstream_graph_hops), 1)
     for origin in graph.segments:
         risks = [
@@ -277,6 +285,41 @@ def build_area_decision_snapshot(
                 downstream_risk.get(lane_id, 0.0),
                 combined_risk,
             )
+            downstream_storage[lane_id] = min(
+                segment_states[origin.segment_id].free_slots,
+                node_states[origin.downstream_tls].free_slots,
+            )
+            downstream_occupancy[lane_id] = max(
+                segment_states[origin.segment_id].occupancy,
+                node_states[origin.downstream_tls].occupancy,
+            )
+        segment_lanes = tuple(traffic.lane(lane_id) for lane_id in origin.lane_ids)
+        mean_speed = max(
+            (
+                sum(lane.mean_speed for lane in segment_lanes if lane.valid)
+                / max(sum(1 for lane in segment_lanes if lane.valid), 1)
+            ),
+            3.0,
+        )
+        arrival_seconds = origin.length_meters / mean_speed
+        horizon_weight = max(
+            0.0,
+            1.0
+            - arrival_seconds / float(config.coordination_horizon_seconds),
+        )
+        predicted_platoon = (
+            segment_states[origin.segment_id].occupied_slots * horizon_weight
+        )
+        if origin.downstream_incoming_lanes:
+            per_lane = predicted_platoon / len(origin.downstream_incoming_lanes)
+            for lane_id in origin.downstream_incoming_lanes:
+                platoon_arrival[lane_id] = (
+                    platoon_arrival.get(lane_id, 0.0) + per_lane
+                )
+                upstream_queue[lane_id] = (
+                    upstream_queue.get(lane_id, 0.0)
+                    + float(segment_states[origin.segment_id].queue)
+                )
 
     return AreaDecisionSnapshot(
         simulation_time=float(simulation_time),
@@ -289,6 +332,10 @@ def build_area_decision_snapshot(
             traffic,
             config,
         ),
+        platoon_arrival_by_incoming_lane=platoon_arrival,
+        downstream_storage_by_outgoing_lane=downstream_storage,
+        upstream_queue_by_incoming_lane=upstream_queue,
+        downstream_occupancy_by_outgoing_lane=downstream_occupancy,
     )
 
 
@@ -298,6 +345,17 @@ def _segment_state(
     config: ControlConfig,
 ) -> SegmentTrafficState:
     lanes = tuple(traffic.lane(lane_id) for lane_id in segment.lane_ids)
+    if lanes and any(not lane.valid for lane in lanes):
+        capacity = max(float(segment.capacity_slots), 1.0)
+        return SegmentTrafficState(
+            segment_id=segment.segment_id,
+            capacity_slots=capacity,
+            occupied_slots=capacity,
+            free_slots=0.0,
+            queue=0,
+            occupancy=1.0,
+            spillback_probability=1.0,
+        )
     vehicle_count = sum(lane.vehicle_count for lane in lanes)
     queue = sum(lane.queue for lane in lanes)
     observed_occupancy = max((lane.occupancy for lane in lanes), default=0.0)
@@ -321,6 +379,16 @@ def _node_state(
     config: ControlConfig,
 ) -> NodeStorageState:
     lanes = tuple(traffic.lane(lane_id) for lane_id in storage.lane_ids)
+    if lanes and any(not lane.valid for lane in lanes):
+        capacity = max(float(storage.capacity_slots), 1.0)
+        return NodeStorageState(
+            tls_id=storage.tls_id,
+            capacity_slots=capacity,
+            occupied_slots=capacity,
+            free_slots=0.0,
+            occupancy=1.0,
+            spillback_probability=1.0,
+        )
     vehicle_count = sum(lane.vehicle_count for lane in lanes)
     queue = sum(lane.queue for lane in lanes)
     capacity = max(float(storage.capacity_slots), 1.0)

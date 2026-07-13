@@ -25,6 +25,7 @@ from .zone_graph import (
     AreaGraph,
     build_area_decision_snapshot,
 )
+from .zone_optimizer import optimize_zone_phases
 
 
 @dataclass
@@ -38,6 +39,7 @@ class QueueForecastSample:
     horizon_seconds: int
     evaluation_time: float
     forecast_contract: str
+    prediction_target: str
     confidence: float
     ood: bool
     diagnostic_reasons: str
@@ -51,7 +53,7 @@ class QueueForecastSample:
 @dataclass
 class PendingQueueForecast:
     sample: QueueForecastSample
-    lane_predictions: tuple[tuple[str, float], ...]
+    lane_predictions: tuple[tuple[str, float, float, float], ...]
 
 
 @dataclass(frozen=True)
@@ -142,8 +144,9 @@ class AreaSignalController:
         )
         self._safety = SafetyValidator(traci_connection, area, config)
         self._lane_demand_started_at: dict[str, float] = {}
+        self._lane_history: dict[str, list[tuple[float, int, int]]] = {}
         self._next_decision_at = float(config.decision_interval)
-        self._fallback_active = False
+        self._fallback_tls_ids: set[str] = set()
         self._pending_queue_forecasts: list[PendingQueueForecast] = []
         self._corridor_recovery = CorridorRecoveryPlanner()
         self.stats = ControllerStats()
@@ -158,20 +161,12 @@ class AreaSignalController:
         traffic = self._reader.read(simulation_time)
         self.stats.sensor_failures += len(traffic.sensor_error_lane_ids)
         self.stats.stale_lane_samples += len(traffic.stale_lane_ids)
-        if not traffic.usable:
-            self.stats.invalid_state_skips += 1
-            self._activate_fallback(simulation_time, traffic.invalid_lane_ids)
-            return
-        if self._fallback_active:
-            self._fallback_active = False
-            self._record_decision(
-                simulation_time,
-                "",
-                "Сенсорні дані відновлено",
-                "FlowMind повернувся з перевіреного TLS fallback до адаптивного керування.",
-                "success",
-            )
         self._resolve_pending_queue_forecasts(traffic, simulation_time)
+        history_context = self._historical_context(traffic, simulation_time)
+        queue_growth_by_lane = {
+            lane_id: values.get("incoming_queue_growth_30s", 0.0)
+            for lane_id, values in history_context.items()
+        }
         demand_wait_by_lane = self._update_demand_timers(
             traffic,
             simulation_time,
@@ -205,6 +200,23 @@ class AreaSignalController:
             tls_id = intersection.tls_id
             if tls_id in recovery_handled:
                 continue
+            invalid_lane_ids = tuple(
+                sorted(
+                    lane_id
+                    for link in intersection.links
+                    for lane_id in (link.incoming_lane, link.outgoing_lane)
+                    if not traffic.lane(lane_id).valid
+                )
+            )
+            if invalid_lane_ids:
+                self.stats.invalid_state_skips += 1
+                self._activate_fallback(
+                    tls_id,
+                    simulation_time,
+                    invalid_lane_ids,
+                )
+                continue
+            self._deactivate_fallback(tls_id, simulation_time)
             current_phase = int(self._traci.trafficlight.getPhase(tls_id))
             if not 0 <= current_phase < len(intersection.phases):
                 self.stats.phase_out_of_range_skips += 1
@@ -244,6 +256,8 @@ class AreaSignalController:
                         phase_elapsed=spent,
                         control=self._config,
                         sample_interval=self._queue_forecast_sample_interval,
+                        context_by_lane=history_context,
+                        area_context_by_lane=self._area_model_context(snapshot),
                     )
                     diagnostics = self._queue_forecast.last_diagnostics
                     count = len(raw_forecast)
@@ -277,6 +291,8 @@ class AreaSignalController:
                         self._record_queue_forecast(
                             simulation_time,
                             intersection,
+                            current_phase,
+                            traffic,
                             raw_forecast,
                             diagnostics.forecast_contract,
                             diagnostics.confidence,
@@ -298,6 +314,9 @@ class AreaSignalController:
                 demand_wait_by_lane,
                 snapshot.downstream_risk_by_outgoing_lane,
                 preparation_link,
+                queue_growth_by_lane,
+                snapshot.platoon_arrival_by_incoming_lane,
+                snapshot.downstream_storage_by_outgoing_lane,
             )
             prepared.append(
                 PreparedIntersectionDecision(
@@ -310,8 +329,28 @@ class AreaSignalController:
                 )
             )
 
+        zone_choices = (
+            optimize_zone_phases(
+                self._area,
+                self._area_graph,
+                snapshot,
+                {
+                    decision.intersection.tls_id: decision.scores
+                    for decision in prepared
+                },
+                self._config,
+            )
+            if self._mode == "flowmind" and self._area_graph is not None
+            else {}
+        )
         for decision in prepared:
-            self._apply_prepared_decision(decision, simulation_time)
+            choice = zone_choices.get(decision.intersection.tls_id)
+            self._apply_prepared_decision(
+                decision,
+                simulation_time,
+                target_phase=(choice.phase_index if choice is not None else None),
+            )
+        self._remember_traffic(traffic, simulation_time)
 
     def _filter_corridor_targets(
         self,
@@ -438,6 +477,8 @@ class AreaSignalController:
         self,
         simulation_time: float,
         intersection: Intersection,
+        current_phase: int,
+        traffic: TrafficState,
         predictions: dict[tuple[int, int], float],
         forecast_contract: str,
         confidence: float,
@@ -445,18 +486,40 @@ class AreaSignalController:
         reasons: tuple[str, ...],
         used_for_control: bool,
     ) -> None:
-        by_link: dict[int, float] = {}
-        for (_phase_index, link_index), prediction in predictions.items():
-            by_link.setdefault(link_index, prediction)
+        # Shadow accuracy is measurable only for the action SUMO actually
+        # executed. Alternative candidate phases remain counterfactual and are
+        # never compared with the observed outcome of another phase.
+        by_link = {
+            link_index: prediction
+            for (phase_index, link_index), prediction in predictions.items()
+            if phase_index == current_phase
+        }
         lane_predictions = tuple(
-            (intersection.links[link_index].incoming_lane, prediction)
+            (
+                intersection.links[link_index].incoming_lane,
+                prediction,
+                float(traffic.lane(
+                    intersection.links[link_index].incoming_lane
+                ).queue),
+                float(traffic.lane(
+                    intersection.links[link_index].incoming_lane
+                ).vehicle_count),
+            )
             for link_index, prediction in by_link.items()
             if 0 <= link_index < len(intersection.links)
         )
         if not lane_predictions:
             return
-        values = tuple(prediction for _lane_id, prediction in lane_predictions)
+        values = tuple(
+            prediction
+            for _lane_id, prediction, _initial_queue, _initial_count in lane_predictions
+        )
         horizon = self._queue_forecast.evaluation_horizon_seconds
+        prediction_target = getattr(
+            self._queue_forecast,
+            "prediction_target",
+            "target_incoming_queue",
+        )
         sample = QueueForecastSample(
             time=round(simulation_time, 3),
             tls_id=intersection.tls_id,
@@ -467,6 +530,7 @@ class AreaSignalController:
             horizon_seconds=horizon,
             evaluation_time=round(simulation_time + horizon, 3),
             forecast_contract=forecast_contract,
+            prediction_target=prediction_target,
             confidence=round(confidence, 5),
             ood=ood,
             diagnostic_reasons=";".join(reasons),
@@ -488,14 +552,23 @@ class AreaSignalController:
             if simulation_time + 1e-9 < item.sample.evaluation_time:
                 pending.append(item)
                 continue
-            observations = tuple(
-                (
-                    float(traffic.lane(lane_id).queue),
-                    float(prediction),
+            observations = []
+            for lane_id, prediction, initial_queue, initial_count in item.lane_predictions:
+                lane = traffic.lane(lane_id)
+                if not lane.valid:
+                    continue
+                observations.append(
+                    (
+                        _observed_forecast_target(
+                            item.sample.prediction_target,
+                            initial_queue,
+                            initial_count,
+                            float(lane.queue),
+                            float(lane.vehicle_count),
+                        ),
+                        float(prediction),
+                    )
                 )
-                for lane_id, prediction in item.lane_predictions
-                if traffic.lane(lane_id).valid
-            )
             if not observations:
                 pending.append(item)
                 continue
@@ -512,33 +585,45 @@ class AreaSignalController:
                 self.stats.queue_forecast_shadow_evaluations += 1
                 self.stats.queue_forecast_shadow_absolute_error += mae
         self._pending_queue_forecasts = pending
-
     def _activate_fallback(
         self,
+        tls_id: str,
         simulation_time: float,
         invalid_lane_ids: tuple[str, ...],
     ) -> None:
-        if self._fallback_active:
+        if tls_id in self._fallback_tls_ids:
             return
         trafficlight = self._traci.trafficlight
         set_program = getattr(trafficlight, "setProgram", None)
         if callable(set_program):
-            for intersection in self._area.intersections:
-                if intersection.program_id:
-                    set_program(intersection.tls_id, intersection.program_id)
-        self._fallback_active = True
+            intersection = self._area.intersection(tls_id)
+            if intersection.program_id:
+                set_program(intersection.tls_id, intersection.program_id)
+        self._fallback_tls_ids.add(tls_id)
         self.stats.fallback_activations += 1
         preview = ", ".join(invalid_lane_ids[:3])
         suffix = "…" if len(invalid_lane_ids) > 3 else ""
         self._record_decision(
             simulation_time,
-            "",
+            tls_id,
             "Активовано перевірений TLS fallback",
             (
-                f"Невалідні lane samples: {preview}{suffix}. "
-                "Адаптивні команди призупинено."
+                f"Перехрестя {tls_id}; невалідні lane samples: "
+                f"{preview}{suffix}. Адаптивні команди призупинено лише для TLS."
             ),
             "warning",
+        )
+
+    def _deactivate_fallback(self, tls_id: str, simulation_time: float) -> None:
+        if tls_id not in self._fallback_tls_ids:
+            return
+        self._fallback_tls_ids.remove(tls_id)
+        self._record_decision(
+            simulation_time,
+            tls_id,
+            "Сенсорні дані TLS відновлено",
+            f"Перехрестя {tls_id} повернулося до адаптивного керування.",
+            "success",
         )
 
     def _decision_due(self, simulation_time: float) -> bool:
@@ -578,12 +663,95 @@ class AreaSignalController:
                 if self._mode == "flowmind"
                 else {}
             ),
+            platoon_arrival_by_incoming_lane={},
+            downstream_storage_by_outgoing_lane={},
+            upstream_queue_by_incoming_lane={},
+            downstream_occupancy_by_outgoing_lane={},
         )
+
+    def _historical_context(
+        self,
+        traffic: TrafficState,
+        simulation_time: float,
+    ) -> dict[str, dict[str, float]]:
+        result: dict[str, dict[str, float]] = {}
+        for lane_id, lane in traffic.lanes.items():
+            values: dict[str, float] = {}
+            history = self._lane_history.get(lane_id, ())
+            for window in (15, 30):
+                previous = next(
+                    (
+                        item
+                        for item in reversed(history)
+                        if item[0] <= simulation_time - window + 1e-9
+                    ),
+                    None,
+                )
+                previous_queue = previous[1] if previous is not None else lane.queue
+                previous_count = (
+                    previous[2] if previous is not None else lane.vehicle_count
+                )
+                elapsed = max(
+                    simulation_time - previous[0]
+                    if previous is not None
+                    else float(window),
+                    1.0,
+                )
+                delta = lane.vehicle_count - previous_count
+                values[f"incoming_queue_growth_{window}s"] = float(
+                    lane.queue - previous_queue
+                )
+                values[f"arrival_rate_{window}s"] = max(delta, 0) / elapsed
+                values[f"discharge_rate_{window}s"] = max(-delta, 0) / elapsed
+            result[lane_id] = values
+        return result
+
+    def _remember_traffic(
+        self,
+        traffic: TrafficState,
+        simulation_time: float,
+    ) -> None:
+        for lane_id, lane in traffic.lanes.items():
+            history = self._lane_history.setdefault(lane_id, [])
+            history.append((simulation_time, lane.queue, lane.vehicle_count))
+            while len(history) > 1 and history[1][0] < simulation_time - 35.0:
+                history.pop(0)
+
+    @staticmethod
+    def _area_model_context(
+        snapshot: AreaDecisionSnapshot,
+    ) -> dict[str, dict[str, float]]:
+        lane_ids = (
+            set(snapshot.platoon_arrival_by_incoming_lane)
+            | set(snapshot.downstream_storage_by_outgoing_lane)
+            | set(snapshot.upstream_queue_by_incoming_lane)
+            | set(snapshot.downstream_occupancy_by_outgoing_lane)
+        )
+        return {
+            lane_id: {
+                "platoon_arrival_30s": snapshot.platoon_arrival_by_incoming_lane.get(
+                    lane_id,
+                    0.0,
+                ),
+                "downstream_storage_slots": (
+                    snapshot.downstream_storage_by_outgoing_lane.get(lane_id, 0.0)
+                ),
+                "upstream_neighbour_queue": snapshot.upstream_queue_by_incoming_lane.get(
+                    lane_id,
+                    0.0,
+                ),
+                "downstream_neighbour_occupancy": (
+                    snapshot.downstream_occupancy_by_outgoing_lane.get(lane_id, 0.0)
+                ),
+            }
+            for lane_id in lane_ids
+        }
 
     def _apply_prepared_decision(
         self,
         decision: PreparedIntersectionDecision,
         simulation_time: float,
+        target_phase: int | None = None,
     ) -> None:
         intersection = decision.intersection
         tls_id = intersection.tls_id
@@ -592,7 +760,14 @@ class AreaSignalController:
         max_green = decision.max_green
         priority_link = decision.priority_link
         scores = decision.scores
-        best = choose_phase(scores)
+        best = (
+            next(
+                (item for item in scores if item.phase_index == target_phase),
+                None,
+            )
+            if target_phase is not None
+            else choose_phase(scores)
+        )
         if best is None:
             self.stats.scoreless_skips += 1
             self.stats.decisions += 1
@@ -623,9 +798,16 @@ class AreaSignalController:
             self.stats.priority_decisions += 1
 
         should_extend = (
-            best.phase_index == current_phase
-            or current_score >= best.score - self._config.hysteresis
-        ) and spent < max_green
+            (
+                best.phase_index == current_phase
+                if target_phase is not None
+                else (
+                    best.phase_index == current_phase
+                    or current_score >= best.score - self._config.hysteresis
+                )
+            )
+            and spent < max_green
+        )
         if should_extend:
             safety = self._safety.validate_extension(
                 tls_id,
@@ -791,3 +973,19 @@ class AreaSignalController:
             )
         )
         self.stats.decision_events = self.stats.decision_events[-100:]
+
+
+def _observed_forecast_target(
+    target: str,
+    initial_queue: float,
+    initial_vehicle_count: float,
+    observed_queue: float,
+    observed_vehicle_count: float,
+) -> float:
+    if "queue_reduction" in target:
+        return initial_queue - observed_queue
+    if "delta_queue" in target:
+        return observed_queue - initial_queue
+    if "discharged_vehicles" in target:
+        return max(initial_vehicle_count - observed_vehicle_count, 0.0)
+    return observed_queue

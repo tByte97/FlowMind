@@ -338,3 +338,73 @@
   повторне A/B-тестування. До завершення перших трьох етапів систему краще
   описувати як «адаптивний multi-intersection prototype», а не як валідоване
   зональне керування.
+
+## Актуалізація P0–P3 для 20 TLS (2026-07-13)
+
+Цей розділ є актуальним станом після переходу від старого 6-TLS
+dataset/current-policy ML до Rivne 20-TLS decision model.
+
+### P0 — узгодженість
+
+- [x] `rivne_area/focused.sumocfg` і `central_zone.json` є явними defaults
+  `run_dataset.py` та аргументами репозиторного `compose.yaml`.
+- [x] Versioned Docker build з OCI/image commit та strict startup contract.
+- [x] Startup audit перевіряє commit, TLS count, network/zone/dataset
+  schema hashes, model artifact/feature schema і coverage TLS/lanes; emergency-expanded
+  area перевіряється повторно.
+- [x] Dataset fingerprint включає scenario/network/zone/schema/controller
+  source/demand/run plan; `--resume` відхиляє legacy і mismatch.
+- [x] 6-TLS моделі заархівовані у `models/archive/zone6` і виключені
+  з Docker build context.
+- [x] `model-init` автоматично виставляє UID/GID 10001 для
+  `flowmind_models`.
+- [ ] Зібрати новий 20-TLS dataset і три decision-моделі. Це довгий
+  compute-job, який має виконуватися вже на новому image. Dataset,
+  що зараз виконується на сервері, придатний лише як baseline/archive:
+  він не має нової schema/action/history/demand diversity і не може навчати
+  фінальну decision model.
+
+### P1 — зональна ефективність
+
+- [x] Горизонт 30–90 с для platoon arrivals, storage і downstream occupancy.
+- [x] Спільний `zone_optimizer` вибирає фази всіх TLS coordinate-descent
+  над `delay + queue growth + spillback + stops - throughput` з парними
+  corridor/platoon terms.
+- [x] Phase capacity враховує saturation flow і turning ratio, а не середній
+  score дубльованих connections.
+- [x] Sensor fallback активується лише для проблемного TLS;
+  graph segment із invalid data залишається fail-closed.
+- [x] Segment/node capacity калібрується в тій самій sensor window
+  (за замовчуванням 120 м).
+- [ ] Динамічне маскування окремої blocked movement всередині
+  спільної SUMO-фази не увімкнено: поточно вся demanded-фаза
+  fail-closed. Безпечне виправлення потребує startup-генерації та
+  conflict-validation маскованих TLS plans; простий
+  `setRedYellowGreenState` зруйнує перевірену послідовність clearance і не є
+  прийнятним shortcut.
+
+### P2 — ML decision model
+
+- [x] Dataset schema v3 містить observed action/candidate phase, history 15/30 с,
+  arrival/discharge, downstream storage/occupancy, сусідні TLS і platoon.
+- [x] Targets: delta queue, queue reduction, future waiting і discharged vehicles;
+  30/60/90 ensemble за замовчуванням навчається на queue reduction.
+- [x] Demand рандомізує off-peak/normal/morning/evening/oversaturated,
+  incident/lane closure та emergency, а не лише seed однакового OD.
+- [x] Runtime не підміняє actual current phase candidate-фазою; negative
+  queue reduction зберігається в physical bounds.
+- [x] Shadow MAE порівнює target лише для фактично виконаної фази,
+  а не для контрфактичних alternatives.
+
+### P3 — validation і tuning
+
+- [x] Shadow/control evaluation має окремі resumable IDs і regression gates.
+- [x] `approve_queue_control.py` вимагає pass обох evaluation, MAE/OOD bounds і
+  пише approval, прив'язаний до models/network/zone/ControlConfig hashes.
+- [x] Web залишає ML у shadow, доки немає matching approval і
+  `FLOWMIND_ENABLE_QUEUE_CONTROL=1`.
+- [x] `tune_control.py` реалізує resumable Optuna/TPE Bayesian search;
+  його `best_control_config.json` можна передати demo/evaluation.
+- [ ] Фактично виконати tuning, 30 shadow pairs, 30 ML-control pairs і approval
+  після завершення нового 20-TLS training. До цього фінальну
+  evaluation не запускати.

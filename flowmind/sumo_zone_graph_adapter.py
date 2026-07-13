@@ -16,8 +16,13 @@ from .zone_graph import (
 class SumoZoneGraphAdapter:
     """Build the pre-MVP road graph from SUMO without leaking SUMO types."""
 
-    def __init__(self, net_path: str | Path) -> None:
+    def __init__(
+        self,
+        net_path: str | Path,
+        sensor_range_meters: float = 120.0,
+    ) -> None:
         self._net_path = Path(net_path)
+        self._sensor_range_meters = max(float(sensor_range_meters), 1.0)
 
     def build_graph(
         self,
@@ -45,6 +50,7 @@ class SumoZoneGraphAdapter:
                         corridor.corridor_id,
                         by_tls[left],
                         by_tls[right],
+                        self._sensor_range_meters,
                     )
                 )
                 segments.append(
@@ -53,10 +59,15 @@ class SumoZoneGraphAdapter:
                         corridor.corridor_id,
                         by_tls[right],
                         by_tls[left],
+                        self._sensor_range_meters,
                     )
                 )
         storage = tuple(
-            self._build_storage(network, intersection)
+            self._build_storage(
+                network,
+                intersection,
+                self._sensor_range_meters,
+            )
             for intersection in area.intersections
             if intersection.tls_id in zone_tls_ids
         )
@@ -68,6 +79,7 @@ class SumoZoneGraphAdapter:
         corridor_id: str,
         upstream: Intersection,
         downstream: Intersection,
+        sensor_range_meters: float,
     ) -> RoadSegment:
         outgoing_lanes = tuple(
             sorted({link.outgoing_lane for link in upstream.links})
@@ -142,7 +154,14 @@ class SumoZoneGraphAdapter:
             )
         )
         capacity_slots = sum(
-            max(float(network.getLane(lane_id).getLength()) / 7.5, 1.0)
+            max(
+                min(
+                    float(network.getLane(lane_id).getLength()),
+                    sensor_range_meters,
+                )
+                / 7.5,
+                1.0,
+            )
             for lane_id in segment_lanes
         )
         return RoadSegment(
@@ -162,6 +181,7 @@ class SumoZoneGraphAdapter:
     def _build_storage(
         network: object,
         intersection: Intersection,
+        sensor_range_meters: float,
     ) -> IntersectionStorage:
         lane_ids = tuple(
             sorted(
@@ -177,7 +197,14 @@ class SumoZoneGraphAdapter:
                 f"TLS {intersection.tls_id} has no passenger storage lanes"
             )
         capacity = sum(
-            max(float(network.getLane(lane_id).getLength()) / 7.5, 1.0)
+            max(
+                min(
+                    float(network.getLane(lane_id).getLength()),
+                    sensor_range_meters,
+                )
+                / 7.5,
+                1.0,
+            )
             for lane_id in lane_ids
         )
         return IntersectionStorage(

@@ -181,16 +181,37 @@ def score_phases(
     demand_wait_by_lane: dict[str, float] | None = None,
     downstream_risk_by_outgoing_lane: dict[str, float] | None = None,
     preparation_link: int | None = None,
+    queue_growth_by_lane: dict[str, float] | None = None,
+    platoon_arrival_by_incoming_lane: dict[str, float] | None = None,
+    downstream_storage_by_outgoing_lane: dict[str, float] | None = None,
 ) -> tuple[PhaseScore, ...]:
     area_pressure = area_pressure or {}
     queue_forecast = queue_forecast or {}
     demand_wait_by_lane = demand_wait_by_lane or {}
     downstream_risk_by_outgoing_lane = downstream_risk_by_outgoing_lane or {}
+    queue_growth_by_lane = queue_growth_by_lane or {}
+    platoon_arrival_by_incoming_lane = (
+        platoon_arrival_by_incoming_lane or {}
+    )
+    downstream_storage_by_outgoing_lane = (
+        downstream_storage_by_outgoing_lane or {}
+    )
     scores: list[PhaseScore] = []
     for phase_index in intersection.green_phase_indices:
         phase_state = intersection.phases[phase_index]
+        green_links = tuple(
+            (link_index, link)
+            for link_index, link in enumerate(intersection.links)
+            if link.signal_index < len(phase_state)
+            and phase_state[link.signal_index] in "Gg"
+        )
+        turns_per_incoming: dict[str, int] = {}
+        for _link_index, link in green_links:
+            turns_per_incoming[link.incoming_lane] = (
+                turns_per_incoming.get(link.incoming_lane, 0) + 1
+            )
         score = 0.0
-        movements = 0
+        served_incoming_lanes: set[str] = set()
         demand_movements = 0
         blocked_downstream = False
         for link_index, link in enumerate(intersection.links):
@@ -239,12 +260,17 @@ def score_phases(
                 break
             if has_demand:
                 demand_movements += 1
+            turning_ratio = 1.0 / max(
+                turns_per_incoming.get(link.incoming_lane, 1),
+                1,
+            )
             if mode == "local":
                 movement_score = (
                     float(incoming.queue)
                     if has_demand
                     else -float(config.empty_approach_penalty)
                 )
+                movement_score *= turning_ratio
             else:
                 movement_score = movement_pressure(
                     incoming.queue,
@@ -266,6 +292,52 @@ def score_phases(
                 movement_score -= (
                     graph_spillback_risk * config.downstream_graph_weight
                 )
+                movement_score *= turning_ratio
+                horizon = float(config.coordination_horizon_seconds)
+                saturation_capacity = (
+                    float(config.saturation_flow_vph_per_lane)
+                    / 3600.0
+                    * horizon
+                    * turning_ratio
+                )
+                predicted_arrivals = platoon_arrival_by_incoming_lane.get(
+                    link.incoming_lane,
+                    0.0,
+                )
+                discharge = min(
+                    float(incoming.vehicle_count) + predicted_arrivals,
+                    saturation_capacity,
+                )
+                movement_score += (
+                    float(incoming.queue)
+                    * horizon
+                    / 60.0
+                    * config.objective_delay_weight
+                )
+                movement_score += max(
+                    queue_growth_by_lane.get(link.incoming_lane, 0.0),
+                    0.0,
+                ) * config.objective_queue_growth_weight
+                movement_score += (
+                    float(incoming.queue) * config.objective_stops_weight
+                )
+                movement_score += (
+                    discharge * config.objective_throughput_weight
+                )
+                movement_score += (
+                    predicted_arrivals * config.platoon_arrival_weight
+                )
+                movement_score -= (
+                    graph_spillback_risk * config.objective_spillback_weight
+                )
+                if downstream_storage_by_outgoing_lane:
+                    movement_score += min(
+                        downstream_storage_by_outgoing_lane.get(
+                            link.outgoing_lane,
+                            0.0,
+                        ),
+                        saturation_capacity,
+                    ) * 0.05
             if is_preparation_movement:
                 movement_score += float(config.corridor_prepare_bonus)
             if has_demand:
@@ -274,9 +346,10 @@ def score_phases(
                     config,
                 )
             score += movement_score
-            movements += 1
+            served_incoming_lanes.add(link.incoming_lane)
         if blocked_downstream:
             continue
+        movements = len(served_incoming_lanes)
         if movements:
             score /= movements
         if movements and not demand_movements:

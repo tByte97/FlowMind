@@ -52,10 +52,13 @@ NUMERIC_FEATURES = (
     "priority_distance",
     "max_priority_override",
     "clearance_seconds",
+    "demand_scale",
     "time",
     "signal_index",
     "is_green",
     "current_phase",
+    "candidate_phase",
+    "action_phase",
     "phase_elapsed",
     "phase_count",
     "incoming_queue",
@@ -69,6 +72,16 @@ NUMERIC_FEATURES = (
     "outgoing_mean_speed",
     "outgoing_free_slots",
     "downstream_blocked",
+    "incoming_queue_growth_15s",
+    "incoming_queue_growth_30s",
+    "arrival_rate_15s",
+    "arrival_rate_30s",
+    "discharge_rate_15s",
+    "discharge_rate_30s",
+    "upstream_neighbour_queue",
+    "downstream_neighbour_occupancy",
+    "downstream_storage_slots",
+    "platoon_arrival_30s",
 )
 
 CATEGORICAL_FEATURES = (
@@ -79,6 +92,8 @@ CATEGORICAL_FEATURES = (
     "outgoing_lane",
     "signal_state",
     "phase_state",
+    "candidate_phase_state",
+    "demand_profile",
 )
 
 DEFAULT_CONTROL = ControlConfig()
@@ -106,6 +121,19 @@ OPTIONAL_NUMERIC_DEFAULTS = {
     "priority_distance": DEFAULT_CONTROL.priority_distance,
     "max_priority_override": DEFAULT_CONTROL.max_priority_override,
     "clearance_seconds": DEFAULT_CONTROL.clearance_seconds,
+    "demand_scale": 1.0,
+    "candidate_phase": -1,
+    "action_phase": -1,
+    "incoming_queue_growth_15s": 0.0,
+    "incoming_queue_growth_30s": 0.0,
+    "arrival_rate_15s": 0.0,
+    "arrival_rate_30s": 0.0,
+    "discharge_rate_15s": 0.0,
+    "discharge_rate_30s": 0.0,
+    "upstream_neighbour_queue": 0.0,
+    "downstream_neighbour_occupancy": 0.0,
+    "downstream_storage_slots": 0.0,
+    "platoon_arrival_30s": 0.0,
 }
 
 DROP_COLUMNS = (
@@ -113,6 +141,9 @@ DROP_COLUMNS = (
     "scenario",
     "seed",
     "duration",
+    "dataset_fingerprint",
+    "dataset_schema_version",
+    "dataset_schema_sha256",
 )
 
 
@@ -132,7 +163,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--target",
-        default="target_incoming_queue_60s",
+        default="target_queue_reduction_60s",
         help="Target column to predict.",
     )
     parser.add_argument(
@@ -161,6 +192,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=PROJECT_ROOT / "simulation" / "rivne_area" / "osm.net.xml.gz",
         help="Network used by the training/demo scenario (stored by SHA-256).",
+    )
+    parser.add_argument(
+        "--zone",
+        type=Path,
+        default=PROJECT_ROOT / "simulation" / "rivne_area" / "central_zone.json",
+        help="Zone definition stored by SHA-256 in the model contract.",
     )
     parser.add_argument("--max-files", type=int)
     parser.add_argument("--max-rows", type=int)
@@ -213,6 +250,7 @@ def main() -> None:
         rows_per_file,
         args.random_state,
     )
+    dataset_contract = validate_dataset_contract(df)
     train_seeds, valid_seeds, test_seeds = split_seeds(
         sorted(int(seed) for seed in df["seed"].dropna().unique()),
         args.train_ratio,
@@ -264,13 +302,18 @@ def main() -> None:
         "artifact_format_version": 2,
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "model_type": args.model_type,
-        "forecast_contract": "current_policy",
+        "forecast_contract": "counterfactual",
         "target": args.target,
         "dataset_dir": str(args.dataset_dir),
         "dataset_sha256": dataset_sha256(sample_paths),
         "dataset_files": [path.name for path in sample_paths],
         "network_path": str(args.network),
         "network_sha256": file_sha256(args.network),
+        "zone_path": str(args.zone),
+        "zone_sha256": file_sha256(args.zone),
+        "dataset_fingerprint": dataset_contract["dataset_fingerprint"],
+        "dataset_schema_version": dataset_contract["dataset_schema_version"],
+        "dataset_schema_sha256": dataset_contract["dataset_schema_sha256"],
         "sample_file_count": len(sample_paths),
         "row_count": int(len(df)),
         "rows_per_file": rows_per_file,
@@ -282,7 +325,7 @@ def main() -> None:
             feature_columns,
             NUMERIC_FEATURES,
             CATEGORICAL_FEATURES,
-            "current_policy",
+            "counterfactual",
         ),
         "feature_ranges": numeric_feature_ranges(train_df),
         "known_tls_ids": sorted(
@@ -414,7 +457,13 @@ def load_dataset(
 
     frames = []
     use_columns = set(NUMERIC_FEATURES) | set(CATEGORICAL_FEATURES)
-    use_columns |= {target, "seed"}
+    use_columns |= {
+        target,
+        "seed",
+        "dataset_fingerprint",
+        "dataset_schema_version",
+        "dataset_schema_sha256",
+    }
     for index, path in enumerate(sample_paths, start=1):
         frame = pd.read_csv(
             path,
@@ -451,6 +500,33 @@ def add_optional_feature_defaults(df: Any) -> Any:
         if column not in df.columns:
             df[column] = default
     return df
+
+
+def validate_dataset_contract(df: Any) -> dict[str, object]:
+    required = (
+        "dataset_fingerprint",
+        "dataset_schema_version",
+        "dataset_schema_sha256",
+    )
+    missing = [column for column in required if column not in df.columns]
+    if missing:
+        raise SystemExit(
+            "Legacy/mixed dataset is not trainable; missing contract columns: "
+            + ", ".join(missing)
+        )
+    values: dict[str, object] = {}
+    for column in required:
+        unique = {
+            str(value)
+            for value in df[column].dropna().unique()
+            if str(value).strip()
+        }
+        if len(unique) != 1:
+            raise SystemExit(
+                f"Dataset contract mismatch in {column}: {sorted(unique)}"
+            )
+        values[column] = next(iter(unique))
+    return values
 
 
 def split_seeds(

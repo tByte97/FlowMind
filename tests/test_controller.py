@@ -78,6 +78,7 @@ class FakeQueueForecast:
     def __init__(self, diagnostics: ForecastDiagnostics) -> None:
         self.last_diagnostics = diagnostics
         self.evaluation_horizon_seconds = 3
+        self.prediction_target = "target_incoming_queue_3s"
 
     def predict_intersection(self, **_kwargs: object) -> dict[tuple[int, int], float]:
         return {(0, 0): 1.0, (2, 1): 9.0}
@@ -232,6 +233,78 @@ class AreaSignalControllerTest(unittest.TestCase):
         self.assertEqual(traci.trafficlight.programs, [("tls", "0")])
         self.assertEqual(traci.trafficlight.get_phase_calls, 0)
 
+    def test_sensor_failure_falls_back_only_affected_tls(self) -> None:
+        class SelectiveLaneDomain(FakeLaneDomain):
+            counts = {
+                "a-north": 0,
+                "a-south": 0,
+                "a-east": 10,
+                "a-west": 0,
+                "b-north": 0,
+                "b-south": 0,
+                "b-east": 10,
+                "b-west": 0,
+            }
+
+            def getLength(self, lane_id: str) -> float:
+                if lane_id == "a-north":
+                    raise RuntimeError("camera a unavailable")
+                return 120.0
+
+        class MultiTrafficLightDomain:
+            def __init__(self) -> None:
+                self.phases = {"tls-a": 0, "tls-b": 0}
+                self.reads: list[str] = []
+                self.programs: list[tuple[str, str]] = []
+
+            def getPhase(self, tls_id: str) -> int:
+                self.reads.append(tls_id)
+                return self.phases[tls_id]
+
+            def getSpentDuration(self, _tls_id: str) -> float:
+                return 12.0
+
+            def setPhase(self, tls_id: str, phase: int) -> None:
+                self.phases[tls_id] = phase
+
+            def setPhaseDuration(self, _tls_id: str, _duration: float) -> None:
+                return None
+
+            def setProgram(self, tls_id: str, program_id: str) -> None:
+                self.programs.append((tls_id, program_id))
+
+        traci = FakeTraci()
+        traci.lane = SelectiveLaneDomain()
+        traci.trafficlight = MultiTrafficLightDomain()
+        area = AreaModel(
+            tuple(
+                Intersection(
+                    tls_id=f"tls-{suffix}",
+                    position=(0.0, 0.0),
+                    phases=("Gr", "yr", "rG", "ry"),
+                    links=(
+                        ControlledLink(f"{suffix}-north", f"{suffix}-south", 0),
+                        ControlledLink(f"{suffix}-east", f"{suffix}-west", 1),
+                    ),
+                    program_id="0",
+                )
+                for suffix in ("a", "b")
+            )
+        )
+        controller = AreaSignalController(
+            traci,
+            area,
+            "flowmind",
+            ControlConfig(),
+        )
+
+        controller.step(12.0)
+
+        self.assertEqual(traci.trafficlight.programs, [("tls-a", "0")])
+        self.assertNotIn("tls-a", traci.trafficlight.reads)
+        self.assertIn("tls-b", traci.trafficlight.reads)
+        self.assertEqual(traci.trafficlight.phases["tls-b"], 1)
+
     def test_safety_rejection_reason_is_counted_and_logged(self) -> None:
         class RejectingSafety:
             @staticmethod
@@ -282,7 +355,9 @@ class AreaSignalControllerTest(unittest.TestCase):
         self.assertEqual(controller.stats.queue_forecast_shadow_mae, 1.0)
         sample = controller.stats.queue_forecast_samples[0]
         self.assertFalse(sample.used_for_control)
-        self.assertEqual(sample.observed_mean, 5.0)
+        # Only the movement served by the observed phase is eligible for
+        # shadow validation; alternative phase predictions are counterfactual.
+        self.assertEqual(sample.observed_mean, 0.0)
         self.assertEqual(sample.mean_absolute_error, 1.0)
 
     def test_ood_forecast_is_gated_even_when_shadow_mode_is_disabled(self) -> None:

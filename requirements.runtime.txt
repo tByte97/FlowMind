@@ -11,6 +11,7 @@ idna==3.18
 joblib==1.5.3
 lightgbm==4.6.0
 networkx==3.6.1
+optuna>=4,<5
 numpy==2.5.0
 pandas==3.0.3
 pydantic==2.13.4

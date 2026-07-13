@@ -20,9 +20,9 @@ CONTROL_MODES = (
 ADAPTIVE_CONTROL_MODES = (LOCAL_MODE, FLOWMIND_MODE)
 LEGACY_CONTROL_MODE_ALIASES = {"fixed": STATIC_FIXED_MODE}
 DEFAULT_QUEUE_MODEL_PATHS = (
-    PROJECT_ROOT / "models" / "queue_lgbm_30s_current.joblib",
-    PROJECT_ROOT / "models" / "queue_lgbm_60s_current.joblib",
-    PROJECT_ROOT / "models" / "queue_lgbm_90s_current.joblib",
+    PROJECT_ROOT / "models" / "queue_lgbm_30s_decision.joblib",
+    PROJECT_ROOT / "models" / "queue_lgbm_60s_decision.joblib",
+    PROJECT_ROOT / "models" / "queue_lgbm_90s_decision.joblib",
 )
 
 
@@ -55,6 +55,15 @@ class ControlConfig:
     spillback_start_occupancy: float = 0.55
     spillback_hard_gate_probability: float = 0.85
     area_pressure_weight: float = 0.35
+    coordination_horizon_seconds: int = 60
+    saturation_flow_vph_per_lane: float = 1800.0
+    objective_delay_weight: float = 1.0
+    objective_queue_growth_weight: float = 2.0
+    objective_spillback_weight: float = 30.0
+    objective_stops_weight: float = 0.5
+    objective_throughput_weight: float = 1.0
+    platoon_arrival_weight: float = 0.8
+    zone_coordination_weight: float = 1.5
     queue_forecast_weight: float = 0.75
     queue_forecast_shadow_mode: bool = True
     queue_forecast_min_confidence: float = 0.70
@@ -98,6 +107,8 @@ class ControlConfig:
             "corridor_pass_confirmation_distance": (
                 self.corridor_pass_confirmation_distance
             ),
+            "coordination_horizon_seconds": self.coordination_horizon_seconds,
+            "saturation_flow_vph_per_lane": self.saturation_flow_vph_per_lane,
         }
         for name, value in positive.items():
             if float(value) <= 0:
@@ -126,6 +137,13 @@ class ControlConfig:
             "downstream_weight": self.downstream_weight,
             "downstream_graph_weight": self.downstream_graph_weight,
             "area_pressure_weight": self.area_pressure_weight,
+            "objective_delay_weight": self.objective_delay_weight,
+            "objective_queue_growth_weight": self.objective_queue_growth_weight,
+            "objective_spillback_weight": self.objective_spillback_weight,
+            "objective_stops_weight": self.objective_stops_weight,
+            "objective_throughput_weight": self.objective_throughput_weight,
+            "platoon_arrival_weight": self.platoon_arrival_weight,
+            "zone_coordination_weight": self.zone_coordination_weight,
             "queue_forecast_weight": self.queue_forecast_weight,
             "empty_approach_penalty": self.empty_approach_penalty,
             "empty_phase_penalty": self.empty_phase_penalty,
@@ -180,6 +198,10 @@ class RunConfig:
     dataset_scenario: str = "rivne_focused"
     dataset_sample_interval: int = 5
     dataset_target_horizons: tuple[int, ...] = (30, 60, 90)
+    dataset_fingerprint: str = ""
+    demand_profile: str = "normal"
+    demand_scale: float = 1.0
+    dataset_emergency_active: bool = False
     evaluation_id: str | None = None
     evaluation_pair_id: str | None = None
     evaluation_replicate: int | None = None
@@ -199,6 +221,21 @@ class RunConfig:
             raise ValueError("websocket_port must be between 1 and 65535")
         if self.dataset_sample_interval <= 0:
             raise ValueError("dataset_sample_interval must be positive")
+        if self.demand_scale <= 0:
+            raise ValueError("demand_scale must be positive")
+        supported_profiles = {
+            "off_peak",
+            "normal",
+            "morning_peak",
+            "evening_peak",
+            "oversaturated",
+            "incident",
+            "lane_closure",
+        }
+        if self.demand_profile not in supported_profiles:
+            raise ValueError(
+                "Unsupported demand_profile: " + self.demand_profile
+            )
         if self.control.sensor_range_meters <= 0:
             raise ValueError("sensor_range_meters must be positive")
         if any(value <= 0 for value in self.dataset_target_horizons):

@@ -73,6 +73,8 @@ results/* + FastAPI dashboard
 | `flowmind/traffic_state.py` | читання стану смуг у sensor range |
 | `flowmind/signal_policy.py` | scoring фаз для `local` і `flowmind` |
 | `flowmind/controller.py` | прийняття рішень і керування світлофорами через TraCI |
+| `flowmind/zone_optimizer.py` | спільна 30–90-секундна ціль і узгодження фаз усієї зони |
+| `flowmind/runtime_contract.py` | startup-перевірка commit/TLS/network/zone/schema/model coverage |
 | `flowmind/safety_validator.py` | hard floor SUMO minDur, реальні yellow/all-red duration/minDur і безпечні переходи |
 | `flowmind/queue_forecast.py` | LightGBM-прогноз черг на 30/60/90 секунд |
 | `flowmind/emergency_router.py` | маршрути для швидкої та оцінка альтернатив |
@@ -91,29 +93,35 @@ results/* + FastAPI dashboard
 
 ## AI / ML
 
-Поточні runtime-моделі:
+Активні decision-моделі після нового навчання:
 
 ```text
-models/queue_lgbm_30s_current.joblib
-models/queue_lgbm_60s_current.joblib
-models/queue_lgbm_90s_current.joblib
+models/queue_lgbm_30s_decision.joblib
+models/queue_lgbm_60s_decision.joblib
+models/queue_lgbm_90s_decision.joblib
 ```
 
 Модельний стек:
 
 - LightGBM;
 - 3 горизонти прогнозу: 30, 60, 90 секунд;
-- target: `target_incoming_queue_30s`, `target_incoming_queue_60s`, `target_incoming_queue_90s`;
-- контракт моделей: `current_policy`; фактичний `current_phase` не підміняється candidate-фазою;
-- input features: стан фази, elapsed time, incoming/outgoing queue, occupancy, speed, free slots, signal state, TLS/lane/movement ID як categorical features і control parameters;
-- кожен артефакт має SHA-256 dataset, network, feature schema та `.joblib` у sidecar metadata;
+- target: `target_queue_reduction_30s/60s/90s`;
+- контракт моделей: `counterfactual`; фактичний `current_phase`
+  зберігається окремо від `candidate_phase/action_phase`;
+- input features включають queue growth 15/30 с, arrival/discharge rate,
+  downstream storage/occupancy, platoon, сусідні TLS та demand profile;
+- кожен артефакт має SHA-256 dataset, dataset fingerprint,
+  network, zone, dataset/feature schema та `.joblib`;
 - prediction обмежується фізичною lane capacity;
 - unseen TLS/lane, schema/hash mismatch або feature OOD автоматично вимикають ML-вплив.
 
 За замовчуванням ML працює у shadow mode: прогноз не впливає на
-світлофор, а trace після закінчення горизонту містить фактичну чергу і MAE.
+світлофор, а trace порівнює прогноз зменшення черги лише для
+фактично виконаної фази. Альтернативні candidate-фази не видаються
+за спостережений outcome.
 Явно дозволити лише in-domain/high-confidence ML-вплив можна прапором
-`--enable-queue-control`.
+`--enable-queue-control`, і лише з approval-артефактом, що збігається з
+model/network/zone/ControlConfig hashes.
 
 ## Green corridor
 
@@ -227,8 +235,9 @@ python experiments/run_experiment.py sumo_actuated --duration 600
 python experiments/run_experiment.py local --duration 600
 python experiments/run_experiment.py flowmind --duration 600
 python experiments/run_experiment.py flowmind --duration 600 --emergency
-# ML вплив лише після shadow-валідації:
-python experiments/run_experiment.py flowmind --duration 600 --enable-queue-control
+# ML вплив лише після shadow/control evaluation і approval:
+python experiments/run_demo.py --duration 600 --headless --no-dashboard \
+  --enable-queue-control --control-config results/tuning/best_control_config.json
 ```
 
 ## Відтворювана оцінка режимів
@@ -278,14 +287,16 @@ GEMINI_MODEL=gemini-3.1-flash-lite
 ```
 
 `/app/results` винесено в persistent volume `flowmind_results`, а активні
-моделі — у `flowmind_models`. Перший запуск копіює bundled models з image у
-порожній models volume; trainer потім оновлює цей volume.
+моделі — у `flowmind_models`. Volume моделей автоматично
+ініціалізується з UID/GID `10001`, тому trainer може безпечно записувати
+артефакти. Старі 6-TLS моделі лежать у `models/archive/zone6` і не
+потрапляють у Docker image.
 
 Серверний workflow:
 
 ```bash
-# 1. Зібрати образ і підняти web.
-docker compose -f compose.yaml -f compose.server.yaml build web
+# 1. Зібрати versioned image і підняти web.
+./scripts/build_image.sh web
 docker compose -f compose.yaml -f compose.server.yaml up -d web
 
 # 2. Зібрати повний training dataset (400 resumable runs).
@@ -296,15 +307,16 @@ docker compose --profile dataset \
 docker compose --profile training \
   -f compose.yaml -f compose.server.yaml up trainer
 
-# 4. Виконати resumable 30-pair evaluation на нових моделях.
-docker compose --profile evaluation \
-  -f compose.yaml -f compose.server.yaml up evaluation
+# 4. Не вмикати ML: спочатку shadow/control evaluation та approval,
+#    точні команди наведені нижче.
 ```
 
 Jobs можна від'єднати від terminal через `up -d`, а стан дивитися командами
 `docker compose logs -f dataset`, `docker compose logs -f trainer` і
 `docker compose logs -f evaluation`. Повторний `up` використовує `--resume`
 для dataset/evaluation і не приймає неповні summaries як завершені runs.
+Dataset `--resume` додатково fail-fast порівнює fingerprint плану,
+мережі, зони, schema, controller source, demand і всіх run settings.
 
 ## Dataset і тренування
 
@@ -323,6 +335,34 @@ python experiments/train_queue_ensemble.py \
   --rows-per-file 5000 \
   --jobs 4
 ```
+
+Валідація, tuning та допуск ML:
+
+```bash
+# 1. Bayesian/Optuna search зональної ControlConfig.
+docker compose --profile tuning up tuning
+
+# 2. 30 paired replicates: ML лише shadow.
+python experiments/run_evaluation.py --replicates 30 --duration 1800 \
+  --workers 4 --evaluation-id rivne_shadow_v2 --resume \
+  --control-config results/tuning/best_control_config.json
+
+# 3. 30 paired replicates: ML вплив у кандидатному evaluation.
+python experiments/run_evaluation.py --replicates 30 --duration 1800 \
+  --workers 4 --evaluation-id rivne_ml_control_v2 --resume \
+  --enable-queue-control \
+  --control-config results/tuning/best_control_config.json
+
+# 4. Видати hash-bound approval лише якщо обидва reports pass.
+python experiments/approve_queue_control.py \
+  --shadow-dir results/evaluation/rivne_shadow_v2 \
+  --baseline-dir results/evaluation/rivne_shadow_v2 \
+  --control-dir results/evaluation/rivne_ml_control_v2
+```
+
+Для web після approval встановити
+`FLOWMIND_ENABLE_QUEUE_CONTROL=1` і
+`FLOWMIND_CONTROL_CONFIG=/app/results/tuning/best_control_config.json`.
 
 ## Структура
 

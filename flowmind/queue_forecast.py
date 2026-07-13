@@ -35,6 +35,14 @@ class QueueForecastStats:
     dataset_sha256: str = ""
     network_sha256: str = ""
     feature_schema_sha256: str = ""
+    zone_sha256: str = ""
+    dataset_fingerprint: str = ""
+    dataset_schema_version: str = ""
+    dataset_schema_sha256: str = ""
+    known_tls_count: int = 0
+    known_lane_count: int = 0
+    feature_schema_valid: bool = False
+    artifact_hash_valid: bool = False
 
 
 @dataclass(frozen=True)
@@ -89,6 +97,14 @@ class QueueForecastModel:
         self._declared_artifact_sha256 = str(metadata.get("artifact_sha256", ""))
         self._dataset_sha256 = str(metadata.get("dataset_sha256", ""))
         self._network_sha256 = str(metadata.get("network_sha256", ""))
+        self._zone_sha256 = str(metadata.get("zone_sha256", ""))
+        self._dataset_fingerprint = str(metadata.get("dataset_fingerprint", ""))
+        self._dataset_schema_version = str(
+            metadata.get("dataset_schema_version", "")
+        )
+        self._dataset_schema_sha256 = str(
+            metadata.get("dataset_schema_sha256", "")
+        )
         self._feature_schema_sha256 = str(
             metadata.get("feature_schema_sha256", "")
         )
@@ -149,11 +165,39 @@ class QueueForecastModel:
             dataset_sha256=self._dataset_sha256,
             network_sha256=self._network_sha256,
             feature_schema_sha256=self._feature_schema_sha256,
+            zone_sha256=self._zone_sha256,
+            dataset_fingerprint=self._dataset_fingerprint,
+            dataset_schema_version=self._dataset_schema_version,
+            dataset_schema_sha256=self._dataset_schema_sha256,
+            known_tls_count=len(self._known_tls_ids),
+            known_lane_count=len(self._known_lane_ids),
+            feature_schema_valid=(
+                bool(self._feature_schema_sha256)
+                and self._feature_schema_sha256
+                == self._computed_feature_schema_sha256
+            ),
+            artifact_hash_valid=(
+                bool(self._declared_artifact_sha256)
+                and bool(self._artifact_sha256)
+                and self._declared_artifact_sha256 == self._artifact_sha256
+            ),
         )
+
+    @property
+    def known_tls_ids(self) -> frozenset[str]:
+        return self._known_tls_ids
+
+    @property
+    def known_lane_ids(self) -> frozenset[str]:
+        return self._known_lane_ids
 
     @property
     def horizon_seconds(self) -> int | None:
         return self._horizon_seconds
+
+    @property
+    def prediction_target(self) -> str:
+        return self._target
 
     @property
     def evaluation_horizon_seconds(self) -> int:
@@ -174,6 +218,8 @@ class QueueForecastModel:
         phase_elapsed: float,
         control: ControlConfig,
         sample_interval: int,
+        context_by_lane: dict[str, dict[str, float]] | None = None,
+        area_context_by_lane: dict[str, dict[str, float]] | None = None,
     ) -> dict[tuple[int, int], float]:
         if not 0 <= current_phase < len(intersection.phases):
             self._last_diagnostics = ForecastDiagnostics(
@@ -216,6 +262,8 @@ class QueueForecastModel:
                         state=state,
                         control=control,
                         sample_interval=sample_interval,
+                        context_by_lane=context_by_lane,
+                        area_context_by_lane=area_context_by_lane,
                     )
                 )
                 row_keys.append(candidate_keys)
@@ -246,6 +294,8 @@ class QueueForecastModel:
                             state=state,
                             control=control,
                             sample_interval=sample_interval,
+                            context_by_lane=context_by_lane,
+                            area_context_by_lane=area_context_by_lane,
                         )
                     )
                     row_keys.append(((phase_index, link_index),))
@@ -267,7 +317,12 @@ class QueueForecastModel:
                 float(incoming.queue),
                 1.0,
             )
-            bounded = sanitized_prediction(prediction, upper_bound=capacity)
+            bounded = sanitized_prediction(
+                prediction,
+                upper_bound=capacity,
+                allow_negative="queue_reduction" in self._target
+                or "delta_queue" in self._target,
+            )
             for key in keys:
                 result[key] = bounded
         return result
@@ -287,12 +342,19 @@ class QueueForecastModel:
         state: TrafficState,
         control: ControlConfig,
         sample_interval: int,
+        context_by_lane: dict[str, dict[str, float]] | None,
+        area_context_by_lane: dict[str, dict[str, float]] | None,
     ) -> dict[str, Any]:
         incoming = state.lane(link.incoming_lane)
         outgoing = state.lane(link.outgoing_lane)
         movement_id = movement_id_for(intersection.tls_id, link)
+        context = (context_by_lane or {}).get(link.incoming_lane, {})
+        incoming_area = (area_context_by_lane or {}).get(link.incoming_lane, {})
+        outgoing_area = (area_context_by_lane or {}).get(link.outgoing_lane, {})
         return {
             "mode": mode,
+            "demand_profile": "runtime",
+            "demand_scale": 1.0,
             "sample_interval": sample_interval,
             "decision_interval": control.decision_interval,
             "sensor_range_meters": control.sensor_range_meters,
@@ -331,7 +393,14 @@ class QueueForecastModel:
             "candidate_phase": (
                 candidate_phase if candidate_phase is not None else current_phase
             ),
+            "action_phase": (
+                candidate_phase if candidate_phase is not None else current_phase
+            ),
+            "action_is_observed": int(candidate_phase is None),
             "phase_state": phase_state,
+            "candidate_phase_state": intersection.phases[
+                candidate_phase if candidate_phase is not None else current_phase
+            ],
             "phase_elapsed": round(phase_elapsed, 3),
             "phase_count": len(intersection.phases),
             "incoming_queue": incoming.queue,
@@ -345,6 +414,28 @@ class QueueForecastModel:
             "outgoing_mean_speed": round(outgoing.mean_speed, 5),
             "outgoing_free_slots": round(outgoing.free_slots, 5),
             "downstream_blocked": int(outgoing.occupancy >= control.blocked_occupancy),
+            "incoming_queue_growth_15s": context.get(
+                "incoming_queue_growth_15s", 0.0
+            ),
+            "incoming_queue_growth_30s": context.get(
+                "incoming_queue_growth_30s", 0.0
+            ),
+            "arrival_rate_15s": context.get("arrival_rate_15s", 0.0),
+            "arrival_rate_30s": context.get("arrival_rate_30s", 0.0),
+            "discharge_rate_15s": context.get("discharge_rate_15s", 0.0),
+            "discharge_rate_30s": context.get("discharge_rate_30s", 0.0),
+            "upstream_neighbour_queue": incoming_area.get(
+                "upstream_neighbour_queue", 0.0
+            ),
+            "downstream_neighbour_occupancy": outgoing_area.get(
+                "downstream_neighbour_occupancy", 0.0
+            ),
+            "downstream_storage_slots": outgoing_area.get(
+                "downstream_storage_slots", 0.0
+            ),
+            "platoon_arrival_30s": incoming_area.get(
+                "platoon_arrival_30s", 0.0
+            ),
         }
 
     def _diagnostics(
@@ -451,7 +542,47 @@ class QueueForecastEnsemble:
             feature_schema_sha256=";".join(
                 model.stats.feature_schema_sha256 for model in models
             ),
+            zone_sha256=";".join(model.stats.zone_sha256 for model in models),
+            dataset_fingerprint=";".join(
+                model.stats.dataset_fingerprint for model in models
+            ),
+            dataset_schema_version=";".join(
+                model.stats.dataset_schema_version for model in models
+            ),
+            dataset_schema_sha256=";".join(
+                model.stats.dataset_schema_sha256 for model in models
+            ),
+            known_tls_count=len(self.known_tls_ids),
+            known_lane_count=len(self.known_lane_ids),
+            feature_schema_valid=all(
+                model.stats.feature_schema_valid for model in models
+            ),
+            artifact_hash_valid=all(
+                model.stats.artifact_hash_valid for model in models
+            ),
         )
+
+    @property
+    def known_tls_ids(self) -> frozenset[str]:
+        domains = [
+            model.known_tls_ids
+            for model, weight in self._weighted_models
+            if weight > 0.0
+        ]
+        if not domains:
+            return frozenset()
+        return frozenset.intersection(*domains)
+
+    @property
+    def known_lane_ids(self) -> frozenset[str]:
+        domains = [
+            model.known_lane_ids
+            for model, weight in self._weighted_models
+            if weight > 0.0
+        ]
+        if not domains:
+            return frozenset()
+        return frozenset.intersection(*domains)
 
     @property
     def last_diagnostics(self) -> ForecastDiagnostics:
@@ -474,6 +605,20 @@ class QueueForecastEnsemble:
             )
         )
 
+    @property
+    def prediction_target(self) -> str:
+        targets = {
+            model.prediction_target
+            for model, weight in self._weighted_models
+            if weight > 0.0
+        }
+        if not targets:
+            return ""
+        families = {_target_family(target) for target in targets}
+        if len(families) != 1:
+            return ";".join(sorted(targets))
+        return next(iter(families))
+
     def predict_intersection(
         self,
         *,
@@ -485,6 +630,8 @@ class QueueForecastEnsemble:
         phase_elapsed: float,
         control: ControlConfig,
         sample_interval: int,
+        context_by_lane: dict[str, dict[str, float]] | None = None,
+        area_context_by_lane: dict[str, dict[str, float]] | None = None,
     ) -> dict[tuple[int, int], float]:
         totals: dict[tuple[int, int], float] = {}
         weights: dict[tuple[int, int], float] = {}
@@ -500,6 +647,8 @@ class QueueForecastEnsemble:
                 phase_elapsed=phase_elapsed,
                 control=control,
                 sample_interval=sample_interval,
+                context_by_lane=context_by_lane,
+                area_context_by_lane=area_context_by_lane,
             )
             for key, prediction in predictions.items():
                 totals[key] = totals.get(key, 0.0) + prediction * weight
@@ -561,14 +710,35 @@ def stable_hash(value: object) -> int:
     return int.from_bytes(digest, "little", signed=False)
 
 
-def sanitized_prediction(value: object, upper_bound: float | None = None) -> float:
+def sanitized_prediction(
+    value: object,
+    upper_bound: float | None = None,
+    *,
+    allow_negative: bool = False,
+) -> float:
     prediction = float(value)
     if not math.isfinite(prediction):
         return 0.0
-    prediction = max(prediction, 0.0)
     if upper_bound is not None:
-        prediction = min(prediction, max(float(upper_bound), 0.0))
+        bound = max(float(upper_bound), 0.0)
+        lower = -bound if allow_negative else 0.0
+        prediction = min(max(prediction, lower), bound)
+    elif not allow_negative:
+        prediction = max(prediction, 0.0)
     return prediction
+
+
+def _target_family(target: str) -> str:
+    for family in (
+        "queue_reduction",
+        "delta_queue",
+        "discharged_vehicles",
+        "future_waiting",
+        "incoming_queue",
+    ):
+        if family in target:
+            return family
+    return target
 
 
 def _file_sha256(path: Path) -> str:

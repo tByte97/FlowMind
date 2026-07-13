@@ -17,6 +17,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        FLOWMIND_GIT_COMMIT: ${FLOWMIND_GIT_COMMIT:-unversioned}
     image: flowmind:local
     container_name: flowmind-web
     init: true
@@ -27,6 +29,9 @@ services:
     environment:
       FLOWMIND_RESULTS_DIR: /app/results
       FLOWMIND_WEB_RESULTS_DIR: /app/results/web_demo
+      FLOWMIND_STRICT_STARTUP: ${FLOWMIND_STRICT_STARTUP:-1}
+      FLOWMIND_ENABLE_QUEUE_CONTROL: ${FLOWMIND_ENABLE_QUEUE_CONTROL:-0}
+      FLOWMIND_CONTROL_CONFIG: ${FLOWMIND_CONTROL_CONFIG:-}
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
       GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.1-flash-lite}
       OMP_NUM_THREADS: ${FLOWMIND_CPU_THREADS:-4}
@@ -69,6 +74,7 @@ services:
     restart: "no"
     environment:
       FLOWMIND_RESULTS_DIR: /app/results
+      FLOWMIND_STRICT_STARTUP: ${FLOWMIND_STRICT_STARTUP:-1}
       OMP_NUM_THREADS: ${FLOWMIND_CPU_THREADS:-4}
       OPENBLAS_NUM_THREADS: ${FLOWMIND_CPU_THREADS:-4}
       MKL_NUM_THREADS: ${FLOWMIND_CPU_THREADS:-4}
@@ -113,6 +119,7 @@ services:
       model-init:
         condition: service_completed_successfully
     environment:
+      FLOWMIND_STRICT_STARTUP: ${FLOWMIND_STRICT_STARTUP:-1}
       OMP_NUM_THREADS: ${FLOWMIND_CPU_THREADS:-4}
       OPENBLAS_NUM_THREADS: ${FLOWMIND_CPU_THREADS:-4}
       MKL_NUM_THREADS: ${FLOWMIND_CPU_THREADS:-4}
@@ -156,6 +163,7 @@ services:
         condition: service_completed_successfully
     environment:
       FLOWMIND_RESULTS_DIR: /app/results
+      FLOWMIND_STRICT_STARTUP: ${FLOWMIND_STRICT_STARTUP:-1}
       OMP_NUM_THREADS: ${FLOWMIND_CPU_THREADS:-4}
       OPENBLAS_NUM_THREADS: ${FLOWMIND_CPU_THREADS:-4}
       MKL_NUM_THREADS: ${FLOWMIND_CPU_THREADS:-4}
@@ -189,6 +197,49 @@ services:
       - --results-dir
       - /app/results/evaluation
       - --resume
+
+  tuning:
+    image: flowmind:local
+    container_name: flowmind-tuning
+    profiles:
+      - tuning
+    init: true
+    restart: "no"
+    environment:
+      FLOWMIND_RESULTS_DIR: /app/results
+      FLOWMIND_STRICT_STARTUP: ${FLOWMIND_STRICT_STARTUP:-1}
+      OMP_NUM_THREADS: ${FLOWMIND_CPU_THREADS:-4}
+      OPENBLAS_NUM_THREADS: ${FLOWMIND_CPU_THREADS:-4}
+      MKL_NUM_THREADS: ${FLOWMIND_CPU_THREADS:-4}
+    volumes:
+      - flowmind_results:/app/results
+      - flowmind_models:/app/models:ro
+    read_only: true
+    tmpfs:
+      - /tmp:size=1g,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 512
+    stop_grace_period: 60s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+    command:
+      - python
+      - -u
+      - experiments/tune_control.py
+      - --trials
+      - ${FLOWMIND_TUNING_TRIALS:-60}
+      - --duration
+      - ${FLOWMIND_TUNING_DURATION:-900}
+      - --seeds-per-trial
+      - ${FLOWMIND_TUNING_SEEDS:-3}
+      - --storage
+      - sqlite:////app/results/tuning/optuna.db
+      - --results-dir
+      - /app/results/tuning
 
 volumes:
   flowmind_results:

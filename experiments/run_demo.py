@@ -6,6 +6,7 @@ import os
 import socket
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -17,7 +18,9 @@ from flowmind.config import (
     RunConfig,
 )
 from flowmind.emergency_vehicle import load_emergency_config
+from flowmind.control_config_io import load_control_config
 from flowmind.experiment import run_experiment
+from flowmind.ml_approval import validate_queue_control_approval
 
 
 def find_free_port(preferred: int, attempts: int = 50) -> int:
@@ -127,6 +130,21 @@ def main() -> None:
         action="store_true",
         help="Disable ML queue forecast and run classic FlowMind scoring.",
     )
+    parser.add_argument(
+        "--enable-queue-control",
+        action="store_true",
+        help="Enable ML influence only when a matching approval artifact exists.",
+    )
+    parser.add_argument(
+        "--queue-control-approval",
+        type=Path,
+        default=PROJECT_ROOT / "models" / "queue_control_approval.json",
+    )
+    parser.add_argument(
+        "--control-config",
+        type=Path,
+        help="Load a tuned ControlConfig JSON artifact.",
+    )
     args = parser.parse_args()
 
     emergency = load_emergency_config(args.emergency_config).with_overrides(
@@ -135,7 +153,25 @@ def main() -> None:
         destination_edge=args.emergency_to_edge,
     )
     results_dir = args.results_dir
-    control = ControlConfig(sensor_range_meters=args.sensor_range)
+    model_paths = selected_queue_model_paths(args)
+    base_control = (
+        load_control_config(args.control_config)
+        if args.control_config is not None
+        else ControlConfig()
+    )
+    control = replace(
+        base_control,
+        sensor_range_meters=args.sensor_range,
+        queue_forecast_shadow_mode=not args.enable_queue_control,
+    )
+    if args.enable_queue_control:
+        validate_queue_control_approval(
+            args.queue_control_approval,
+            model_paths,
+            args.config.resolve().parent / "osm.net.xml.gz",
+            args.zone,
+            control,
+        )
     dashboard_process = None
     if not args.no_dashboard:
         results_dir.mkdir(parents=True, exist_ok=True)
@@ -183,7 +219,7 @@ def main() -> None:
                 zone_path=args.zone,
                 emergency=emergency,
                 control=control,
-                queue_model_paths=selected_queue_model_paths(args),
+                queue_model_paths=model_paths,
             )
         )
     except Exception:

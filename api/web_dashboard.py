@@ -907,6 +907,11 @@ def build_demo_command(options: dict[str, Any]) -> tuple[list[str], Path]:
         command.append("--headless")
     if not baseline:
         command.append("--no-baseline")
+    if os.getenv("FLOWMIND_ENABLE_QUEUE_CONTROL", "0").strip() == "1":
+        command.append("--enable-queue-control")
+    control_config = os.getenv("FLOWMIND_CONTROL_CONFIG", "").strip()
+    if control_config:
+        command.extend(["--control-config", control_config])
     return command, results_dir
 
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import json
 import os
+import xml.etree.ElementTree as ET
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -75,6 +76,11 @@ from .queue_forecast import (
     load_queue_forecast_models,
 )
 from .provenance import run_provenance_summary
+from .runtime_contract import (
+    RuntimeContract,
+    validate_runtime_contract,
+    write_runtime_contract_audit,
+)
 from .sumo_tls_adapter import SumoTlsSafetyAdapter
 from .sumo_corridor_adapter import SumoCorridorObservationAdapter
 from .sumo_zone_graph_adapter import SumoZoneGraphAdapter
@@ -129,6 +135,8 @@ def _sumo_command(config: RunConfig) -> list[str]:
         str(raw_dir / f"{config.mode}_sumo.log"),
         "--seed",
         str(config.seed),
+        "--scale",
+        str(config.demand_scale),
         "--end",
         str(config.duration),
         "--no-step-log",
@@ -140,9 +148,45 @@ def _sumo_command(config: RunConfig) -> list[str]:
         "--quit-on-end",
         "true",
     ]
+    profiled_route = _profiled_route_file(config)
+    if profiled_route is not None:
+        command.extend(["--route-files", str(profiled_route)])
     if config.gui:
         command.extend(["--delay", str(config.gui_delay_ms), "--start"])
     return command
+
+
+def _profiled_route_file(config: RunConfig) -> Path | None:
+    if config.demand_profile not in {"morning_peak", "evening_peak"}:
+        return None
+    try:
+        sumo_root = ET.parse(config.config_path).getroot()
+        route_value = next(
+            element.attrib["value"]
+            for element in sumo_root.findall(".//route-files")
+            if element.attrib.get("value")
+        )
+        source = config.config_path.resolve().parent / route_value.split(",")[0]
+        tree = ET.parse(source)
+    except (OSError, ET.ParseError, KeyError, StopIteration) as error:
+        raise RuntimeError(f"Cannot prepare demand profile routes: {error}") from error
+    flows = tree.getroot().findall("flow")
+    midpoint = max(len(flows) // 2, 1)
+    for index, flow in enumerate(flows):
+        base = float(flow.attrib.get("vehsPerHour", "0"))
+        favoured = index < midpoint
+        if config.demand_profile == "evening_peak":
+            favoured = not favoured
+        factor = 1.35 if favoured else 0.70
+        flow.set("vehsPerHour", f"{base * factor:.3f}")
+    output = (
+        config.results_dir.resolve()
+        / "raw"
+        / f"{config.mode}_{config.demand_profile}.rou.xml"
+    )
+    output.parent.mkdir(parents=True, exist_ok=True)
+    tree.write(output, encoding="utf-8", xml_declaration=True)
+    return output
 
 
 def load_area(config: RunConfig) -> AreaModel:
@@ -164,6 +208,30 @@ def run_experiment(config: RunConfig) -> dict[str, object]:
         queue_forecast_stats = (
             queue_forecast.stats if queue_forecast is not None else None
         )
+        runtime_contract: RuntimeContract = validate_runtime_contract(
+            config,
+            area,
+            net_path,
+            queue_forecast,
+        )
+        runtime_contract_audit_path = write_runtime_contract_audit(
+            config.results_dir,
+            config.mode,
+            runtime_contract,
+        )
+        print(
+            "Runtime contract: "
+            f"commit={runtime_contract.image_git_commit or runtime_contract.controller_git_commit} "
+            f"tls={runtime_contract.controlled_tls_count} "
+            f"network={runtime_contract.network_sha256[:12]} "
+            f"zone={runtime_contract.zone_sha256[:12]} "
+            f"model_tls={runtime_contract.covered_tls_count}/"
+            f"{runtime_contract.controlled_tls_count} "
+            f"model_lanes={runtime_contract.covered_lane_count}/"
+            f"{runtime_contract.required_lane_count}",
+            flush=True,
+        )
+        runtime_contract.raise_for_errors()
         configure_projection_data()
         start_sumo(_sumo_command(config))
         connection = traci.getConnection()
@@ -327,6 +395,32 @@ def run_experiment(config: RunConfig) -> dict[str, object]:
                     config.control.corridor_pass_confirmation_distance,
                 )
 
+        if area.tls_ids != evaluation_area.tls_ids:
+            # Emergency routing may safely expand the controlled area beyond
+            # the configured 20-TLS zone. Re-run the model coverage contract
+            # against the actual startup area before creating the controller.
+            runtime_contract = validate_runtime_contract(
+                config,
+                area,
+                net_path,
+                queue_forecast,
+            )
+            runtime_contract_audit_path = write_runtime_contract_audit(
+                config.results_dir,
+                config.mode,
+                runtime_contract,
+            )
+            print(
+                "Runtime contract (emergency-expanded): "
+                f"tls={runtime_contract.controlled_tls_count} "
+                f"model_tls={runtime_contract.covered_tls_count}/"
+                f"{runtime_contract.controlled_tls_count} "
+                f"model_lanes={runtime_contract.covered_lane_count}/"
+                f"{runtime_contract.required_lane_count}",
+                flush=True,
+            )
+            runtime_contract.raise_for_errors()
+
         if config.mode == STATIC_FIXED_MODE:
             static_programs = activate_static_fixed_programs(
                 connection,
@@ -407,7 +501,10 @@ def run_experiment(config: RunConfig) -> dict[str, object]:
                 level="success",
             )
         )
-        evaluation_graph = SumoZoneGraphAdapter(net_path).build_graph(
+        evaluation_graph = SumoZoneGraphAdapter(
+            net_path,
+            config.control.sensor_range_meters,
+        ).build_graph(
             zone_definition,
             evaluation_area,
         )
@@ -497,8 +594,25 @@ def run_experiment(config: RunConfig) -> dict[str, object]:
                     duration=config.duration,
                     sample_interval=config.dataset_sample_interval,
                     target_horizons=config.dataset_target_horizons,
+                    dataset_fingerprint=config.dataset_fingerprint,
+                    demand_profile=config.demand_profile,
+                    demand_scale=config.demand_scale,
+                    emergency_active=config.dataset_emergency_active,
                 ),
+                area_graph,
             )
+
+        disruption_lane_id = ""
+        disruption_original_speed: float | None = None
+        disruption_active = False
+        disruption_restored = False
+        if config.demand_profile in {"incident", "lane_closure"}:
+            candidate_lanes = tuple(sorted(evaluation_area.outgoing_lanes))
+            if candidate_lanes:
+                disruption_lane_id = candidate_lanes[config.seed % len(candidate_lanes)]
+                disruption_original_speed = float(
+                    connection.lane.getMaxSpeed(disruption_lane_id)
+                )
 
         simulated_time = 0.0
         while (
@@ -507,6 +621,27 @@ def run_experiment(config: RunConfig) -> dict[str, object]:
         ):
             connection.simulationStep()
             simulated_time = float(connection.simulation.getTime())
+            if (
+                disruption_lane_id
+                and not disruption_active
+                and simulated_time >= config.duration / 3.0
+            ):
+                connection.lane.setMaxSpeed(
+                    disruption_lane_id,
+                    0.5 if config.demand_profile == "lane_closure" else 3.0,
+                )
+                disruption_active = True
+            if (
+                disruption_active
+                and not disruption_restored
+                and simulated_time >= config.duration * 2.0 / 3.0
+                and disruption_original_speed is not None
+            ):
+                connection.lane.setMaxSpeed(
+                    disruption_lane_id,
+                    disruption_original_speed,
+                )
+                disruption_restored = True
             
             if (
                 not route_reassessment_done
@@ -765,7 +900,26 @@ def run_experiment(config: RunConfig) -> dict[str, object]:
                 }
             )
         summary["telemetry_failures"] = telemetry_failures
+        summary.update(
+            {
+                "demand_profile": config.demand_profile,
+                "demand_scale": config.demand_scale,
+                "dataset_emergency_active": config.dataset_emergency_active,
+                "disruption_lane_id": disruption_lane_id,
+                "disruption_applied": disruption_active,
+                "disruption_restored": disruption_restored,
+            }
+        )
         summary.update(queue_forecast_summary(queue_forecast_stats))
+        summary.update(
+            {
+                "runtime_contract_valid": runtime_contract.valid,
+                "runtime_contract_warnings": list(runtime_contract.warnings),
+                "runtime_contract_startup_audit": str(
+                    runtime_contract_audit_path
+                ),
+            }
+        )
         actual_emergency_route = (
             emergency_details.route_edges if emergency_details is not None else ()
         )
@@ -1205,6 +1359,10 @@ def queue_forecast_summary(stats: QueueForecastStats | None) -> dict[str, object
             "queue_forecast_dataset_sha256": "",
             "queue_forecast_network_sha256": "",
             "queue_forecast_feature_schema_sha256": "",
+            "queue_forecast_zone_sha256": "",
+            "queue_forecast_dataset_fingerprint": "",
+            "queue_forecast_known_tls_count": 0,
+            "queue_forecast_known_lane_count": 0,
         }
     return {
         "queue_forecast_model": stats.model_path,
@@ -1218,6 +1376,10 @@ def queue_forecast_summary(stats: QueueForecastStats | None) -> dict[str, object
         "queue_forecast_dataset_sha256": stats.dataset_sha256,
         "queue_forecast_network_sha256": stats.network_sha256,
         "queue_forecast_feature_schema_sha256": stats.feature_schema_sha256,
+        "queue_forecast_zone_sha256": stats.zone_sha256,
+        "queue_forecast_dataset_fingerprint": stats.dataset_fingerprint,
+        "queue_forecast_known_tls_count": stats.known_tls_count,
+        "queue_forecast_known_lane_count": stats.known_lane_count,
     }
 
 
