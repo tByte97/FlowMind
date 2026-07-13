@@ -97,9 +97,13 @@ class DatasetRun:
 
 
 def default_scenario_file(name: str) -> Path:
-    new_area = PROJECT_ROOT / "simulation" / "new_area" / name
-    if new_area.exists():
-        return new_area
+    """Return the versioned Rivne production/demo scenario by default.
+
+    ``simulation/new_area`` is retained as an optional fixture, but it must
+    never silently replace the configured Rivne zone during dataset creation.
+    Callers that need another map pass ``--config`` and ``--zone`` explicitly.
+    """
+
     return PROJECT_ROOT / "simulation" / "rivne_area" / name
 
 
