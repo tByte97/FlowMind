@@ -31,6 +31,7 @@ _CONTROLLER_SOURCE_FILES = (
     "zone_graph.py",
     "zone_optimizer.py",
     "sumo_zone_graph_adapter.py",
+    "sumo_signal_mask_adapter.py",
 )
 
 

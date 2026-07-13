@@ -376,12 +376,12 @@ dataset/current-policy ML до Rivne 20-TLS decision model.
   graph segment із invalid data залишається fail-closed.
 - [x] Segment/node capacity калібрується в тій самій sensor window
   (за замовчуванням 120 м).
-- [ ] Динамічне маскування окремої blocked movement всередині
-  спільної SUMO-фази не увімкнено: поточно вся demanded-фаза
-  fail-closed. Безпечне виправлення потребує startup-генерації та
-  conflict-validation маскованих TLS plans; простий
-  `setRedYellowGreenState` зруйнує перевірену послідовність clearance і не є
-  прийнятним shortcut.
+- [x] Окрема blocked movement всередині спільної фази маскується
+  на рівні signal index, а safety-valid групи залишаються кандидатами.
+  SUMO-adapter клонує startup-validated logic і може лише замінити
+  `G/g` на `r`; phase order, timing і yellow/all-red states не змінюються.
+  Непідтримуваний adapter залишається fail-closed для частково
+  заблокованої фази.
 
 ### P2 — ML decision model
 

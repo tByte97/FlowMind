@@ -70,6 +70,7 @@ results/* + FastAPI dashboard
 | `flowmind/sumo_tls_adapter.py` | ізольований адаптер SUMO topology/TraCI до нейтрального safety-каталогу |
 | `flowmind/zone_graph.py` | corridors, directed road segments, node storage, spillback probability і area decision snapshot |
 | `flowmind/sumo_zone_graph_adapter.py` | pre-MVP адаптер, який зв’язує TLS через реальні SUMO edges/lanes |
+| `flowmind/sumo_signal_mask_adapter.py` | fail-closed маскування blocked signal groups без змін phase order, timing або clearance |
 | `flowmind/traffic_state.py` | читання стану смуг у sensor range |
 | `flowmind/signal_policy.py` | scoring фаз для `local` і `flowmind` |
 | `flowmind/controller.py` | прийняття рішень і керування світлофорами через TraCI |

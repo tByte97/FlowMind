@@ -11,6 +11,7 @@ from .traffic_state import LaneState, TrafficState
 class PhaseScore:
     phase_index: int
     score: float
+    blocked_signal_indices: tuple[int, ...] = ()
 
 
 def movement_pressure(
@@ -184,6 +185,7 @@ def score_phases(
     queue_growth_by_lane: dict[str, float] | None = None,
     platoon_arrival_by_incoming_lane: dict[str, float] | None = None,
     downstream_storage_by_outgoing_lane: dict[str, float] | None = None,
+    blocked_signals_by_phase: dict[int, tuple[int, ...]] | None = None,
 ) -> tuple[PhaseScore, ...]:
     area_pressure = area_pressure or {}
     queue_forecast = queue_forecast or {}
@@ -196,15 +198,28 @@ def score_phases(
     downstream_storage_by_outgoing_lane = (
         downstream_storage_by_outgoing_lane or {}
     )
+    blocked_signals_by_phase = blocked_signals_by_phase or phase_signal_masks(
+        intersection,
+        state,
+        config,
+        priority_link=priority_link,
+        preparation_link=preparation_link,
+        downstream_risk_by_outgoing_lane=downstream_risk_by_outgoing_lane,
+    )
     scores: list[PhaseScore] = []
     for phase_index in intersection.green_phase_indices:
         phase_state = intersection.phases[phase_index]
+        blocked_signal_indices = blocked_signals_by_phase.get(phase_index, ())
+        blocked_signal_set = set(blocked_signal_indices)
         green_links = tuple(
             (link_index, link)
             for link_index, link in enumerate(intersection.links)
             if link.signal_index < len(phase_state)
             and phase_state[link.signal_index] in "Gg"
+            and link.signal_index not in blocked_signal_set
         )
+        if not green_links:
+            continue
         turns_per_incoming: dict[str, int] = {}
         for _link_index, link in green_links:
             turns_per_incoming[link.incoming_lane] = (
@@ -213,11 +228,12 @@ def score_phases(
         score = 0.0
         served_incoming_lanes: set[str] = set()
         demand_movements = 0
-        blocked_downstream = False
         for link_index, link in enumerate(intersection.links):
             if link.signal_index >= len(phase_state):
                 continue
             if phase_state[link.signal_index] not in "Gg":
+                continue
+            if link.signal_index in blocked_signal_set:
                 continue
             incoming = state.lane(link.incoming_lane)
             outgoing = state.lane(link.outgoing_lane)
@@ -234,30 +250,6 @@ def score_phases(
                 link.outgoing_lane,
                 0.0,
             )
-            if (
-                has_demand or is_priority_movement or is_preparation_movement
-            ) and graph_spillback_risk >= config.spillback_hard_gate_probability:
-                blocked_downstream = True
-                break
-            if is_priority_movement and movement_has_blocked_downstream(
-                outgoing,
-                config,
-                required_storage_slots=config.priority_min_storage_slots,
-            ):
-                blocked_downstream = True
-                break
-            if is_preparation_movement and movement_has_blocked_downstream(
-                outgoing,
-                config,
-            ):
-                blocked_downstream = True
-                break
-            if has_demand and movement_has_blocked_downstream(
-                outgoing,
-                config,
-            ):
-                blocked_downstream = True
-                break
             if has_demand:
                 demand_movements += 1
             turning_ratio = 1.0 / max(
@@ -347,18 +339,81 @@ def score_phases(
                 )
             score += movement_score
             served_incoming_lanes.add(link.incoming_lane)
-        if blocked_downstream:
-            continue
         movements = len(served_incoming_lanes)
         if movements:
             score /= movements
         if movements and not demand_movements:
             score -= float(config.empty_phase_penalty)
         if priority_link is not None and 0 <= priority_link < len(phase_state):
-            if phase_state[priority_link] in "Gg":
+            if (
+                phase_state[priority_link] in "Gg"
+                and priority_link not in blocked_signal_set
+            ):
                 score += 1_000.0
-        scores.append(PhaseScore(phase_index, score))
+        scores.append(
+            PhaseScore(
+                phase_index,
+                score,
+                blocked_signal_indices,
+            )
+        )
     return tuple(scores)
+
+
+def phase_signal_masks(
+    intersection: Intersection,
+    state: TrafficState,
+    config: ControlConfig,
+    *,
+    priority_link: int | None = None,
+    preparation_link: int | None = None,
+    downstream_risk_by_outgoing_lane: dict[str, float] | None = None,
+) -> dict[int, tuple[int, ...]]:
+    """Return green signal indices that must be red-masked per phase.
+
+    A signal index is the smallest independently controllable SUMO movement
+    group. If any demanded turn behind that signal has no safe downstream
+    storage, the whole signal index is masked while other green groups in the
+    same validated phase may continue.
+    """
+
+    downstream_risk = downstream_risk_by_outgoing_lane or {}
+    result: dict[int, tuple[int, ...]] = {}
+    for phase_index in intersection.green_phase_indices:
+        phase_state = intersection.phases[phase_index]
+        blocked: set[int] = set()
+        for link in intersection.links:
+            signal_index = link.signal_index
+            if signal_index >= len(phase_state):
+                continue
+            if phase_state[signal_index] not in "Gg":
+                continue
+            incoming = state.lane(link.incoming_lane)
+            outgoing = state.lane(link.outgoing_lane)
+            has_demand = lane_has_demand(incoming, config)
+            is_priority = priority_link is not None and signal_index == priority_link
+            is_preparation = (
+                preparation_link is not None and signal_index == preparation_link
+            )
+            if not (has_demand or is_priority or is_preparation):
+                continue
+            graph_blocked = (
+                downstream_risk.get(link.outgoing_lane, 0.0)
+                >= config.spillback_hard_gate_probability
+            )
+            required_slots = (
+                config.priority_min_storage_slots
+                if is_priority
+                else config.min_downstream_storage_slots
+            )
+            if graph_blocked or movement_has_blocked_downstream(
+                outgoing,
+                config,
+                required_storage_slots=required_slots,
+            ):
+                blocked.add(signal_index)
+        result[phase_index] = tuple(sorted(blocked))
+    return result
 
 
 def choose_phase(scores: tuple[PhaseScore, ...]) -> PhaseScore | None:

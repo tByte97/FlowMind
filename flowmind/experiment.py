@@ -844,6 +844,12 @@ def run_experiment(config: RunConfig) -> dict[str, object]:
                     "stale_lane_samples": controller.stats.stale_lane_samples,
                     "invalid_state_skips": controller.stats.invalid_state_skips,
                     "fallback_activations": controller.stats.fallback_activations,
+                    "movement_mask_updates": (
+                        controller.stats.movement_mask_updates
+                    ),
+                    "movement_mask_failures": (
+                        controller.stats.movement_mask_failures
+                    ),
                     "safety_rejections": controller.stats.safety_rejections,
                     "safety_rejection_reasons": (
                         controller.stats.safety_rejection_reasons
@@ -892,6 +898,8 @@ def run_experiment(config: RunConfig) -> dict[str, object]:
                     "stale_lane_samples": 0,
                     "invalid_state_skips": 0,
                     "fallback_activations": 0,
+                    "movement_mask_updates": 0,
+                    "movement_mask_failures": 0,
                     "safety_rejections": 0,
                     "safety_rejection_reasons": {},
                     "corridor_preparation_targets": 0,

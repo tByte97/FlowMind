@@ -84,6 +84,8 @@ INDEX_COLUMNS = (
     "clearance_phase_skips",
     "min_green_skips",
     "scoreless_skips",
+    "movement_mask_updates",
+    "movement_mask_failures",
     "queue_forecast_enabled",
     "queue_forecast_model",
     "queue_forecast_target",

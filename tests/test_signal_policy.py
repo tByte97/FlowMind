@@ -111,6 +111,33 @@ class SignalPolicyTest(unittest.TestCase):
 
         self.assertEqual([item.phase_index for item in scores], [0])
 
+    def test_demanded_blocked_group_is_masked_without_dropping_shared_phase(
+        self,
+    ) -> None:
+        intersection = Intersection(
+            tls_id="shared",
+            position=(0.0, 0.0),
+            phases=("GG", "yy", "rr"),
+            links=(
+                ControlledLink("blocked_demand", "blocked", 0),
+                ControlledLink("busy", "open", 1),
+            ),
+        )
+        state = TrafficState(
+            {
+                "blocked_demand": LaneState(8, 8, 0.5, 0.0, 4.0),
+                "blocked": LaneState(12, 16, 0.95, 0.0, 0.0),
+                "busy": LaneState(8, 8, 0.5, 0.0, 4.0),
+                "open": LaneState(0, 0, 0.0, 10.0, 15.0),
+            }
+        )
+
+        scores = score_phases(intersection, state, "flowmind", self.config)
+
+        self.assertEqual(len(scores), 1)
+        self.assertEqual(scores[0].phase_index, 0)
+        self.assertEqual(scores[0].blocked_signal_indices, (0,))
+
     def test_priority_cannot_force_blocked_downstream_phase(self) -> None:
         state = TrafficState(
             {

@@ -17,8 +17,10 @@ from .signal_policy import (
     effective_min_green,
     lane_has_demand,
     movement_has_blocked_downstream,
+    phase_signal_masks,
     score_phases,
 )
+from .sumo_signal_mask_adapter import SumoSignalMaskAdapter
 from .traffic_state import TrafficState, TrafficStateReader
 from .zone_graph import (
     AreaDecisionSnapshot,
@@ -64,6 +66,7 @@ class PreparedIntersectionDecision:
     max_green: float
     priority_link: int | None
     scores: tuple[PhaseScore, ...]
+    phase_masks: dict[int, tuple[int, ...]]
 
 
 @dataclass
@@ -88,6 +91,8 @@ class ControllerStats:
     stale_lane_samples: int = 0
     invalid_state_skips: int = 0
     fallback_activations: int = 0
+    movement_mask_updates: int = 0
+    movement_mask_failures: int = 0
     safety_rejections: int = 0
     safety_rejection_reasons: dict[str, int] = field(default_factory=dict)
     corridor_preparation_targets: int = 0
@@ -143,10 +148,13 @@ class AreaSignalController:
             config.sensor_last_known_good_ttl,
         )
         self._safety = SafetyValidator(traci_connection, area, config)
+        self._signal_masks = SumoSignalMaskAdapter(traci_connection)
         self._lane_demand_started_at: dict[str, float] = {}
         self._lane_history: dict[str, list[tuple[float, int, int]]] = {}
         self._next_decision_at = float(config.decision_interval)
         self._fallback_tls_ids: set[str] = set()
+        self._last_phase_by_tls: dict[str, int] = {}
+        self._phase_started_at: dict[str, float] = {}
         self._pending_queue_forecasts: list[PendingQueueForecast] = []
         self._corridor_recovery = CorridorRecoveryPlanner()
         self.stats = ControllerStats()
@@ -221,7 +229,11 @@ class AreaSignalController:
             if not 0 <= current_phase < len(intersection.phases):
                 self.stats.phase_out_of_range_skips += 1
                 continue
-            spent = float(self._traci.trafficlight.getSpentDuration(tls_id))
+            spent = self._phase_elapsed(
+                tls_id,
+                current_phase,
+                simulation_time,
+            )
             if tls_id in corridor_target_ids:
                 self._corridor_recovery.capture(
                     intersection,
@@ -244,6 +256,16 @@ class AreaSignalController:
 
             priority_link = overrides.get(tls_id)
             preparation_link = preparation_overrides.get(tls_id)
+            phase_masks = phase_signal_masks(
+                intersection,
+                traffic,
+                self._config,
+                priority_link=priority_link,
+                preparation_link=preparation_link,
+                downstream_risk_by_outgoing_lane=(
+                    snapshot.downstream_risk_by_outgoing_lane
+                ),
+            )
             queue_forecast: dict[tuple[int, int], float] = {}
             if self._queue_forecast is not None:
                 try:
@@ -317,6 +339,7 @@ class AreaSignalController:
                 queue_growth_by_lane,
                 snapshot.platoon_arrival_by_incoming_lane,
                 snapshot.downstream_storage_by_outgoing_lane,
+                phase_masks,
             )
             prepared.append(
                 PreparedIntersectionDecision(
@@ -326,8 +349,45 @@ class AreaSignalController:
                     max_green=max_green,
                     priority_link=priority_link,
                     scores=scores,
+                    phase_masks=phase_masks,
                 )
             )
+
+        masked_prepared: list[PreparedIntersectionDecision] = []
+        for decision in prepared:
+            synchronized = self._signal_masks.synchronize(
+                decision.intersection.tls_id,
+                decision.current_phase,
+                decision.phase_masks,
+            )
+            if synchronized:
+                if any(decision.phase_masks.values()):
+                    self.stats.movement_mask_updates += 1
+                masked_prepared.append(decision)
+                continue
+            self.stats.movement_mask_failures += 1
+            safe_scores = tuple(
+                score
+                for score in decision.scores
+                if not score.blocked_signal_indices
+            )
+            masked_prepared.append(
+                PreparedIntersectionDecision(
+                    intersection=decision.intersection,
+                    current_phase=decision.current_phase,
+                    spent=decision.spent,
+                    max_green=decision.max_green,
+                    priority_link=decision.priority_link,
+                    scores=safe_scores,
+                    phase_masks={},
+                )
+            )
+            self._record_safety_rejection(
+                simulation_time,
+                decision.intersection.tls_id,
+                "movement mask adapter unavailable",
+            )
+        prepared = masked_prepared
 
         zone_choices = (
             optimize_zone_phases(
@@ -351,6 +411,24 @@ class AreaSignalController:
                 target_phase=(choice.phase_index if choice is not None else None),
             )
         self._remember_traffic(traffic, simulation_time)
+
+    def _phase_elapsed(
+        self,
+        tls_id: str,
+        current_phase: int,
+        simulation_time: float,
+    ) -> float:
+        previous_phase = self._last_phase_by_tls.get(tls_id)
+        if previous_phase != current_phase or tls_id not in self._phase_started_at:
+            try:
+                reported = float(
+                    self._traci.trafficlight.getSpentDuration(tls_id)
+                )
+            except Exception:
+                reported = 0.0
+            self._last_phase_by_tls[tls_id] = current_phase
+            self._phase_started_at[tls_id] = simulation_time - max(reported, 0.0)
+        return max(simulation_time - self._phase_started_at[tls_id], 0.0)
 
     def _filter_corridor_targets(
         self,
@@ -594,6 +672,19 @@ class AreaSignalController:
         if tls_id in self._fallback_tls_ids:
             return
         trafficlight = self._traci.trafficlight
+        if self._signal_masks.has_active_mask(tls_id):
+            try:
+                current_phase = int(trafficlight.getPhase(tls_id))
+                restored = self._signal_masks.restore(tls_id, current_phase)
+            except Exception:
+                restored = False
+            if not restored:
+                self.stats.movement_mask_failures += 1
+                self._record_safety_rejection(
+                    simulation_time,
+                    tls_id,
+                    "could not restore base TLS logic before sensor fallback",
+                )
         set_program = getattr(trafficlight, "setProgram", None)
         if callable(set_program):
             intersection = self._area.intersection(tls_id)
