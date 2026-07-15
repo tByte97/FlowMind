@@ -53,7 +53,6 @@ NUMERIC_FEATURES = (
     "max_priority_override",
     "clearance_seconds",
     "demand_scale",
-    "time",
     "signal_index",
     "is_green",
     "current_phase",
@@ -241,6 +240,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="Write the pre-fit coverage/action/split report as JSON.",
     )
+    parser.add_argument(
+        "--forecast-contract",
+        choices=("observational_action_conditioned", "counterfactual"),
+        default="observational_action_conditioned",
+        help="Semantic contract represented by the training rows.",
+    )
     return parser
 
 
@@ -330,7 +335,7 @@ def main() -> None:
         "artifact_format_version": 2,
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "model_type": args.model_type,
-        "forecast_contract": "observational_action_conditioned",
+        "forecast_contract": args.forecast_contract,
         "target": args.target,
         "dataset_dir": str(args.dataset_dir),
         "dataset_sha256": dataset_sha256(sample_paths),
@@ -353,7 +358,7 @@ def main() -> None:
             feature_columns,
             NUMERIC_FEATURES,
             CATEGORICAL_FEATURES,
-            "observational_action_conditioned",
+            args.forecast_contract,
         ),
         "feature_ranges": numeric_feature_ranges(train_df),
         "known_tls_ids": sorted(

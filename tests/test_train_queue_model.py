@@ -9,6 +9,7 @@ import pandas as pd
 
 from experiments.train_queue_model import (
     CATEGORICAL_FEATURES,
+    NUMERIC_FEATURES,
     add_optional_feature_defaults,
     filter_paths_by_quality_report,
 )
@@ -25,6 +26,7 @@ class TrainQueueModelTests(unittest.TestCase):
         self.assertEqual(upgraded.iloc[0]["current_signal_state"], "G")
         self.assertEqual(upgraded.iloc[0]["action_phase_state"], "Gr")
         self.assertNotIn("mode", CATEGORICAL_FEATURES)
+        self.assertNotIn("time", NUMERIC_FEATURES)
 
     def test_quality_report_filters_rejected_sample_files(self) -> None:
         with TemporaryDirectory() as directory:

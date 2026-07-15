@@ -8,6 +8,10 @@ from typing import TYPE_CHECKING
 
 from .area_model import AreaModel, load_zone_tls_ids
 from .config import RunConfig
+from .counterfactual_dataset import (
+    COUNTERFACTUAL_DATASET_SCHEMA_VERSION,
+    counterfactual_dataset_schema_sha256,
+)
 from .ml_dataset import ML_DATASET_SCHEMA_VERSION, ml_dataset_schema_sha256
 from .provenance import controller_git_commit, scenario_provenance
 
@@ -80,6 +84,13 @@ def validate_runtime_contract(
         set(queue_forecast.known_lane_ids) if queue_forecast is not None else set()
     )
     stats = queue_forecast.stats if queue_forecast is not None else None
+    expected_dataset_schema_version = ML_DATASET_SCHEMA_VERSION
+    expected_dataset_schema_sha256 = ml_dataset_schema_sha256()
+    if stats is not None and set(stats.forecast_contract.split(";")) == {
+        "counterfactual"
+    }:
+        expected_dataset_schema_version = COUNTERFACTUAL_DATASET_SCHEMA_VERSION
+        expected_dataset_schema_sha256 = counterfactual_dataset_schema_sha256()
     errors: list[str] = []
     warnings: list[str] = []
 
@@ -122,12 +133,12 @@ def validate_runtime_contract(
             model_issues.append("model dataset fingerprint is missing")
         if not _hash_set_matches(
             stats.dataset_schema_version,
-            str(ML_DATASET_SCHEMA_VERSION),
+            str(expected_dataset_schema_version),
         ):
             model_issues.append("model dataset schema version mismatch")
         if not _hash_set_matches(
             stats.dataset_schema_sha256,
-            ml_dataset_schema_sha256(),
+            expected_dataset_schema_sha256,
         ):
             model_issues.append("model dataset schema hash mismatch")
     elif not config.control.queue_forecast_shadow_mode and config.mode == "flowmind":
@@ -147,8 +158,8 @@ def validate_runtime_contract(
         configured_tls_count=len(configured_tls),
         network_sha256=scenario.network_sha256,
         zone_sha256=scenario.zone_sha256,
-        dataset_schema_version=ML_DATASET_SCHEMA_VERSION,
-        dataset_schema_sha256=ml_dataset_schema_sha256(),
+        dataset_schema_version=expected_dataset_schema_version,
+        dataset_schema_sha256=expected_dataset_schema_sha256,
         model_loaded=queue_forecast is not None,
         model_network_sha256=stats.network_sha256 if stats is not None else "",
         model_zone_sha256=stats.zone_sha256 if stats is not None else "",

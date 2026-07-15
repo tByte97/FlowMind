@@ -148,6 +148,100 @@ services:
       - --min-actuated-detector-coverage
       - ${FLOWMIND_MIN_ACTUATED_DETECTOR_COVERAGE:-1.0}
 
+  counterfactual-dataset:
+    image: flowmind:local
+    container_name: flowmind-counterfactual-dataset
+    profiles:
+      - counterfactual
+    init: true
+    restart: "no"
+    environment:
+      FLOWMIND_RESULTS_DIR: /app/results
+      FLOWMIND_STRICT_STARTUP: ${FLOWMIND_STRICT_STARTUP:-1}
+      OMP_NUM_THREADS: ${FLOWMIND_CPU_THREADS:-4}
+      OPENBLAS_NUM_THREADS: ${FLOWMIND_CPU_THREADS:-4}
+      MKL_NUM_THREADS: ${FLOWMIND_CPU_THREADS:-4}
+    volumes:
+      - flowmind_results:/app/results
+    read_only: true
+    tmpfs:
+      - /tmp:size=1g,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 512
+    stop_grace_period: 60s
+    logging:
+      driver: json-file
+      options:
+        max-size: 20m
+        max-file: "3"
+    healthcheck:
+      disable: true
+    command:
+      - python
+      - -u
+      - experiments/run_counterfactual_dataset.py
+      - --runs
+      - ${FLOWMIND_COUNTERFACTUAL_RUNS:-12}
+      - --resume
+      - --output-dir
+      - /app/results/counterfactual_dataset
+      - --config
+      - /app/simulation/rivne_area/focused.sumocfg
+      - --zone
+      - /app/simulation/rivne_area/central_zone.json
+
+  counterfactual-trainer:
+    image: flowmind:local
+    container_name: flowmind-counterfactual-trainer
+    profiles:
+      - counterfactual
+    init: true
+    restart: "no"
+    depends_on:
+      model-init:
+        condition: service_completed_successfully
+      counterfactual-dataset:
+        condition: service_completed_successfully
+    environment:
+      FLOWMIND_STRICT_STARTUP: ${FLOWMIND_STRICT_STARTUP:-1}
+      OMP_NUM_THREADS: ${FLOWMIND_CPU_THREADS:-4}
+      OPENBLAS_NUM_THREADS: ${FLOWMIND_CPU_THREADS:-4}
+      MKL_NUM_THREADS: ${FLOWMIND_CPU_THREADS:-4}
+    volumes:
+      - flowmind_results:/app/results
+      - flowmind_models:/app/models
+    read_only: true
+    tmpfs:
+      - /tmp:size=1g,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 512
+    stop_grace_period: 60s
+    logging:
+      driver: json-file
+      options:
+        max-size: 20m
+        max-file: "3"
+    healthcheck:
+      disable: true
+    command:
+      - python
+      - -u
+      - experiments/train_queue_ensemble.py
+      - --dataset-dir
+      - /app/results/counterfactual_dataset
+      - --output-dir
+      - /app/models/counterfactual_candidate
+      - --rows-per-file
+      - ${FLOWMIND_COUNTERFACTUAL_ROWS_PER_FILE:-10000}
+      - --jobs
+      - ${FLOWMIND_CPU_THREADS:-4}
+      - --quality-report
+      - /app/results/counterfactual_dataset/quality_report.json
+      - --forecast-contract
+      - counterfactual
+
   trainer:
     image: flowmind:local
     container_name: flowmind-trainer

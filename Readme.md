@@ -314,6 +314,11 @@ docker compose --profile training \
 
 # 4. Не вмикати ML: спочатку shadow/control evaluation та approval,
 #    точні команди наведені нижче.
+
+# Окремий нічний snapshot-branch pipeline: збір реальних outcomes
+# альтернативних фаз, quality gate і навчання candidate ensemble.
+docker compose --profile counterfactual \
+  -f compose.yaml -f compose.server.yaml up -d counterfactual-trainer
 ```
 
 Jobs можна від'єднати від terminal через `up -d`, а стан дивитися командами
@@ -356,6 +361,15 @@ python experiments/train_queue_ensemble.py \
   --jobs 4 \
   --quality-report results/dataset/quality_report.json
 ```
+
+Звичайний dataset має observational contract і не містить результатів
+альтернативних фаз. Для decision-моделі використовується окремий schema v5
+snapshot-branch dataset: SUMO зберігає стан і RNG, кожна green action
+відтворюється через повний reload (щоб не втратити майбутні `<flow>` vehicles),
+а перемикання проходить через yellow/all-red clearance. Нічний Compose job
+пише dataset у `results/counterfactual_dataset`, а моделі — лише в
+`models/counterfactual_candidate`; production-моделі він автоматично не
+замінює. Після завершення потрібні shadow paired evaluation та approval gate.
 
 Перед tuning/training можна запустити п'ять коротких ablation-профілів:
 

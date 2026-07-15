@@ -39,6 +39,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="Completed dataset quality report used to exclude unsafe runs.",
     )
+    parser.add_argument(
+        "--forecast-contract",
+        choices=("observational_action_conditioned", "counterfactual"),
+        default="observational_action_conditioned",
+    )
     return parser
 
 
@@ -51,6 +56,7 @@ def training_command(
     jobs: int,
     n_estimators: int,
     quality_report: Path | None = None,
+    forecast_contract: str = "observational_action_conditioned",
 ) -> list[str]:
     command = [
         sys.executable,
@@ -68,6 +74,8 @@ def training_command(
         str(jobs),
         "--n-estimators",
         str(n_estimators),
+        "--forecast-contract",
+        forecast_contract,
     ]
     if quality_report is not None:
         command.extend(("--quality-report", str(quality_report)))
@@ -96,6 +104,7 @@ def main() -> None:
                 jobs=args.jobs,
                 n_estimators=args.n_estimators,
                 quality_report=args.quality_report,
+                forecast_contract=args.forecast_contract,
             ),
             cwd=PROJECT_ROOT,
             check=True,
@@ -111,6 +120,7 @@ def main() -> None:
         "n_estimators": args.n_estimators,
         "horizons": completed,
         "quality_report": str(args.quality_report) if args.quality_report else "",
+        "forecast_contract": args.forecast_contract,
     }
     manifest_path = args.output_dir / "ensemble_training.json"
     manifest_path.write_text(

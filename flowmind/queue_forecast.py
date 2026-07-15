@@ -354,8 +354,8 @@ class QueueForecastModel:
                 result[key] = bounded
         return result
 
+    @staticmethod
     def _feature_row(
-        self,
         *,
         mode: str,
         simulation_time: float,
@@ -510,17 +510,18 @@ class QueueForecastModel:
                     if value < minimum or value > maximum:
                         reasons.append(f"feature_out_of_range:{feature}")
                         break
-        if (
-            self._forecast_contract == "observational_action_conditioned"
-            and not self._categorical_domains
-        ):
+        action_conditioned = self._forecast_contract in {
+            "observational_action_conditioned",
+            "counterfactual",
+        }
+        if action_conditioned and not self._categorical_domains:
             reasons.append("categorical_domains_missing")
         elif self._categorical_domains:
             for row in rows:
                 for feature, domain in self._categorical_domains.items():
                     if feature in row and str(row[feature]) not in domain:
                         reasons.append(f"categorical_ood:{feature}")
-        if self._forecast_contract == "observational_action_conditioned":
+        if action_conditioned:
             supported_actions = self._action_support_by_tls.get(intersection.tls_id)
             if not supported_actions:
                 reasons.append("action_support_missing")
