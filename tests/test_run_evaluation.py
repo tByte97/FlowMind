@@ -8,6 +8,7 @@ from tempfile import TemporaryDirectory
 from experiments.run_evaluation import (
     _validate_resume_manifest,
     emergency_route_edges,
+    select_evaluation_modes,
     validate_replicate_count,
 )
 
@@ -32,6 +33,20 @@ class EvaluationRunnerTests(unittest.TestCase):
             ("edge-a", "edge-b"),
         )
         self.assertEqual(emergency_route_edges({}), ())
+
+    def test_selected_baselines_define_modes_with_flowmind_last(self) -> None:
+        baselines, modes = select_evaluation_modes(("static_fixed", "local"))
+
+        self.assertEqual(baselines, ("static_fixed", "local"))
+        self.assertEqual(modes, ("static_fixed", "local", "flowmind"))
+
+    def test_selected_baselines_must_be_known_and_unique(self) -> None:
+        with self.assertRaises(ValueError):
+            select_evaluation_modes(())
+        with self.assertRaises(ValueError):
+            select_evaluation_modes(("local", "local"))
+        with self.assertRaises(ValueError):
+            select_evaluation_modes(("flowmind",))
 
     def test_resume_treats_json_lists_and_config_tuples_as_equal(self) -> None:
         requested = {

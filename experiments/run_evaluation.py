@@ -7,13 +7,14 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Mapping
+from typing import Mapping, Sequence
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from flowmind.config import (
     CONTROL_MODES,
     DEFAULT_QUEUE_MODEL_PATHS,
+    FLOWMIND_MODE,
     PROJECT_ROOT,
     ControlConfig,
     RunConfig,
@@ -31,6 +32,7 @@ from flowmind.dataset_quality import parse_missing_detector_links
 
 
 EVALUATION_RUNNER_SCHEMA_VERSION = 1
+BASELINE_MODES = tuple(mode for mode in CONTROL_MODES if mode != FLOWMIND_MODE)
 
 
 @dataclass(frozen=True)
@@ -47,6 +49,7 @@ class EvaluationPairRequest:
     emergency: EmergencyVehicleConfig | None
     control: ControlConfig
     queue_model_paths: tuple[Path, ...]
+    modes: tuple[str, ...]
     resume: bool
     require_complete_actuated_detectors: bool = True
 
@@ -54,8 +57,8 @@ class EvaluationPairRequest:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Run reproducible paired FlowMind evaluation across all four "
-            "control modes"
+            "Run reproducible paired FlowMind evaluation against selected "
+            "baseline control modes"
         )
     )
     parser.add_argument("--replicates", type=int, default=DEFAULT_MIN_PAIRS)
@@ -141,6 +144,17 @@ def build_parser() -> argparse.ArgumentParser:
             "SUMO actuated run whose startup log reports an uncovered link."
         ),
     )
+    parser.add_argument(
+        "--baselines",
+        nargs="+",
+        choices=BASELINE_MODES,
+        default=BASELINE_MODES,
+        help=(
+            "Baseline modes admitted to this benchmark. FlowMind is always "
+            "included. Exclude sumo_actuated when detector startup coverage "
+            "is incomplete instead of weakening the detector gate."
+        ),
+    )
     return parser
 
 
@@ -158,6 +172,22 @@ def validate_replicate_count(replicates: int, allow_small: bool) -> None:
         )
 
 
+def select_evaluation_modes(
+    baselines: Sequence[str],
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    selected_baselines = tuple(baselines)
+    if not selected_baselines:
+        raise ValueError("At least one baseline mode is required")
+    if len(set(selected_baselines)) != len(selected_baselines):
+        raise ValueError("Baseline modes must be unique")
+    unknown = set(selected_baselines) - set(BASELINE_MODES)
+    if unknown:
+        raise ValueError(
+            "Unknown baseline mode(s): " + ", ".join(sorted(unknown))
+        )
+    return selected_baselines, (*selected_baselines, FLOWMIND_MODE)
+
+
 def main() -> None:
     args = build_parser().parse_args()
     validate_replicate_count(args.replicates, args.allow_small)
@@ -165,6 +195,7 @@ def main() -> None:
         raise ValueError("duration must be positive")
     if not 1 <= args.workers <= 8:
         raise ValueError("workers must be between 1 and 8")
+    baselines, modes = select_evaluation_modes(args.baselines)
 
     evaluation_id = args.evaluation_id or datetime.now(timezone.utc).strftime(
         "eval_%Y%m%dT%H%M%SZ"
@@ -230,6 +261,7 @@ def main() -> None:
                 emergency=emergency,
                 control=control,
                 queue_model_paths=queue_model_paths,
+                modes=modes,
                 resume=args.resume,
                 require_complete_actuated_detectors=(
                     not args.allow_incomplete_actuated_detectors
@@ -272,6 +304,7 @@ def main() -> None:
         minimum = 1 if args.allow_small else DEFAULT_MIN_PAIRS
         report = analyze_paired_summaries(
             summaries,
+            baselines=baselines,
             min_pairs=minimum,
             max_pairs=DEFAULT_MAX_PAIRS,
         )
@@ -322,7 +355,7 @@ def _initial_manifest(
         "evaluation_runner_schema_version": EVALUATION_RUNNER_SCHEMA_VERSION,
         "evaluation_id": evaluation_id,
         "status": "running",
-        "modes": list(CONTROL_MODES),
+        "modes": [*args.baselines, FLOWMIND_MODE],
         "replicates": args.replicates,
         "duration": args.duration,
         "seed_start": args.seed_start,
@@ -444,7 +477,7 @@ def _run_pair(
         f"[{request.replicate}] seed={request.seed} pair={pair_id}",
         flush=True,
     )
-    for mode in CONTROL_MODES:
+    for mode in request.modes:
         mode_dir = pair_dir / mode
         summary_path = mode_dir / f"{mode}_summary.json"
         summary = (
