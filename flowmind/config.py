@@ -54,6 +54,21 @@ class ControlConfig:
     downstream_graph_decay: float = 0.55
     spillback_start_occupancy: float = 0.55
     spillback_hard_gate_probability: float = 0.85
+    spillback_hard_gate_release_probability: float = 0.65
+    graph_hard_mask_enabled: bool = False
+    physical_hard_mask_enabled: bool = True
+    graph_hard_mask_confirmation_samples: int = 3
+    graph_hard_mask_release_samples: int = 2
+    max_graph_masked_movement_share: float = 0.25
+    # Fail back to the empirically safer Local policy when a congested TLS
+    # stops discharging.  This is a safety default, not an ablation option:
+    # zone coordination must prove that it is healthy before it keeps control.
+    throughput_fallback_enabled: bool = True
+    throughput_fallback_window_seconds: int = 30
+    throughput_fallback_queue_threshold: int = 20
+    throughput_fallback_min_discharge_rate: float = 0.02
+    throughput_fallback_confirmation_samples: int = 3
+    throughput_fallback_recovery_samples: int = 3
     area_pressure_weight: float = 0.35
     coordination_horizon_seconds: int = 60
     saturation_flow_vph_per_lane: float = 1800.0
@@ -99,6 +114,13 @@ class ControlConfig:
             "min_downstream_storage_slots": self.min_downstream_storage_slots,
             "priority_min_storage_slots": self.priority_min_storage_slots,
             "downstream_graph_hops": self.downstream_graph_hops,
+            "graph_hard_mask_confirmation_samples": (
+                self.graph_hard_mask_confirmation_samples
+            ),
+            "graph_hard_mask_release_samples": self.graph_hard_mask_release_samples,
+            "throughput_fallback_window_seconds": self.throughput_fallback_window_seconds,
+            "throughput_fallback_confirmation_samples": self.throughput_fallback_confirmation_samples,
+            "throughput_fallback_recovery_samples": self.throughput_fallback_recovery_samples,
             "priority_distance": self.priority_distance,
             "max_priority_override": self.max_priority_override,
             "clearance_seconds": self.clearance_seconds,
@@ -123,6 +145,12 @@ class ControlConfig:
             "spillback_hard_gate_probability": (
                 self.spillback_hard_gate_probability
             ),
+            "spillback_hard_gate_release_probability": (
+                self.spillback_hard_gate_release_probability
+            ),
+            "max_graph_masked_movement_share": (
+                self.max_graph_masked_movement_share
+            ),
             "congested_occupancy_threshold": (
                 self.congested_occupancy_threshold
             ),
@@ -131,6 +159,14 @@ class ControlConfig:
         for name, value in probabilities.items():
             if not 0.0 <= float(value) <= 1.0:
                 raise ValueError(f"{name} must be between 0 and 1")
+        if (
+            self.spillback_hard_gate_release_probability
+            >= self.spillback_hard_gate_probability
+        ):
+            raise ValueError(
+                "spillback_hard_gate_release_probability must be below "
+                "spillback_hard_gate_probability"
+            )
 
         non_negative = {
             "default_green_extension": self.default_green_extension,
@@ -152,6 +188,8 @@ class ControlConfig:
             "demand_timer_seconds": self.demand_timer_seconds,
             "demand_wait_weight": self.demand_wait_weight,
             "max_demand_wait_bonus": self.max_demand_wait_bonus,
+            "throughput_fallback_queue_threshold": self.throughput_fallback_queue_threshold,
+            "throughput_fallback_min_discharge_rate": self.throughput_fallback_min_discharge_rate,
             "hysteresis": self.hysteresis,
             "corridor_prepare_bonus": self.corridor_prepare_bonus,
             "corridor_reroute_lead_seconds": self.corridor_reroute_lead_seconds,
@@ -208,6 +246,7 @@ class RunConfig:
     fixed_emergency_route_edges: tuple[str, ...] = field(default_factory=tuple)
     allow_emergency_reroute: bool = True
     enable_live_telemetry: bool = True
+    require_complete_actuated_detectors: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "mode", normalize_control_mode(self.mode))

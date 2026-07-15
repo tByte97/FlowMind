@@ -59,11 +59,13 @@ from .area_model import (
 from .config import (
     ADAPTIVE_CONTROL_MODES,
     STATIC_FIXED_MODE,
+    SUMO_ACTUATED_MODE,
     RunConfig,
 )
 from .controller import AreaSignalController
 from .corridor_manager import CorridorManager
 from .decision_feed import DecisionEvent, merged_decision_log
+from .dataset_quality import parse_missing_detector_links
 from .emergency_router import EmergencyRouter
 from .emergency_vehicle import EmergencyVehicleManager
 from .live_transport import LiveTelemetryPublisher
@@ -195,6 +197,57 @@ def load_area(config: RunConfig) -> AreaModel:
     return discover_area(net_path, config.zone_size, tls_ids)
 
 
+def audit_actuated_detector_startup(
+    config: RunConfig,
+    area: AreaModel,
+) -> dict[str, object]:
+    log_path = config.results_dir.resolve() / "raw" / f"{config.mode}_sumo.log"
+    try:
+        log_text = log_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        log_text = ""
+    missing = parse_missing_detector_links(log_text)
+    controlled_links = {
+        (intersection.tls_id, link.signal_index)
+        for intersection in area.intersections
+        for link in intersection.links
+    }
+    relevant_missing = missing & controlled_links
+    coverage = (
+        1.0 - len(relevant_missing) / len(controlled_links)
+        if controlled_links
+        else 0.0
+    )
+    payload: dict[str, object] = {
+        "status": "pass" if not relevant_missing else "fail",
+        "coverage_complete": not relevant_missing,
+        "coverage": round(coverage, 7),
+        "controlled_link_count": len(controlled_links),
+        "controlled_links": [
+            {"tls_id": tls_id, "signal_index": signal_index}
+            for tls_id, signal_index in sorted(controlled_links)
+        ],
+        "missing_link_count": len(relevant_missing),
+        "missing_by_tls": {
+            tls_id: sorted(
+                index for item_tls, index in relevant_missing if item_tls == tls_id
+            )
+            for tls_id in sorted(
+                {tls_id for tls_id, _index in relevant_missing}
+            )
+        },
+        "sumo_log": str(log_path),
+    }
+    audit_path = config.results_dir.resolve() / "actuated_detector_startup_audit.json"
+    audit_path.parent.mkdir(parents=True, exist_ok=True)
+    audit_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    payload["audit_path"] = str(audit_path)
+    return payload
+
+
 def run_experiment(config: RunConfig) -> dict[str, object]:
     if config.enable_live_telemetry:
         write_live_run_status(config, "starting")
@@ -235,6 +288,20 @@ def run_experiment(config: RunConfig) -> dict[str, object]:
         configure_projection_data()
         start_sumo(_sumo_command(config))
         connection = traci.getConnection()
+        if config.mode == SUMO_ACTUATED_MODE:
+            detector_audit = audit_actuated_detector_startup(
+                config,
+                evaluation_area,
+            )
+            if (
+                config.require_complete_actuated_detectors
+                and not detector_audit["coverage_complete"]
+            ):
+                raise RuntimeError(
+                    "SUMO Actuated detector startup validation failed: "
+                    f"{detector_audit['missing_link_count']} controlled links "
+                    "have no detector"
+                )
         emergency_details = None
         emergency_manager = None
         corridor_manager = None
@@ -541,6 +608,7 @@ def run_experiment(config: RunConfig) -> dict[str, object]:
                 queue_forecast,
                 config.dataset_sample_interval,
                 area_graph,
+                demand_profile=config.demand_profile,
             )
             if config.mode in ADAPTIVE_CONTROL_MODES
             else None
@@ -844,8 +912,17 @@ def run_experiment(config: RunConfig) -> dict[str, object]:
                     "stale_lane_samples": controller.stats.stale_lane_samples,
                     "invalid_state_skips": controller.stats.invalid_state_skips,
                     "fallback_activations": controller.stats.fallback_activations,
+                    "throughput_fallback_activations": (
+                        controller.stats.throughput_fallback_activations
+                    ),
                     "movement_mask_updates": (
                         controller.stats.movement_mask_updates
+                    ),
+                    "movement_mask_active_decisions": (
+                        controller.stats.movement_mask_active_decisions
+                    ),
+                    "movement_mask_program_updates": (
+                        controller.stats.movement_mask_program_updates
                     ),
                     "movement_mask_failures": (
                         controller.stats.movement_mask_failures
@@ -898,7 +975,10 @@ def run_experiment(config: RunConfig) -> dict[str, object]:
                     "stale_lane_samples": 0,
                     "invalid_state_skips": 0,
                     "fallback_activations": 0,
+                    "throughput_fallback_activations": 0,
                     "movement_mask_updates": 0,
+                    "movement_mask_active_decisions": 0,
+                    "movement_mask_program_updates": 0,
                     "movement_mask_failures": 0,
                     "safety_rejections": 0,
                     "safety_rejection_reasons": {},
@@ -974,6 +1054,7 @@ def run_experiment(config: RunConfig) -> dict[str, object]:
                 active_tls_programs=active_tls_programs,
                 tls_safety_report=tls_safety_report,
                 area_graph=area_graph,
+                demand_profile=config.demand_profile,
                 running=False,
             ),
             decision_log=build_decision_log(
@@ -1196,6 +1277,11 @@ def build_live_system_status(
             ),
             "fallback_activations": (
                 controller_stats.fallback_activations if controller_stats else 0
+            ),
+            "throughput_fallback_activations": (
+                controller_stats.throughput_fallback_activations
+                if controller_stats
+                else 0
             ),
             "corridor_preparation_targets": (
                 controller_stats.corridor_preparation_targets

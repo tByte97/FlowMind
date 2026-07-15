@@ -67,6 +67,7 @@ class PreparedIntersectionDecision:
     priority_link: int | None
     scores: tuple[PhaseScore, ...]
     phase_masks: dict[int, tuple[int, ...]]
+    local_throughput_fallback: bool = False
 
 
 @dataclass
@@ -91,6 +92,9 @@ class ControllerStats:
     stale_lane_samples: int = 0
     invalid_state_skips: int = 0
     fallback_activations: int = 0
+    throughput_fallback_activations: int = 0
+    movement_mask_active_decisions: int = 0
+    movement_mask_program_updates: int = 0
     movement_mask_updates: int = 0
     movement_mask_failures: int = 0
     safety_rejections: int = 0
@@ -128,6 +132,7 @@ class AreaSignalController:
         queue_forecast: QueueForecastModel | QueueForecastEnsemble | None = None,
         queue_forecast_sample_interval: int = 5,
         area_graph: AreaGraph | None = None,
+        demand_profile: str = "normal",
     ) -> None:
         if mode not in {"local", "flowmind"}:
             raise ValueError("Adaptive controller mode must be local or flowmind")
@@ -139,6 +144,7 @@ class AreaSignalController:
         self._queue_forecast = queue_forecast if mode == "flowmind" else None
         self._queue_forecast_sample_interval = queue_forecast_sample_interval
         self._area_graph = area_graph
+        self._demand_profile = demand_profile
         self._corridor_manager = None
         self._reader = TrafficStateReader(
             traci_connection,
@@ -153,6 +159,12 @@ class AreaSignalController:
         self._lane_history: dict[str, list[tuple[float, int, int]]] = {}
         self._next_decision_at = float(config.decision_interval)
         self._fallback_tls_ids: set[str] = set()
+        self._graph_mask_block_streak: dict[tuple[str, int, int], int] = {}
+        self._graph_mask_release_streak: dict[tuple[str, int, int], int] = {}
+        self._active_graph_masks: set[tuple[str, int, int]] = set()
+        self._throughput_fallback_tls_ids: set[str] = set()
+        self._throughput_low_streak: dict[str, int] = {}
+        self._throughput_recovery_streak: dict[str, int] = {}
         self._last_phase_by_tls: dict[str, int] = {}
         self._phase_started_at: dict[str, float] = {}
         self._pending_queue_forecasts: list[PendingQueueForecast] = []
@@ -256,6 +268,12 @@ class AreaSignalController:
 
             priority_link = overrides.get(tls_id)
             preparation_link = preparation_overrides.get(tls_id)
+            local_throughput_fallback = self._update_throughput_fallback(
+                intersection,
+                traffic,
+                history_context,
+                simulation_time,
+            )
             phase_masks = phase_signal_masks(
                 intersection,
                 traffic,
@@ -266,6 +284,21 @@ class AreaSignalController:
                     snapshot.downstream_risk_by_outgoing_lane
                 ),
             )
+            phase_masks = self._stabilize_graph_masks(
+                intersection,
+                traffic,
+                phase_masks,
+                snapshot.downstream_risk_by_outgoing_lane,
+            )
+            if local_throughput_fallback:
+                phase_masks = phase_signal_masks(
+                    intersection,
+                    traffic,
+                    self._config,
+                    priority_link=priority_link,
+                    preparation_link=preparation_link,
+                    downstream_risk_by_outgoing_lane={},
+                )
             queue_forecast: dict[tuple[int, int], float] = {}
             if self._queue_forecast is not None:
                 try:
@@ -278,6 +311,7 @@ class AreaSignalController:
                         phase_elapsed=spent,
                         control=self._config,
                         sample_interval=self._queue_forecast_sample_interval,
+                        demand_profile=self._demand_profile,
                         context_by_lane=history_context,
                         area_context_by_lane=self._area_model_context(snapshot),
                     )
@@ -328,7 +362,7 @@ class AreaSignalController:
             scores = score_phases(
                 intersection,
                 traffic,
-                self._mode,
+                "local" if local_throughput_fallback else self._mode,
                 self._config,
                 priority_link,
                 snapshot.area_pressure_by_incoming_lane,
@@ -350,6 +384,7 @@ class AreaSignalController:
                     priority_link=priority_link,
                     scores=scores,
                     phase_masks=phase_masks,
+                    local_throughput_fallback=local_throughput_fallback,
                 )
             )
 
@@ -362,6 +397,11 @@ class AreaSignalController:
             )
             if synchronized:
                 if any(decision.phase_masks.values()):
+                    self.stats.movement_mask_active_decisions += 1
+                if self._signal_masks.last_synchronize_changed:
+                    self.stats.movement_mask_program_updates += 1
+                    # Backward-compatible field now has its literal meaning:
+                    # an actual program update, not merely an active mask.
                     self.stats.movement_mask_updates += 1
                 masked_prepared.append(decision)
                 continue
@@ -380,6 +420,7 @@ class AreaSignalController:
                     priority_link=decision.priority_link,
                     scores=safe_scores,
                     phase_masks={},
+                    local_throughput_fallback=decision.local_throughput_fallback,
                 )
             )
             self._record_safety_rejection(
@@ -397,6 +438,7 @@ class AreaSignalController:
                 {
                     decision.intersection.tls_id: decision.scores
                     for decision in prepared
+                    if not decision.local_throughput_fallback
                 },
                 self._config,
             )
@@ -411,6 +453,187 @@ class AreaSignalController:
                 target_phase=(choice.phase_index if choice is not None else None),
             )
         self._remember_traffic(traffic, simulation_time)
+
+    def _update_throughput_fallback(
+        self,
+        intersection: Intersection,
+        traffic: TrafficState,
+        history_context: dict[str, dict[str, float]],
+        simulation_time: float,
+    ) -> bool:
+        """Switch one TLS to Local scoring when measured discharge collapses."""
+
+        tls_id = intersection.tls_id
+        if not self._config.throughput_fallback_enabled:
+            self._throughput_fallback_tls_ids.discard(tls_id)
+            return False
+        incoming_lanes = {link.incoming_lane for link in intersection.links}
+        queue = sum(traffic.lane(lane_id).queue for lane_id in incoming_lanes)
+        discharge_rate = sum(
+            max(
+                history_context.get(lane_id, {}).get(
+                    "discharge_rate_30s",
+                    0.0,
+                ),
+                0.0,
+            )
+            for lane_id in incoming_lanes
+        )
+        degraded = (
+            simulation_time >= self._config.throughput_fallback_window_seconds
+            and queue >= self._config.throughput_fallback_queue_threshold
+            and discharge_rate
+            <= self._config.throughput_fallback_min_discharge_rate
+        )
+        if degraded:
+            self._throughput_low_streak[tls_id] = (
+                self._throughput_low_streak.get(tls_id, 0) + 1
+            )
+            self._throughput_recovery_streak[tls_id] = 0
+            if (
+                tls_id not in self._throughput_fallback_tls_ids
+                and self._throughput_low_streak[tls_id]
+                >= self._config.throughput_fallback_confirmation_samples
+            ):
+                self._throughput_fallback_tls_ids.add(tls_id)
+                self.stats.throughput_fallback_activations += 1
+                self._record_decision(
+                    simulation_time,
+                    tls_id,
+                    "Circuit breaker: Local fallback",
+                    (
+                        f"Черга {queue} авто, discharge {discharge_rate:.3f} авто/с; "
+                        "TLS тимчасово виключено із зонального optimizer."
+                    ),
+                    "warning",
+                )
+        else:
+            self._throughput_low_streak[tls_id] = 0
+            if tls_id in self._throughput_fallback_tls_ids:
+                self._throughput_recovery_streak[tls_id] = (
+                    self._throughput_recovery_streak.get(tls_id, 0) + 1
+                )
+                if (
+                    self._throughput_recovery_streak[tls_id]
+                    >= self._config.throughput_fallback_recovery_samples
+                ):
+                    self._throughput_fallback_tls_ids.discard(tls_id)
+                    self._throughput_recovery_streak[tls_id] = 0
+                    self._record_decision(
+                        simulation_time,
+                        tls_id,
+                        "Zone control відновлено",
+                        (
+                            f"Discharge відновився до {discharge_rate:.3f} авто/с "
+                            f"при черзі {queue} авто."
+                        ),
+                        "success",
+                    )
+        return tls_id in self._throughput_fallback_tls_ids
+
+    def _stabilize_graph_masks(
+        self,
+        intersection: Intersection,
+        traffic: TrafficState,
+        requested_masks: dict[int, tuple[int, ...]],
+        downstream_risk: dict[str, float],
+    ) -> dict[int, tuple[int, ...]]:
+        """Keep physical safety immediate and debounce probabilistic graph masks."""
+
+        physical_masks = phase_signal_masks(
+            intersection,
+            traffic,
+            self._config,
+            downstream_risk_by_outgoing_lane={},
+        )
+        if not self._config.graph_hard_mask_enabled:
+            self._clear_graph_mask_state(intersection.tls_id)
+            return physical_masks
+
+        result: dict[int, tuple[int, ...]] = {}
+        for phase_index in intersection.green_phase_indices:
+            phase_state = intersection.phases[phase_index]
+            green_indices = {
+                link.signal_index
+                for link in intersection.links
+                if link.signal_index < len(phase_state)
+                and phase_state[link.signal_index] in "Gg"
+            }
+            physical = set(physical_masks.get(phase_index, ()))
+            graph_requested = set(requested_masks.get(phase_index, ())) - physical
+            risk_by_signal = {
+                signal_index: max(
+                    (
+                        downstream_risk.get(link.outgoing_lane, 0.0)
+                        for link in intersection.links
+                        if link.signal_index == signal_index
+                    ),
+                    default=0.0,
+                )
+                for signal_index in green_indices
+            }
+            active: set[int] = set()
+            for signal_index in green_indices:
+                key = (intersection.tls_id, phase_index, signal_index)
+                if signal_index in graph_requested:
+                    self._graph_mask_block_streak[key] = (
+                        self._graph_mask_block_streak.get(key, 0) + 1
+                    )
+                    self._graph_mask_release_streak[key] = 0
+                    if (
+                        self._graph_mask_block_streak[key]
+                        >= self._config.graph_hard_mask_confirmation_samples
+                    ):
+                        self._active_graph_masks.add(key)
+                elif key in self._active_graph_masks:
+                    if (
+                        risk_by_signal[signal_index]
+                        <= self._config.spillback_hard_gate_release_probability
+                    ):
+                        self._graph_mask_release_streak[key] = (
+                            self._graph_mask_release_streak.get(key, 0) + 1
+                        )
+                        if (
+                            self._graph_mask_release_streak[key]
+                            >= self._config.graph_hard_mask_release_samples
+                        ):
+                            self._active_graph_masks.discard(key)
+                            self._graph_mask_block_streak[key] = 0
+                    else:
+                        self._graph_mask_release_streak[key] = 0
+                else:
+                    self._graph_mask_block_streak[key] = 0
+                if key in self._active_graph_masks:
+                    active.add(signal_index)
+
+            max_graph_masks = int(
+                len(green_indices) * self._config.max_graph_masked_movement_share
+            )
+            if self._config.max_graph_masked_movement_share > 0 and max_graph_masks < 1:
+                max_graph_masks = 1
+            selected_graph = set(
+                sorted(
+                    active,
+                    key=lambda index: (-risk_by_signal[index], index),
+                )[:max_graph_masks]
+            )
+            result[phase_index] = tuple(sorted(physical | selected_graph))
+        return result
+
+    def _clear_graph_mask_state(self, tls_id: str) -> None:
+        self._active_graph_masks = {
+            key for key in self._active_graph_masks if key[0] != tls_id
+        }
+        self._graph_mask_block_streak = {
+            key: value
+            for key, value in self._graph_mask_block_streak.items()
+            if key[0] != tls_id
+        }
+        self._graph_mask_release_streak = {
+            key: value
+            for key, value in self._graph_mask_release_streak.items()
+            if key[0] != tls_id
+        }
 
     def _phase_elapsed(
         self,
@@ -565,8 +788,8 @@ class AreaSignalController:
         used_for_control: bool,
     ) -> None:
         # Shadow accuracy is measurable only for the action SUMO actually
-        # executed. Alternative candidate phases remain counterfactual and are
-        # never compared with the observed outcome of another phase.
+        # executed. Alternative action-conditioned estimates are never compared
+        # with the observed outcome of another phase.
         by_link = {
             link_index: prediction
             for (phase_index, link_index), prediction in predictions.items()

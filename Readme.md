@@ -107,14 +107,15 @@ models/queue_lgbm_90s_decision.joblib
 - LightGBM;
 - 3 горизонти прогнозу: 30, 60, 90 секунд;
 - target: `target_queue_reduction_30s/60s/90s`;
-- контракт моделей: `counterfactual`; фактичний `current_phase`
-  зберігається окремо від `candidate_phase/action_phase`;
+- контракт моделей: `observational_action_conditioned`; dataset зберігає лише
+  фактично виконаний `action_phase`, не вигадуючи outcome альтернативної фази;
 - input features включають queue growth 15/30 с, arrival/discharge rate,
   downstream storage/occupancy, platoon, сусідні TLS та demand profile;
 - кожен артефакт має SHA-256 dataset, dataset fingerprint,
   network, zone, dataset/feature schema та `.joblib`;
 - prediction обмежується фізичною lane capacity;
-- unseen TLS/lane, schema/hash mismatch або feature OOD автоматично вимикають ML-вплив.
+- unseen TLS/lane/action/category, schema/hash mismatch або feature OOD
+  автоматично вимикають ML-вплив.
 
 За замовчуванням ML працює у shadow mode: прогноз не впливає на
 світлофор, а trace порівнює прогноз зменшення черги лише для
@@ -285,6 +286,8 @@ FLOWMIND_EVALUATION_WORKERS=4
 FLOWMIND_EVALUATION_ID=rivne_full_v1
 GEMINI_API_KEY=
 GEMINI_MODEL=gemini-3.1-flash-lite
+FLOWMIND_REQUIRE_MUTATION_AUTH=1
+FLOWMIND_MUTATION_TOKEN=<long-random-secret>
 ```
 
 `/app/results` винесено в persistent volume `flowmind_results`, а активні
@@ -304,7 +307,8 @@ docker compose -f compose.yaml -f compose.server.yaml up -d web
 docker compose --profile dataset \
   -f compose.yaml -f compose.server.yaml up dataset
 
-# 3. Навчити ensemble; під час цього не запускати нові симуляції.
+# 3. Audit автоматично перевіряє рівно 400 runs, після нього trainer
+#    навчається лише на accepted samples.
 docker compose --profile training \
   -f compose.yaml -f compose.server.yaml up trainer
 
@@ -318,6 +322,9 @@ Jobs можна від'єднати від terminal через `up -d`, а ст�
 для dataset/evaluation і не приймає неповні summaries як завершені runs.
 Dataset `--resume` додатково fail-fast порівнює fingerprint плану,
 мережі, зони, schema, controller source, demand і всіх run settings.
+Web-сторінка `/jobs` показує dataset progress/ETA/disk, quality gate,
+trainer/evaluation та model registry. Mutation endpoints (`start`, `stop`,
+Gemini) в server Compose вимагають `FLOWMIND_MUTATION_TOKEN`.
 
 ## Dataset і тренування
 
@@ -327,6 +334,18 @@ Dataset `--resume` додатково fail-fast порівнює fingerprint п�
 python experiments/run_dataset.py --full-real --resume --keep-going --output-dir results/dataset
 ```
 
+Обов'язковий quality audit перед ручним тренуванням:
+
+```bash
+python experiments/audit_dataset.py --dataset-dir results/dataset \
+  --expected-runs 400 --output results/dataset/quality_report.json
+```
+
+Аудит рахує teleports (jam/yield/wrong-lane), emergency braking, collisions,
+actuated detector coverage та формує accepted/rejected manifest. Schema v3
+поточного серверного dataset мігрує в пам'яті до observational contract;
+повторювати 400 runs не потрібно.
+
 Тренування ensemble:
 
 ```bash
@@ -334,8 +353,20 @@ python experiments/train_queue_ensemble.py \
   --dataset-dir results/dataset \
   --output-dir models \
   --rows-per-file 5000 \
-  --jobs 4
+  --jobs 4 \
+  --quality-report results/dataset/quality_report.json
 ```
+
+Перед tuning/training можна запустити п'ять коротких ablation-профілів:
+
+```bash
+python experiments/run_ablation.py --replicates 10 --duration 900 \
+  --workers 2 --resume
+```
+
+Final evaluation суворо відхиляє `sumo_actuated`, якщо SUMO startup log
+містить хоча б один link без detector coverage. Прапорець
+`--allow-incomplete-actuated-detectors` дозволений лише для smoke/archive.
 
 Валідація, tuning та допуск ML:
 

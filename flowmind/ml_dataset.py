@@ -13,7 +13,7 @@ from .traffic_state import TrafficStateReader
 from .zone_graph import AreaGraph
 
 
-ML_DATASET_SCHEMA_VERSION = 3
+ML_DATASET_SCHEMA_VERSION = 4
 HISTORY_WINDOWS_SECONDS = (15, 30)
 
 
@@ -167,14 +167,20 @@ class MLDatasetCollector:
                         "incoming_lane": link.incoming_lane,
                         "outgoing_lane": link.outgoing_lane,
                         "signal_index": link.signal_index,
+                        "current_signal_state": signal,
                         "signal_state": signal,
                         "is_green": int(signal in "Gg"),
                         "current_phase": current_phase,
-                        "candidate_phase": current_phase,
+                        # No alternative outcome is observed in a normal SUMO
+                        # rollout.  Keep the legacy column empty rather than
+                        # pretending that the current phase is a sampled
+                        # counterfactual candidate.
+                        "candidate_phase": "",
                         "action_phase": current_phase,
                         "action_is_observed": 1,
                         "phase_state": phase_state,
-                        "candidate_phase_state": phase_state,
+                        "candidate_phase_state": "",
+                        "action_phase_state": phase_state,
                         "phase_elapsed": round(spent_duration, 3),
                         "phase_count": len(intersection.phases),
                         "incoming_queue": incoming.queue,
@@ -393,7 +399,7 @@ def ml_dataset_schema_sha256() -> str:
     payload = {
         "version": ML_DATASET_SCHEMA_VERSION,
         "history_windows": HISTORY_WINDOWS_SECONDS,
-        "action_contract": "observed_action_candidate_phase",
+        "action_contract": "observational_action_conditioned",
         "targets": (
             "incoming_queue",
             "incoming_occupancy",

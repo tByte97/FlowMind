@@ -57,8 +57,8 @@ NUMERIC_FEATURES = (
     "signal_index",
     "is_green",
     "current_phase",
-    "candidate_phase",
     "action_phase",
+    "action_is_observed",
     "phase_elapsed",
     "phase_count",
     "incoming_queue",
@@ -85,14 +85,14 @@ NUMERIC_FEATURES = (
 )
 
 CATEGORICAL_FEATURES = (
-    "mode",
     "tls_id",
     "movement_id",
     "incoming_lane",
     "outgoing_lane",
     "signal_state",
     "phase_state",
-    "candidate_phase_state",
+    "current_signal_state",
+    "action_phase_state",
     "demand_profile",
 )
 
@@ -122,8 +122,8 @@ OPTIONAL_NUMERIC_DEFAULTS = {
     "max_priority_override": DEFAULT_CONTROL.max_priority_override,
     "clearance_seconds": DEFAULT_CONTROL.clearance_seconds,
     "demand_scale": 1.0,
-    "candidate_phase": -1,
     "action_phase": -1,
+    "action_is_observed": 1,
     "incoming_queue_growth_15s": 0.0,
     "incoming_queue_growth_30s": 0.0,
     "arrival_rate_15s": 0.0,
@@ -228,6 +228,19 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Load and split data, but do not fit or write a model.",
     )
+    parser.add_argument(
+        "--quality-report",
+        type=Path,
+        help=(
+            "Dataset quality_report.json. When supplied, only accepted run "
+            "sample files are trainable and a missing/stale report is fatal."
+        ),
+    )
+    parser.add_argument(
+        "--report-output",
+        type=Path,
+        help="Write the pre-fit coverage/action/split report as JSON.",
+    )
     return parser
 
 
@@ -237,6 +250,11 @@ def main() -> None:
 
     samples_dir = args.samples_dir or args.dataset_dir / "samples"
     sample_paths = discover_sample_paths(samples_dir, args.modes, args.max_files)
+    if args.quality_report is not None:
+        sample_paths = filter_paths_by_quality_report(
+            sample_paths,
+            args.quality_report,
+        )
     if not sample_paths:
         raise SystemExit(f"No sample CSV files found in {samples_dir}")
 
@@ -267,7 +285,17 @@ def main() -> None:
         )
 
     feature_columns = validate_feature_columns(df, args.target)
-    print_dataset_report(args, sample_paths, df, train_df, valid_df, test_df)
+    dataset_report = build_dataset_report(
+        args,
+        sample_paths,
+        df,
+        train_df,
+        valid_df,
+        test_df,
+    )
+    print_dataset_report(dataset_report)
+    report_output = args.report_output or args.dataset_dir / "training_readiness.json"
+    write_json_atomic(report_output, dataset_report)
 
     if args.dry_run:
         return
@@ -302,7 +330,7 @@ def main() -> None:
         "artifact_format_version": 2,
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "model_type": args.model_type,
-        "forecast_contract": "counterfactual",
+        "forecast_contract": "observational_action_conditioned",
         "target": args.target,
         "dataset_dir": str(args.dataset_dir),
         "dataset_sha256": dataset_sha256(sample_paths),
@@ -325,7 +353,7 @@ def main() -> None:
             feature_columns,
             NUMERIC_FEATURES,
             CATEGORICAL_FEATURES,
-            "counterfactual",
+            "observational_action_conditioned",
         ),
         "feature_ranges": numeric_feature_ranges(train_df),
         "known_tls_ids": sorted(
@@ -341,6 +369,9 @@ def main() -> None:
         "training_modes": sorted(
             str(value) for value in train_df["mode"].dropna().unique()
         ),
+        "categorical_domains": categorical_domains(train_df),
+        "action_support_by_tls": action_support_by_tls(train_df),
+        "training_readiness_report": str(report_output),
         "dropped_columns": list(DROP_COLUMNS),
         "train_seeds": train_seeds,
         "validation_seeds": valid_seeds,
@@ -460,6 +491,9 @@ def load_dataset(
     use_columns |= {
         target,
         "seed",
+        "mode",
+        "run_id",
+        "demand_profile",
         "dataset_fingerprint",
         "dataset_schema_version",
         "dataset_schema_sha256",
@@ -496,6 +530,12 @@ def load_dataset(
 
 def add_optional_feature_defaults(df: Any) -> Any:
     df = df.copy()
+    # Schema v3 server runs remain useful as observational rollouts.  Upgrade
+    # names in memory without inventing alternative outcomes.
+    if "current_signal_state" not in df.columns and "signal_state" in df.columns:
+        df["current_signal_state"] = df["signal_state"]
+    if "action_phase_state" not in df.columns and "phase_state" in df.columns:
+        df["action_phase_state"] = df["phase_state"]
     for column, default in OPTIONAL_NUMERIC_DEFAULTS.items():
         if column not in df.columns:
             df[column] = default
@@ -558,6 +598,40 @@ def validate_feature_columns(df: Any, target: str) -> list[str]:
     if missing:
         raise SystemExit("Missing feature columns: " + ", ".join(missing))
     return list(NUMERIC_FEATURES) + list(CATEGORICAL_FEATURES)
+
+
+def filter_paths_by_quality_report(
+    sample_paths: list[Path],
+    report_path: Path,
+) -> list[Path]:
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise SystemExit(f"Dataset quality report is unavailable: {report_path}: {error}")
+    if not isinstance(report, dict) or report.get("status") != "completed":
+        raise SystemExit(f"Dataset quality report is not completed: {report_path}")
+    accepted = report.get("accepted_sample_files")
+    if not isinstance(accepted, list):
+        raise SystemExit("Dataset quality report has no accepted_sample_files")
+    runs = report.get("runs")
+    if not isinstance(runs, list):
+        raise SystemExit("Dataset quality report has no per-run audit records")
+    audited_names = {
+        Path(str(row.get("sample_file", ""))).name
+        for row in runs
+        if isinstance(row, dict) and row.get("sample_file")
+    }
+    unaudited = [path.name for path in sample_paths if path.name not in audited_names]
+    if unaudited:
+        raise SystemExit(
+            "Dataset quality report is stale; unaudited samples: "
+            + ", ".join(unaudited[:10])
+        )
+    accepted_names = {Path(str(value)).name for value in accepted}
+    selected = [path for path in sample_paths if path.name in accepted_names]
+    if not selected:
+        raise SystemExit("Dataset quality report rejected every selected sample file")
+    return selected
 
 
 def build_pipeline(
@@ -695,30 +769,114 @@ def numeric_feature_ranges(df: Any) -> dict[str, list[float]]:
     return ranges
 
 
-def print_dataset_report(
+def build_dataset_report(
     args: argparse.Namespace,
     sample_paths: list[Path],
     df: Any,
     train_df: Any,
     valid_df: Any,
     test_df: Any,
-) -> None:
-    print(f"Samples: {len(sample_paths)} files")
-    print(f"Rows after target cleanup: {len(df):,}")
-    print(f"Target: {args.target}")
-    print(f"Modes: {', '.join(args.modes)}")
+) -> dict[str, Any]:
+    train_seeds = sorted(int(value) for value in train_df["seed"].dropna().unique())
+    validation_seeds = sorted(int(value) for value in valid_df["seed"].dropna().unique())
+    test_seeds = sorted(int(value) for value in test_df["seed"].dropna().unique())
+    overlaps = {
+        "train_validation": sorted(set(train_seeds) & set(validation_seeds)),
+        "train_test": sorted(set(train_seeds) & set(test_seeds)),
+        "validation_test": sorted(set(validation_seeds) & set(test_seeds)),
+    }
+    actions = action_support_by_tls(df)
+    action_counts = (
+        df.groupby(["tls_id", "action_phase"], dropna=False)
+        .size()
+        .sort_values(ascending=False)
+    )
+    return {
+        "status": "ready" if not any(overlaps.values()) else "blocked",
+        "target": args.target,
+        "sample_file_count": len(sample_paths),
+        "row_count": int(len(df)),
+        "modes": value_counts(df, "mode"),
+        "demand_profiles": value_counts(df, "demand_profile"),
+        "tls_coverage": sorted(str(value) for value in df["tls_id"].dropna().unique()),
+        "tls_coverage_count": int(df["tls_id"].nunique()),
+        "lane_coverage": sorted(
+            {
+                str(value)
+                for column in ("incoming_lane", "outgoing_lane")
+                for value in df[column].dropna().unique()
+            }
+        ),
+        "lane_coverage_count": len(
+            {
+                str(value)
+                for column in ("incoming_lane", "outgoing_lane")
+                for value in df[column].dropna().unique()
+            }
+        ),
+        "action_support_by_tls": actions,
+        "action_counts": [
+            {"tls_id": str(index[0]), "action_phase": int(index[1]), "rows": int(count)}
+            for index, count in action_counts.items()
+        ],
+        "split": {
+            "train": {"rows": int(len(train_df)), "seeds": train_seeds},
+            "validation": {"rows": int(len(valid_df)), "seeds": validation_seeds},
+            "test": {"rows": int(len(test_df)), "seeds": test_seeds},
+            "seed_overlap": overlaps,
+        },
+    }
+
+
+def print_dataset_report(report: dict[str, Any]) -> None:
+    print(f"Samples: {report['sample_file_count']} files")
+    print(f"Rows after target cleanup: {report['row_count']:,}")
+    print(f"Target: {report['target']}")
+    print(f"TLS/lane coverage: {report['tls_coverage_count']}/{report['lane_coverage_count']}")
+    print(f"Demand profiles: {json.dumps(report['demand_profiles'], sort_keys=True)}")
+    split = report["split"]
     print(
         "Split rows: "
-        f"train={len(train_df):,}, "
-        f"validation={len(valid_df):,}, "
-        f"test={len(test_df):,}"
+        f"train={split['train']['rows']:,}, "
+        f"validation={split['validation']['rows']:,}, "
+        f"test={split['test']['rows']:,}"
     )
-    print(
-        "Split seeds: "
-        f"train={seed_range(train_df)}, "
-        f"validation={seed_range(valid_df)}, "
-        f"test={seed_range(test_df)}"
+
+
+def value_counts(df: Any, column: str) -> dict[str, int]:
+    if column not in df.columns:
+        return {}
+    return {
+        str(key): int(value)
+        for key, value in df[column].fillna("missing").value_counts().items()
+    }
+
+
+def categorical_domains(df: Any) -> dict[str, list[str]]:
+    return {
+        column: sorted(str(value) for value in df[column].dropna().unique())
+        for column in CATEGORICAL_FEATURES
+        if column in df.columns
+    }
+
+
+def action_support_by_tls(df: Any) -> dict[str, list[int]]:
+    if "tls_id" not in df.columns or "action_phase" not in df.columns:
+        return {}
+    return {
+        str(tls_id): sorted(int(value) for value in group["action_phase"].dropna().unique())
+        for tls_id, group in df.groupby("tls_id")
+    }
+
+
+def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
     )
+    temporary.replace(path)
 
 
 def seed_range(df: Any) -> str:

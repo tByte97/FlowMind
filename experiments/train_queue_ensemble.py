@@ -34,6 +34,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rows-per-file", type=int, default=5000)
     parser.add_argument("--jobs", type=int, default=4)
     parser.add_argument("--n-estimators", type=int, default=700)
+    parser.add_argument(
+        "--quality-report",
+        type=Path,
+        help="Completed dataset quality report used to exclude unsafe runs.",
+    )
     return parser
 
 
@@ -45,8 +50,9 @@ def training_command(
     rows_per_file: int,
     jobs: int,
     n_estimators: int,
+    quality_report: Path | None = None,
 ) -> list[str]:
-    return [
+    command = [
         sys.executable,
         "-u",
         str(PROJECT_ROOT / "experiments" / "train_queue_model.py"),
@@ -63,6 +69,9 @@ def training_command(
         "--n-estimators",
         str(n_estimators),
     ]
+    if quality_report is not None:
+        command.extend(("--quality-report", str(quality_report)))
+    return command
 
 
 def main() -> None:
@@ -86,6 +95,7 @@ def main() -> None:
                 rows_per_file=args.rows_per_file,
                 jobs=args.jobs,
                 n_estimators=args.n_estimators,
+                quality_report=args.quality_report,
             ),
             cwd=PROJECT_ROOT,
             check=True,
@@ -100,6 +110,7 @@ def main() -> None:
         "jobs": args.jobs,
         "n_estimators": args.n_estimators,
         "horizons": completed,
+        "quality_report": str(args.quality_report) if args.quality_report else "",
     }
     manifest_path = args.output_dir / "ensemble_training.json"
     manifest_path.write_text(

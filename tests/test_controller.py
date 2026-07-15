@@ -8,6 +8,7 @@ from flowmind.controller import AreaSignalController
 from flowmind.corridor_manager import CorridorManager, CorridorState
 from flowmind.queue_forecast import ForecastDiagnostics
 from flowmind.safety_validator import SafetyDecision
+from flowmind.traffic_state import LaneState, TrafficState
 
 
 class FakeLaneDomain:
@@ -137,6 +138,62 @@ class AreaSignalControllerTest(unittest.TestCase):
         self.assertEqual(traci.trafficlight.phase, 1)
         self.assertEqual(controller.stats.scoreless_skips, 1)
         self.assertEqual(controller.stats.advances, 1)
+
+    def test_throughput_circuit_breaker_falls_back_and_recovers_per_tls(self) -> None:
+        controller = AreaSignalController(
+            FakeTraci(),
+            self.area(),
+            "flowmind",
+            ControlConfig(
+                throughput_fallback_enabled=True,
+                throughput_fallback_window_seconds=30,
+                throughput_fallback_queue_threshold=10,
+                throughput_fallback_min_discharge_rate=0.02,
+                throughput_fallback_confirmation_samples=2,
+                throughput_fallback_recovery_samples=2,
+            ),
+        )
+        intersection = self.area().intersection("tls")
+        traffic = TrafficState(
+            {
+                "north": LaneState(10, 10, 0.6, 0.0, 6.0),
+                "south": LaneState(0, 0, 0.0, 10.0, 16.0),
+                "east": LaneState(10, 10, 0.6, 0.0, 6.0),
+                "west": LaneState(0, 0, 0.0, 10.0, 16.0),
+            },
+            sample_time=33.0,
+        )
+        stalled = {
+            "north": {"discharge_rate_30s": 0.0},
+            "east": {"discharge_rate_30s": 0.0},
+        }
+
+        self.assertFalse(
+            controller._update_throughput_fallback(  # type: ignore[attr-defined]
+                intersection, traffic, stalled, 30.0
+            )
+        )
+        self.assertTrue(
+            controller._update_throughput_fallback(  # type: ignore[attr-defined]
+                intersection, traffic, stalled, 33.0
+            )
+        )
+        self.assertEqual(controller.stats.throughput_fallback_activations, 1)
+
+        recovered = {
+            "north": {"discharge_rate_30s": 0.2},
+            "east": {"discharge_rate_30s": 0.2},
+        }
+        self.assertTrue(
+            controller._update_throughput_fallback(  # type: ignore[attr-defined]
+                intersection, traffic, recovered, 36.0
+            )
+        )
+        self.assertFalse(
+            controller._update_throughput_fallback(  # type: ignore[attr-defined]
+                intersection, traffic, recovered, 39.0
+            )
+        )
 
     def test_all_intersections_are_prepared_before_first_tls_write(self) -> None:
         class MultiTrafficLightDomain:

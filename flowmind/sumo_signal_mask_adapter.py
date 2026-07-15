@@ -18,6 +18,7 @@ class SumoSignalMaskAdapter:
             str,
             tuple[tuple[int, tuple[int, ...]], ...],
         ] = {}
+        self.last_synchronize_changed = False
 
     @property
     def supported(self) -> bool:
@@ -48,8 +49,10 @@ class SumoSignalMaskAdapter:
             )
         )
         if normalized == self._last_masks_by_tls.get(tls_id, ()):
+            self.last_synchronize_changed = False
             return True
         if not self.supported:
+            self.last_synchronize_changed = False
             return not normalized
         base_logic = self._base_logic_by_tls.get(tls_id)
         if base_logic is None:
@@ -63,6 +66,7 @@ class SumoSignalMaskAdapter:
                 None,
             )
             if base_logic is None:
+                self.last_synchronize_changed = False
                 return False
             self._base_logic_by_tls[tls_id] = deepcopy(base_logic)
 
@@ -75,10 +79,12 @@ class SumoSignalMaskAdapter:
             state = list(str(phase.state))
             for signal_index in signal_indices:
                 if not 0 <= signal_index < len(state):
+                    self.last_synchronize_changed = False
                     return False
                 # Removing right of way is conflict-monotone and therefore
                 # preserves the startup-validated conflict matrix.
                 if state[signal_index] not in "Gg":
+                    self.last_synchronize_changed = False
                     return False
                 state[signal_index] = "r"
             phase.state = "".join(state)
@@ -86,6 +92,7 @@ class SumoSignalMaskAdapter:
         self._trafficlight.setProgramLogic(tls_id, logic)
         self._trafficlight.setPhase(tls_id, int(current_phase))
         self._last_masks_by_tls[tls_id] = normalized
+        self.last_synchronize_changed = True
         return True
 
     def restore(self, tls_id: str, current_phase: int) -> bool:

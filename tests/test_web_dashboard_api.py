@@ -9,6 +9,76 @@ from api import web_dashboard
 
 
 class WebDashboardApiTests(unittest.TestCase):
+    def test_jobs_payload_reports_dataset_quality_and_disk(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            dataset = root / "dataset"
+            dataset.mkdir()
+            (dataset / "dataset_index.csv").write_text(
+                "status,elapsed_seconds\ncompleted,10\ncompleted,20\n",
+                encoding="utf-8",
+            )
+            (dataset / "quality_report.json").write_text(
+                json.dumps(
+                    {
+                        "status": "completed",
+                        "accepted_run_count": 1,
+                        "rejected_run_count": 1,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            payload = web_dashboard.build_jobs_payload(root, root / "models")
+
+        self.assertEqual(payload["dataset"]["completed_runs"], 2)
+        self.assertEqual(payload["dataset"]["quality_status"], "completed")
+        self.assertGreater(payload["disk"]["total_gb"], 0)
+
+    def test_model_registry_exposes_contract_and_coverage(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            models = Path(directory)
+            (models / "queue_lgbm_60s_decision_metadata.json").write_text(
+                json.dumps(
+                    {
+                        "forecast_contract": "observational_action_conditioned",
+                        "artifact_sha256": "abc",
+                        "known_tls_ids": ["a", "b"],
+                        "known_lane_ids": ["x", "y", "z"],
+                        "metrics": {"validation": {"mae": 1.25}},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (models / "queue_control_approval.json").write_text(
+                json.dumps(
+                    {"status": "approved", "model_artifact_sha256": ["abc"]}
+                ),
+                encoding="utf-8",
+            )
+
+            payload = web_dashboard.build_model_registry(models)
+
+        model = payload["models"][0]
+        self.assertEqual(model["known_tls_count"], 2)
+        self.assertEqual(model["known_lane_count"], 3)
+        self.assertTrue(model["approved"])
+
+    def test_mutation_auth_rejects_wrong_token(self) -> None:
+        old_required = web_dashboard.REQUIRE_MUTATION_AUTH
+        old_token = web_dashboard.MUTATION_TOKEN
+        web_dashboard.REQUIRE_MUTATION_AUTH = True
+        web_dashboard.MUTATION_TOKEN = "secret"
+        request = type("Request", (), {"headers": {"x-flowmind-token": "wrong"}})()
+        try:
+            with self.assertRaises(web_dashboard.HTTPException) as context:
+                web_dashboard.authorize_mutation(request)
+        finally:
+            web_dashboard.REQUIRE_MUTATION_AUTH = old_required
+            web_dashboard.MUTATION_TOKEN = old_token
+
+        self.assertEqual(context.exception.status_code, 401)
+
     def test_dashboard_includes_live_only_sumo_zone_simulation(self) -> None:
         page = web_dashboard.DESIGN_PAGE
 

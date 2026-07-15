@@ -27,6 +27,7 @@ from flowmind.evaluation import (
     write_evaluation_report,
 )
 from flowmind.experiment import run_experiment
+from flowmind.dataset_quality import parse_missing_detector_links
 
 
 EVALUATION_RUNNER_SCHEMA_VERSION = 1
@@ -47,6 +48,7 @@ class EvaluationPairRequest:
     control: ControlConfig
     queue_model_paths: tuple[Path, ...]
     resume: bool
+    require_complete_actuated_detectors: bool = True
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -130,6 +132,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--control-config",
         type=Path,
         help="Load a tuned ControlConfig JSON artifact.",
+    )
+    parser.add_argument(
+        "--allow-incomplete-actuated-detectors",
+        action="store_true",
+        help=(
+            "Archive/smoke escape hatch. Final benchmarks reject every "
+            "SUMO actuated run whose startup log reports an uncovered link."
+        ),
     )
     return parser
 
@@ -221,6 +231,9 @@ def main() -> None:
                 control=control,
                 queue_model_paths=queue_model_paths,
                 resume=args.resume,
+                require_complete_actuated_detectors=(
+                    not args.allow_incomplete_actuated_detectors
+                ),
             )
             for replicate in range(1, args.replicates + 1)
         ]
@@ -327,6 +340,9 @@ def _initial_manifest(
         "queue_forecast_shadow_mode": not args.enable_queue_control,
         "queue_model_paths": [str(path.resolve()) for path in queue_model_paths],
         "control_config": asdict(control),
+        "require_complete_actuated_detectors": (
+            not args.allow_incomplete_actuated_detectors
+        ),
         "live_telemetry": False,
         "workers": args.workers,
         "evaluation_dir": str(evaluation_dir),
@@ -362,6 +378,7 @@ def _validate_resume_manifest(
         "queue_forecast_shadow_mode",
         "queue_model_paths",
         "control_config",
+        "require_complete_actuated_detectors",
     )
     mismatched = [
         field
@@ -459,12 +476,28 @@ def _run_pair(
                     fixed_emergency_route_edges=fixed_route,
                     allow_emergency_reroute=False,
                     enable_live_telemetry=False,
+                    require_complete_actuated_detectors=(
+                        request.require_complete_actuated_detectors
+                    ),
                 )
             )
         else:
             print(f"  [{request.replicate}] resumed {mode}", flush=True)
 
         route = emergency_route_edges(summary)
+        if mode == "sumo_actuated":
+            detector_audit = audit_actuated_detector_log(mode_dir)
+            summary.update(detector_audit)
+            _write_json_atomic(summary_path, summary)
+            if (
+                request.require_complete_actuated_detectors
+                and not detector_audit["actuated_detector_coverage_complete"]
+            ):
+                raise RuntimeError(
+                    f"{pair_id}/{mode} has incomplete actuated detector "
+                    f"coverage ({detector_audit['missing_actuated_detector_links']} "
+                    "uncovered links); final benchmark refused"
+                )
         if request.emergency is not None:
             if not route:
                 raise RuntimeError(
@@ -477,6 +510,66 @@ def _run_pair(
             fixed_route = route
         summaries.append(summary)
     return request.replicate, summaries
+
+
+def audit_actuated_detector_log(mode_dir: Path) -> dict[str, object]:
+    log_path = mode_dir / "raw" / "sumo_actuated_sumo.log"
+    startup_audit = _read_json_file(
+        mode_dir / "actuated_detector_startup_audit.json"
+    )
+    try:
+        log_text = log_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return {
+            "actuated_detector_coverage_complete": False,
+            "missing_actuated_detector_links": None,
+            "actuated_detector_audit_log": str(log_path),
+        }
+    missing = parse_missing_detector_links(log_text)
+    raw_controlled_links = startup_audit.get("controlled_links", [])
+    controlled_links = {
+        (str(item["tls_id"]), int(item["signal_index"]))
+        for item in raw_controlled_links
+        if isinstance(item, dict)
+        and "tls_id" in item
+        and "signal_index" in item
+    }
+    relevant_missing = missing & controlled_links if controlled_links else missing
+    relevant_missing_count = len(relevant_missing)
+    coverage_complete = not relevant_missing
+    controlled_link_count = len(controlled_links)
+    coverage = (
+        1.0 - relevant_missing_count / controlled_link_count
+        if controlled_link_count
+        else None
+    )
+    return {
+        "actuated_detector_coverage_complete": bool(coverage_complete),
+        "missing_actuated_detector_links": relevant_missing_count,
+        "actuated_detector_coverage": (
+            round(coverage, 7) if coverage is not None else None
+        ),
+        "actuated_detector_controlled_links": controlled_link_count or None,
+        "actuated_detector_missing_by_tls": {
+                tls_id: sorted(
+                    index
+                    for item_tls, index in relevant_missing
+                    if item_tls == tls_id
+                )
+                for tls_id in sorted(
+                    {tls_id for tls_id, _index in relevant_missing}
+                )
+        },
+        "actuated_detector_audit_log": str(log_path),
+    }
+
+
+def _read_json_file(path: Path) -> dict[str, object]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
 
 
 def _checkpoint(

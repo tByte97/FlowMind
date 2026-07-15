@@ -7,7 +7,12 @@ from flowmind.config import ControlConfig
 
 class ControlConfigValidationTest(unittest.TestCase):
     def test_default_config_is_valid(self) -> None:
-        self.assertEqual(ControlConfig().decision_interval, 3)
+        config = ControlConfig()
+
+        self.assertEqual(config.decision_interval, 3)
+        self.assertFalse(config.graph_hard_mask_enabled)
+        self.assertTrue(config.physical_hard_mask_enabled)
+        self.assertTrue(config.throughput_fallback_enabled)
 
     def test_rejects_impossible_green_window(self) -> None:
         with self.assertRaisesRegex(ValueError, "min_green"):

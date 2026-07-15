@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import csv
+import hmac
 import hashlib
 import json
 import os
 import signal
+import shutil
 import socket
 import subprocess
 import sys
@@ -16,12 +18,13 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from fastapi import FastAPI, Request
+    from fastapi import FastAPI, HTTPException, Request
     from fastapi.responses import FileResponse, HTMLResponse
 except ImportError:
     FastAPI = None  # type: ignore[assignment]
     FileResponse = None  # type: ignore[assignment]
     Request = None  # type: ignore[assignment]
+    HTTPException = None  # type: ignore[assignment]
     HTMLResponse = None  # type: ignore[assignment]
 
 
@@ -40,6 +43,10 @@ MAX_DECISION_ROWS = 80
 MAX_TABLE_ROWS = 120
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.1-flash-lite")
 GEMINI_SUMMARY_FILE = "gemini_summary.json"
+MUTATION_TOKEN = os.environ.get("FLOWMIND_MUTATION_TOKEN", "")
+REQUIRE_MUTATION_AUTH = os.environ.get(
+    "FLOWMIND_REQUIRE_MUTATION_AUTH", "0"
+).strip().lower() not in {"", "0", "false", "no", "off"}
 MODE_ORDER = {
     "static_fixed": 0,
     "sumo_actuated": 1,
@@ -94,6 +101,111 @@ def _display_path(path: Path) -> str:
 
 def _result_id(path: Path) -> str:
     return hashlib.sha1(str(path.resolve()).encode("utf-8")).hexdigest()[:16]
+
+
+def authorize_mutation(request: Any) -> None:
+    if not REQUIRE_MUTATION_AUTH:
+        return
+    if not MUTATION_TOKEN:
+        raise HTTPException(
+            status_code=503,
+            detail="Mutation auth is required but FLOWMIND_MUTATION_TOKEN is unset",
+        )
+    supplied = str(request.headers.get("x-flowmind-token", ""))
+    authorization = str(request.headers.get("authorization", ""))
+    if not supplied and authorization.lower().startswith("bearer "):
+        supplied = authorization[7:].strip()
+    if not supplied or not hmac.compare_digest(supplied, MUTATION_TOKEN):
+        raise HTTPException(status_code=401, detail="Invalid FlowMind mutation token")
+
+
+def build_jobs_payload(
+    results_dir: Path = RESULTS_DIR,
+    models_dir: Path = PROJECT_ROOT / "models",
+) -> dict[str, Any]:
+    dataset_dir = results_dir / "dataset"
+    index_path = dataset_dir / "dataset_index.csv"
+    rows = _read_summary_rows(index_path) if index_path.is_file() else []
+    completed = sum(1 for row in rows if row.get("status") == "completed")
+    expected = int(os.environ.get("FLOWMIND_DATASET_EXPECTED_RUNS", "400"))
+    elapsed = [
+        value
+        for row in rows
+        if (value := _as_float(row.get("elapsed_seconds"))) is not None and value > 0
+    ]
+    eta_seconds = (
+        round(sum(elapsed) / len(elapsed) * max(expected - completed, 0), 1)
+        if elapsed and completed < expected
+        else 0.0 if completed >= expected else None
+    )
+    try:
+        disk = shutil.disk_usage(results_dir)
+        disk_payload = {
+            "total_gb": round(disk.total / 1024**3, 2),
+            "used_gb": round(disk.used / 1024**3, 2),
+            "free_gb": round(disk.free / 1024**3, 2),
+        }
+    except OSError:
+        disk_payload = {"total_gb": None, "used_gb": None, "free_gb": None}
+    training = newest_json(
+        tuple(models_dir.glob("**/ensemble_training.json"))
+        + tuple(results_dir.glob("**/ensemble_training.json"))
+    )
+    evaluation = newest_json(tuple(results_dir.glob("evaluation/*/evaluation_manifest.json")))
+    quality = _read_json(dataset_dir / "quality_report.json")
+    return {
+        "dataset": {
+            "status": "completed" if completed >= expected else "running" if completed else "waiting",
+            "completed_runs": completed,
+            "expected_runs": expected,
+            "eta_seconds": eta_seconds,
+            "quality_status": quality.get("status", "waiting"),
+            "accepted_runs": quality.get("accepted_run_count"),
+            "rejected_runs": quality.get("rejected_run_count"),
+        },
+        "disk": disk_payload,
+        "trainer": training,
+        "evaluation": evaluation,
+    }
+
+
+def newest_json(paths: tuple[Path, ...]) -> dict[str, Any]:
+    existing = [path for path in paths if path.is_file()]
+    if not existing:
+        return {"status": "waiting"}
+    path = max(existing, key=_safe_stat_mtime)
+    return {**_read_json(path), "manifest_path": _display_path(path)}
+
+
+def build_model_registry(
+    models_dir: Path = PROJECT_ROOT / "models",
+) -> dict[str, Any]:
+    approval = _read_json(models_dir / "queue_control_approval.json")
+    models = []
+    for path in sorted(models_dir.glob("*_metadata.json")):
+        metadata = _read_json(path)
+        models.append(
+            {
+                "name": path.name.removesuffix("_metadata.json"),
+                "metadata_path": _display_path(path),
+                "artifact_sha256": metadata.get("artifact_sha256"),
+                "dataset_fingerprint": metadata.get("dataset_fingerprint"),
+                "known_tls_count": len(metadata.get("known_tls_ids", [])),
+                "known_lane_count": len(metadata.get("known_lane_ids", [])),
+                "validation_mae": (
+                    metadata.get("metrics", {}).get("validation", {}).get("mae")
+                    if isinstance(metadata.get("metrics"), dict)
+                    else None
+                ),
+                "forecast_contract": metadata.get("forecast_contract"),
+                "approved": (
+                    approval.get("status") == "approved"
+                    and metadata.get("artifact_sha256")
+                    in approval.get("model_artifact_sha256", [])
+                ),
+            }
+        )
+    return {"models": models, "approval": approval or {"status": "waiting"}}
 
 
 def _as_float(value: Any) -> float | None:
@@ -1282,6 +1394,7 @@ HTML_PAGE = r"""<!doctype html>
           <a href="/">Live</a>
           <a href="/archive">Архів</a>
           <a href="/averages">Середні</a>
+          <a href="/jobs">Jobs</a>
         </nav>
       </div>
       <div class="status-line">
@@ -1434,7 +1547,15 @@ HTML_PAGE = r"""<!doctype html>
     }
 
     async function api(path, options = {}) {
+      const method = String(options.method || "GET").toUpperCase();
+      if (method !== "GET" && method !== "HEAD") {
+        let token = sessionStorage.getItem("flowmindMutationToken") || "";
+        if (!token) token = window.prompt("FlowMind admin token") || "";
+        if (token) sessionStorage.setItem("flowmindMutationToken", token);
+        options.headers = { ...(options.headers || {}), "X-FlowMind-Token": token };
+      }
       const response = await fetch(path, options);
+      if (response.status === 401) sessionStorage.removeItem("flowmindMutationToken");
       if (!response.ok) {
         const text = await response.text();
         throw new Error(text || response.statusText);
@@ -2708,6 +2829,7 @@ DESIGN_PAGE = r"""<!doctype html>
             <a href="/" class="active">Live</a>
             <a href="/archive">Архів</a>
             <a href="/averages">Середні</a>
+            <a href="/jobs">Jobs</a>
           </nav>
         </div>
         <div class="status-line">
@@ -2982,7 +3104,15 @@ DESIGN_PAGE = r"""<!doctype html>
     }
 
     async function api(path, options = {}) {
+      const method = String(options.method || "GET").toUpperCase();
+      if (method !== "GET" && method !== "HEAD") {
+        let token = sessionStorage.getItem("flowmindMutationToken") || "";
+        if (!token) token = window.prompt("FlowMind admin token") || "";
+        if (token) sessionStorage.setItem("flowmindMutationToken", token);
+        options.headers = { ...(options.headers || {}), "X-FlowMind-Token": token };
+      }
       const response = await fetch(path, options);
+      if (response.status === 401) sessionStorage.removeItem("flowmindMutationToken");
       if (!response.ok) {
         const text = await response.text();
         throw new Error(text || response.statusText);
@@ -3856,6 +3986,7 @@ ARCHIVE_PAGE = r"""<!doctype html>
           <a href="/">Live</a>
           <a href="/archive">Архів</a>
           <a href="/averages">Середні</a>
+          <a href="/jobs">Jobs</a>
         </nav>
       </div>
       <div class="status-line">
@@ -4365,6 +4496,7 @@ AVERAGES_PAGE = r"""<!doctype html>
           <a href="/">Live</a>
           <a href="/archive">Архів</a>
           <a href="/averages">Середні</a>
+          <a href="/jobs">Jobs</a>
         </nav>
       </div>
       <div class="status-line">
@@ -4588,6 +4720,21 @@ AVERAGES_PAGE = r"""<!doctype html>
 """
 
 
+JOBS_PAGE = """<!doctype html>
+<html lang="uk"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
+<title>FlowMind Jobs</title><style>
+body{font-family:system-ui;background:#07121d;color:#e8f2f8;margin:0;padding:28px}a{color:#57e3d2}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:16px}.card{background:#102230;border:1px solid #244557;border-radius:14px;padding:18px}
+.value{font-size:30px;font-weight:750;margin:8px 0}.muted{color:#9ab2c1}table{width:100%;border-collapse:collapse}td,th{text-align:left;padding:9px;border-bottom:1px solid #244557}
+</style></head><body><p><a href="/">← Dashboard</a></p><h1>Jobs & Model Registry</h1>
+<div class="grid" id="jobs"></div><h2>Models</h2><div class="card"><table><thead><tr><th>Model</th><th>Contract</th><th>Coverage</th><th>MAE</th><th>Approval</th></tr></thead><tbody id="models"></tbody></table></div>
+<script>
+const fmt=(v,s='')=>v==null?'—':`${v}${s}`;async function refresh(){const [j,r]=await Promise.all([fetch('/api/jobs').then(x=>x.json()),fetch('/api/model-registry').then(x=>x.json())]);
+const d=j.dataset||{},disk=j.disk||{};document.getElementById('jobs').innerHTML=[['Dataset',`${fmt(d.completed_runs)}/${fmt(d.expected_runs)}`,`${d.status} · ETA ${fmt(d.eta_seconds,' s')}`],['Quality',fmt(d.quality_status),`accepted ${fmt(d.accepted_runs)} · rejected ${fmt(d.rejected_runs)}`],['Disk',fmt(disk.free_gb,' GB free'),`${fmt(disk.used_gb)} / ${fmt(disk.total_gb)} GB`],['Trainer',fmt(j.trainer?.status),j.trainer?.manifest_path||'waiting'],['Evaluation',fmt(j.evaluation?.status),j.evaluation?.overall_status||j.evaluation?.manifest_path||'waiting']].map(x=>`<div class="card"><div class="muted">${x[0]}</div><div class="value">${x[1]}</div><div class="muted">${x[2]}</div></div>`).join('');
+document.getElementById('models').innerHTML=(r.models||[]).map(m=>`<tr><td>${m.name}</td><td>${m.forecast_contract||'—'}</td><td>${m.known_tls_count}/${m.known_lane_count}</td><td>${fmt(m.validation_mae)}</td><td>${m.approved?'approved':'not approved'}</td></tr>`).join('')||'<tr><td colspan="5">No models</td></tr>';}refresh();setInterval(refresh,5000);
+</script></body></html>"""
+
+
 class MissingFastAPIApp:
     async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
         body = (
@@ -4625,6 +4772,10 @@ else:
     @app.get("/averages", response_class=HTMLResponse)
     def averages_page() -> Any:
         return AVERAGES_PAGE
+
+    @app.get("/jobs", response_class=HTMLResponse)
+    def jobs_page() -> Any:
+        return JOBS_PAGE
 
     @app.get("/assets/icon_car.png")
     def car_icon() -> Any:
@@ -4673,8 +4824,17 @@ else:
     def averages() -> dict[str, Any]:
         return build_averages_payload(RESULTS_DIR)
 
+    @app.get("/api/jobs")
+    def jobs() -> dict[str, Any]:
+        return build_jobs_payload()
+
+    @app.get("/api/model-registry")
+    def model_registry() -> dict[str, Any]:
+        return build_model_registry()
+
     @app.post("/api/gemini-summary")
     async def gemini_summary(request: Request) -> dict[str, Any]:
+        authorize_mutation(request)
         try:
             payload = await request.json()
         except Exception:
@@ -4689,6 +4849,7 @@ else:
 
     @app.post("/api/start-demo")
     async def start_demo(request: Request) -> dict[str, Any]:
+        authorize_mutation(request)
         try:
             payload = await request.json()
         except Exception:
@@ -4698,5 +4859,6 @@ else:
         return manager.start(payload)
 
     @app.post("/api/stop")
-    def stop_demo() -> dict[str, Any]:
+    def stop_demo(request: Request) -> dict[str, Any]:
+        authorize_mutation(request)
         return manager.stop()

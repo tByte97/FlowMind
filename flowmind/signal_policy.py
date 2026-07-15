@@ -398,7 +398,8 @@ def phase_signal_masks(
             if not (has_demand or is_priority or is_preparation):
                 continue
             graph_blocked = (
-                downstream_risk.get(link.outgoing_lane, 0.0)
+                config.graph_hard_mask_enabled
+                and downstream_risk.get(link.outgoing_lane, 0.0)
                 >= config.spillback_hard_gate_probability
             )
             required_slots = (
@@ -406,11 +407,15 @@ def phase_signal_masks(
                 if is_priority
                 else config.min_downstream_storage_slots
             )
-            if graph_blocked or movement_has_blocked_downstream(
-                outgoing,
-                config,
-                required_storage_slots=required_slots,
-            ):
+            physically_blocked = (
+                config.physical_hard_mask_enabled
+                and movement_has_blocked_downstream(
+                    outgoing,
+                    config,
+                    required_storage_slots=required_slots,
+                )
+            )
+            if graph_blocked or physically_blocked:
                 blocked.add(signal_index)
         result[phase_index] = tuple(sorted(blocked))
     return result

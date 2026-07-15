@@ -9,6 +9,7 @@ from flowmind.signal_policy import (
     choose_phase,
     effective_max_green,
     effective_min_green,
+    phase_signal_masks,
     score_phases,
 )
 from flowmind.traffic_state import LaneState, TrafficState
@@ -56,6 +57,44 @@ class SignalPolicyTest(unittest.TestCase):
         )
         self.assertIsNotNone(best)
         self.assertEqual(best.phase_index, 2)
+
+    def test_probabilistic_graph_risk_is_penalty_only_by_default(self) -> None:
+        state = TrafficState(
+            {
+                "north": LaneState(5, 5, 0.4, 0.0, 5.0),
+                "south": LaneState(0, 0, 0.2, 8.0, 10.0),
+                "east": LaneState(0, 0, 0.0, 0.0, 10.0),
+                "west": LaneState(0, 0, 0.0, 8.0, 10.0),
+            }
+        )
+
+        masks = phase_signal_masks(
+            self.intersection,
+            state,
+            self.config,
+            downstream_risk_by_outgoing_lane={"south": 0.99},
+        )
+
+        self.assertEqual(masks[0], ())
+
+    def test_graph_hard_mask_requires_explicit_opt_in(self) -> None:
+        state = TrafficState(
+            {
+                "north": LaneState(5, 5, 0.4, 0.0, 5.0),
+                "south": LaneState(0, 0, 0.2, 8.0, 10.0),
+                "east": LaneState(0, 0, 0.0, 0.0, 10.0),
+                "west": LaneState(0, 0, 0.0, 8.0, 10.0),
+            }
+        )
+
+        masks = phase_signal_masks(
+            self.intersection,
+            state,
+            ControlConfig(graph_hard_mask_enabled=True),
+            downstream_risk_by_outgoing_lane={"south": 0.99},
+        )
+
+        self.assertEqual(masks[0], (0,))
 
     def test_blocked_downstream_phase_is_removed_from_candidates(self) -> None:
         state = TrafficState(

@@ -81,7 +81,11 @@ class QueueForecastModel:
         self._forecast_contract = str(
             metadata.get("forecast_contract", "current_policy")
         )
-        if self._forecast_contract not in {"current_policy", "counterfactual"}:
+        if self._forecast_contract not in {
+            "current_policy",
+            "counterfactual",
+            "observational_action_conditioned",
+        }:
             raise ValueError(
                 f"Unsupported queue forecast contract: {self._forecast_contract}"
             )
@@ -93,6 +97,26 @@ class QueueForecastModel:
         )
         ranges = metadata.get("feature_ranges", {})
         self._feature_ranges = ranges if isinstance(ranges, dict) else {}
+        domains = metadata.get("categorical_domains", {})
+        self._categorical_domains = (
+            {
+                str(feature): frozenset(str(value) for value in values)
+                for feature, values in domains.items()
+                if isinstance(values, (list, tuple))
+            }
+            if isinstance(domains, dict)
+            else {}
+        )
+        support = metadata.get("action_support_by_tls", {})
+        self._action_support_by_tls = (
+            {
+                str(tls_id): frozenset(int(value) for value in values)
+                for tls_id, values in support.items()
+                if isinstance(values, (list, tuple))
+            }
+            if isinstance(support, dict)
+            else {}
+        )
         self._artifact_sha256 = _file_sha256(model_path)
         self._declared_artifact_sha256 = str(metadata.get("artifact_sha256", ""))
         self._dataset_sha256 = str(metadata.get("dataset_sha256", ""))
@@ -218,6 +242,7 @@ class QueueForecastModel:
         phase_elapsed: float,
         control: ControlConfig,
         sample_interval: int,
+        demand_profile: str = "normal",
         context_by_lane: dict[str, dict[str, float]] | None = None,
         area_context_by_lane: dict[str, dict[str, float]] | None = None,
     ) -> dict[tuple[int, int], float]:
@@ -262,6 +287,7 @@ class QueueForecastModel:
                         state=state,
                         control=control,
                         sample_interval=sample_interval,
+                        demand_profile=demand_profile,
                         context_by_lane=context_by_lane,
                         area_context_by_lane=area_context_by_lane,
                     )
@@ -276,8 +302,8 @@ class QueueForecastModel:
                     if candidate_state[link.signal_index] not in "Gg":
                         continue
                     signal_state = (
-                        current_state[link.signal_index]
-                        if link.signal_index < len(current_state)
+                        candidate_state[link.signal_index]
+                        if link.signal_index < len(candidate_state)
                         else ""
                     )
                     rows.append(
@@ -294,6 +320,7 @@ class QueueForecastModel:
                             state=state,
                             control=control,
                             sample_interval=sample_interval,
+                            demand_profile=demand_profile,
                             context_by_lane=context_by_lane,
                             area_context_by_lane=area_context_by_lane,
                         )
@@ -342,6 +369,7 @@ class QueueForecastModel:
         state: TrafficState,
         control: ControlConfig,
         sample_interval: int,
+        demand_profile: str,
         context_by_lane: dict[str, dict[str, float]] | None,
         area_context_by_lane: dict[str, dict[str, float]] | None,
     ) -> dict[str, Any]:
@@ -353,7 +381,7 @@ class QueueForecastModel:
         outgoing_area = (area_context_by_lane or {}).get(link.outgoing_lane, {})
         return {
             "mode": mode,
-            "demand_profile": "runtime",
+            "demand_profile": demand_profile,
             "demand_scale": 1.0,
             "sample_interval": sample_interval,
             "decision_interval": control.decision_interval,
@@ -387,6 +415,11 @@ class QueueForecastModel:
             "incoming_lane_hash": stable_hash(link.incoming_lane),
             "outgoing_lane_hash": stable_hash(link.outgoing_lane),
             "signal_index": link.signal_index,
+            "current_signal_state": (
+                phase_state[link.signal_index]
+                if link.signal_index < len(phase_state)
+                else ""
+            ),
             "signal_state": signal_state,
             "is_green": int(signal_state in "Gg"),
             "current_phase": current_phase,
@@ -399,6 +432,9 @@ class QueueForecastModel:
             "action_is_observed": int(candidate_phase is None),
             "phase_state": phase_state,
             "candidate_phase_state": intersection.phases[
+                candidate_phase if candidate_phase is not None else current_phase
+            ],
+            "action_phase_state": intersection.phases[
                 candidate_phase if candidate_phase is not None else current_phase
             ],
             "phase_elapsed": round(phase_elapsed, 3),
@@ -474,6 +510,29 @@ class QueueForecastModel:
                     if value < minimum or value > maximum:
                         reasons.append(f"feature_out_of_range:{feature}")
                         break
+        if (
+            self._forecast_contract == "observational_action_conditioned"
+            and not self._categorical_domains
+        ):
+            reasons.append("categorical_domains_missing")
+        elif self._categorical_domains:
+            for row in rows:
+                for feature, domain in self._categorical_domains.items():
+                    if feature in row and str(row[feature]) not in domain:
+                        reasons.append(f"categorical_ood:{feature}")
+        if self._forecast_contract == "observational_action_conditioned":
+            supported_actions = self._action_support_by_tls.get(intersection.tls_id)
+            if not supported_actions:
+                reasons.append("action_support_missing")
+            else:
+                for row in rows:
+                    try:
+                        action = int(row["action_phase"])
+                    except (KeyError, TypeError, ValueError):
+                        reasons.append("action_phase_invalid")
+                        continue
+                    if action not in supported_actions:
+                        reasons.append("unsupported_action")
         if self._legacy_hash_schema:
             reasons.append("legacy_numeric_hash_schema")
         if not self._dataset_sha256:
@@ -630,6 +689,7 @@ class QueueForecastEnsemble:
         phase_elapsed: float,
         control: ControlConfig,
         sample_interval: int,
+        demand_profile: str = "normal",
         context_by_lane: dict[str, dict[str, float]] | None = None,
         area_context_by_lane: dict[str, dict[str, float]] | None = None,
     ) -> dict[tuple[int, int], float]:
@@ -647,6 +707,7 @@ class QueueForecastEnsemble:
                 phase_elapsed=phase_elapsed,
                 control=control,
                 sample_interval=sample_interval,
+                demand_profile=demand_profile,
                 context_by_lane=context_by_lane,
                 area_context_by_lane=area_context_by_lane,
             )
