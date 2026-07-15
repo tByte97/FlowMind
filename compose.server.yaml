@@ -1,5 +1,7 @@
 services:
   web:
+    environment:
+      FLOWMIND_CONTROL_CONFIG: /app/results/control/selected_control.json
     networks:
       - default
       - myhaven_proxy
