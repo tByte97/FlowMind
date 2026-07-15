@@ -380,10 +380,14 @@ def _validate_resume_manifest(
         "control_config",
         "require_complete_actuated_detectors",
     )
+    # Values written to JSON lose Python-only container types (notably the
+    # tuple used by queue_forecast_horizon_weights).  Compare the canonical
+    # JSON representation so an identical config can actually be resumed.
+    canonical_requested = json.loads(json.dumps(requested))
     mismatched = [
         field
         for field in invariant_fields
-        if existing.get(field) != requested.get(field)
+        if existing.get(field) != canonical_requested.get(field)
     ]
     if mismatched:
         raise ValueError(
