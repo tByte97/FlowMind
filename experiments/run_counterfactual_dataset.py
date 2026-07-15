@@ -209,7 +209,8 @@ def main() -> None:
             "Counterfactual dataset is not trainable: "
             + "; ".join(str(value) for value in report["blocking_reasons"])
         )
-    print(f"Counterfactual dataset ready: {output_dir}", flush=True)
+    label = "ready" if report["status"] == "completed" else "partial"
+    print(f"Counterfactual dataset {label}: {output_dir}", flush=True)
 
 
 def validate_args(args: argparse.Namespace) -> None:
@@ -325,6 +326,7 @@ def collect_run(
     connection: Any = None
     rows: list[dict[str, Any]] = []
     branch_records: list[dict[str, Any]] = []
+    state_paths: list[Path] = []
     history = HistoryContext()
     base_args = sumo_args(args, run)
     try:
@@ -356,6 +358,7 @@ def collect_run(
             area_context = area_model_context(decision_snapshot)
             state_path = states_dir / f"{run.run_id}_{snapshot_index:03d}.xml.gz"
             connection.simulation.saveState(str(state_path))
+            state_paths.append(state_path)
             selected = selected_intersections(
                 area.intersections,
                 snapshot_index,
@@ -442,13 +445,14 @@ def collect_run(
                         }
                     )
             reload_snapshot(connection, base_args, state_path, actual_time)
-            state_path.unlink(missing_ok=True)
     finally:
         if connection is not None:
             try:
                 connection.close()
             except Exception:
                 pass
+        for state_path in state_paths:
+            state_path.unlink(missing_ok=True)
 
     write_csv_atomic(sample_path, rows)
     teleports = sum(int(item["teleports"]) for item in branch_records)
