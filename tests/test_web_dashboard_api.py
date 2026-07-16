@@ -105,6 +105,7 @@ class WebDashboardApiTests(unittest.TestCase):
 
     def test_zone_explorer_page_discloses_static_snapshot_semantics(self) -> None:
         script = web_dashboard.ZONE_EXPLORER_JS_PATH.read_text(encoding="utf-8")
+        stylesheet = web_dashboard.ZONE_EXPLORER_CSS_PATH.read_text(encoding="utf-8")
 
         self.assertIn('/assets/zone-explorer.css', web_dashboard.ZONE_EXPLORER_PAGE)
         self.assertIn('/assets/zone-explorer.js', web_dashboard.ZONE_EXPLORER_PAGE)
@@ -114,6 +115,9 @@ class WebDashboardApiTests(unittest.TestCase):
         self.assertIn("boxesOverlap", script)
         self.assertIn("this.options.poll === true", script)
         self.assertIn("спрайти не рухаються й не перекриваються", web_dashboard.ZONE_EXPLORER_PAGE)
+        self.assertIn(".zx-shell", stylesheet)
+        self.assertIn("flex: 1 1 100%", stylesheet)
+        self.assertIn(".zx-illustrative { flex-direction: column; }", stylesheet)
         self.assertIn("benchmark-level", script)
         self.assertNotIn("<strong>Ілюстративний replay</strong>", script)
 
