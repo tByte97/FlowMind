@@ -108,8 +108,12 @@ class WebDashboardApiTests(unittest.TestCase):
 
         self.assertIn('/assets/zone-explorer.css', web_dashboard.ZONE_EXPLORER_PAGE)
         self.assertIn('/assets/zone-explorer.js', web_dashboard.ZONE_EXPLORER_PAGE)
-        self.assertIn("static SUMO snapshot", script)
-        self.assertIn("Статичний SUMO snapshot", script)
+        self.assertIn("static lane slots", script)
+        self.assertIn("Статичні черги на смугах", script)
+        self.assertIn("buildStaticVehicleLayout", script)
+        self.assertIn("boxesOverlap", script)
+        self.assertIn("this.options.poll === true", script)
+        self.assertIn("спрайти не рухаються й не перекриваються", web_dashboard.ZONE_EXPLORER_PAGE)
         self.assertIn("benchmark-level", script)
         self.assertNotIn("<strong>Ілюстративний replay</strong>", script)
 

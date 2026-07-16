@@ -1,10 +1,11 @@
-/* FlowMind Zone Explorer: real SUMO geometry with live or explicitly static replay. */
+/* FlowMind Zone Explorer: real SUMO geometry with collision-free static lane slots. */
 (() => {
   "use strict";
 
   const SVG_NS = "http://www.w3.org/2000/svg";
   const DEFAULT_ENDPOINT = "/api/zone-explorer";
   const LIVE_REFRESH_MS = 3_000;
+  const STATIC_LAYOUT_MAX_VEHICLES = 250;
   const LOAD_COLORS = {
     free: "#62d48b",
     busy: "#f2bf5e",
@@ -206,6 +207,7 @@
         Number(point[0]),
         Number(point[1]),
       ]),
+      directions: asArray(item?.directions).map((value) => String(value).toLowerCase()),
       tls_ids: asArray(item?.tls_ids).map(String),
       vehicle_count: Math.max(0, asNumber(item?.vehicle_count, 0)),
       queue: Math.max(0, asNumber(item?.queue, 0)),
@@ -291,6 +293,267 @@
     severity >= .75 ? "critical" : severity >= .4 ? "busy" : "free"
   );
 
+  const polylineMetrics = (shape, project = (x, y) => ({ x, y })) => {
+    const points = asArray(shape).filter(validPoint).map(([x, y]) => project(x, y));
+    const segments = [];
+    let totalLength = 0;
+    points.slice(0, -1).forEach((start, index) => {
+      const end = points[index + 1];
+      const dx = end.x - start.x;
+      const dy = end.y - start.y;
+      const length = Math.hypot(dx, dy);
+      if (length <= 1e-6) return;
+      segments.push({
+        start,
+        end,
+        dx,
+        dy,
+        length,
+        offset: totalLength,
+      });
+      totalLength += length;
+    });
+    return { points, segments, totalLength };
+  };
+
+  const samplePolyline = (metrics, distance) => {
+    if (!metrics?.segments?.length || metrics.totalLength <= 0) return null;
+    const target = clamp(asNumber(distance, 0), 0, metrics.totalLength);
+    const segment = metrics.segments.find(
+      (item) => target <= item.offset + item.length,
+    ) || metrics.segments.at(-1);
+    const ratio = clamp((target - segment.offset) / segment.length, 0, 1);
+    return {
+      x: segment.start.x + segment.dx * ratio,
+      y: segment.start.y + segment.dy * ratio,
+      angle: Math.atan2(segment.dy, segment.dx) * 180 / Math.PI,
+      distance: target,
+    };
+  };
+
+  const pointSegmentDistanceSquared = (point, start, end) => {
+    const dx = end[0] - start[0];
+    const dy = end[1] - start[1];
+    const denominator = dx * dx + dy * dy;
+    if (denominator <= 1e-9) {
+      return (point[0] - start[0]) ** 2 + (point[1] - start[1]) ** 2;
+    }
+    const ratio = clamp(
+      ((point[0] - start[0]) * dx + (point[1] - start[1]) * dy) / denominator,
+      0,
+      1,
+    );
+    const projectedX = start[0] + dx * ratio;
+    const projectedY = start[1] + dy * ratio;
+    return (point[0] - projectedX) ** 2 + (point[1] - projectedY) ** 2;
+  };
+
+  const nearestLaneId = (vehicle, lanes, maximumDistance = 42) => {
+    if (!validPosition(vehicle)) return null;
+    const point = [Number(vehicle.x), Number(vehicle.y)];
+    let bestLaneId = null;
+    let bestDistanceSquared = maximumDistance ** 2;
+    [...lanes].sort((left, right) => left.lane_id.localeCompare(right.lane_id))
+      .forEach((lane) => {
+        lane.shape.slice(0, -1).forEach((start, index) => {
+          const distanceSquared = pointSegmentDistanceSquared(
+            point,
+            start,
+            lane.shape[index + 1],
+          );
+          if (distanceSquared < bestDistanceSquared - 1e-9) {
+            bestDistanceSquared = distanceSquared;
+            bestLaneId = lane.lane_id;
+          }
+        });
+      });
+    return bestLaneId;
+  };
+
+  const orientedBox = (x, y, angle, length, width) => {
+    const radians = angle * Math.PI / 180;
+    const longitudinal = { x: Math.cos(radians), y: Math.sin(radians) };
+    const lateral = { x: -longitudinal.y, y: longitudinal.x };
+    return {
+      x,
+      y,
+      axes: [longitudinal, lateral],
+      halfLength: length / 2,
+      halfWidth: width / 2,
+    };
+  };
+
+  const boxesOverlap = (left, right) => {
+    const delta = { x: right.x - left.x, y: right.y - left.y };
+    return [...left.axes, ...right.axes].every((axis) => {
+      const centerDistance = Math.abs(delta.x * axis.x + delta.y * axis.y);
+      const leftRadius = (
+        Math.abs(left.axes[0].x * axis.x + left.axes[0].y * axis.y) * left.halfLength
+        + Math.abs(left.axes[1].x * axis.x + left.axes[1].y * axis.y) * left.halfWidth
+      );
+      const rightRadius = (
+        Math.abs(right.axes[0].x * axis.x + right.axes[0].y * axis.y) * right.halfLength
+        + Math.abs(right.axes[1].x * axis.x + right.axes[1].y * axis.y) * right.halfWidth
+      );
+      return centerDistance < leftRadius + rightRadius - 1e-7;
+    });
+  };
+
+  const buildStaticVehicleLayout = (lanes, vehicles, projection, options = {}) => {
+    const maximumVehicles = Math.max(
+      0,
+      Math.round(asNumber(options.maximumVehicles, STATIC_LAYOUT_MAX_VEHICLES)),
+    );
+    const laneById = new Map(lanes.map((lane) => [lane.lane_id, lane]));
+    const assignedByLane = new Map(lanes.map((lane) => [lane.lane_id, []]));
+    let reassignedCount = 0;
+    let unassignedCount = 0;
+
+    vehicles.forEach((vehicle) => {
+      let lane = laneById.get(vehicle.lane_id);
+      if (!lane) {
+        const nearestId = nearestLaneId(
+          vehicle,
+          lanes,
+          asNumber(options.maximumSnapDistance, 42),
+        );
+        lane = nearestId ? laneById.get(nearestId) : null;
+        if (lane) reassignedCount += 1;
+      }
+      if (!lane) {
+        unassignedCount += 1;
+        return;
+      }
+      assignedByLane.get(lane.lane_id).push({
+        ...vehicle,
+        original_lane_id: vehicle.lane_id,
+        lane_id: lane.lane_id,
+      });
+    });
+
+    const laneRows = lanes.map((lane) => {
+      const assigned = assignedByLane.get(lane.lane_id)
+        .sort((left, right) => (
+          Number(Boolean(right.is_priority)) - Number(Boolean(left.is_priority))
+          || left.vehicle_id.localeCompare(right.vehicle_id)
+        ));
+      const telemetryCount = Math.max(0, Math.round(asNumber(lane.vehicle_count, 0)));
+      return {
+        lane,
+        assigned,
+        targetCount: Math.max(telemetryCount, assigned.length),
+        severity: loadSeverity(lane.vehicle_count, lane.queue, lane.occupancy),
+      };
+    }).filter((row) => row.targetCount > 0)
+      .sort((left, right) => (
+        right.severity - left.severity
+        || left.lane.lane_id.localeCompare(right.lane.lane_id)
+      ));
+
+    const vehicleLength = asNumber(projection.vehicleLength, 7);
+    const vehicleBreadth = asNumber(projection.vehicleBreadth, 2.4);
+    const markerRadius = asNumber(projection.markerRadius, 0);
+    const spacing = Math.max(
+      vehicleLength * 1.25,
+      asNumber(options.minimumSpacing, 0),
+    );
+    const collisionLength = vehicleLength + Math.max(1, vehicleLength * .14);
+    const collisionBreadth = vehicleBreadth + Math.max(.45, vehicleBreadth * .18);
+    const occupiedBoxes = [];
+    const placements = [];
+    const requestedCount = laneRows.reduce(
+      (sum, row) => sum + row.targetCount,
+      0,
+    );
+    let omittedCount = unassignedCount;
+
+    laneRows.forEach(({ lane, assigned, targetCount }) => {
+      if (placements.length >= maximumVehicles) {
+        omittedCount += targetCount;
+        return;
+      }
+      const metrics = polylineMetrics(lane.shape, projection.project);
+      const leadMargin = Math.min(
+        markerRadius + vehicleLength * .62,
+        Math.max(vehicleLength * .8, metrics.totalLength * .32),
+      );
+      const tailMargin = Math.min(
+        vehicleLength * .62,
+        metrics.totalLength * .15,
+      );
+      const availableLength = metrics.totalLength - leadMargin - tailMargin;
+      if (availableLength < 0) {
+        omittedCount += targetCount;
+        return;
+      }
+      const maximumSlots = Math.floor(availableLength / spacing) + 1;
+      const laneTarget = Math.min(
+        targetCount,
+        maximumVehicles - placements.length,
+      );
+      omittedCount += targetCount - laneTarget;
+      const queueFromEnd = lane.directions.includes("incoming")
+        || !lane.directions.includes("outgoing");
+      const items = assigned.slice(0, laneTarget);
+      while (items.length < laneTarget) {
+        const slotNumber = items.length + 1;
+        items.push({
+          vehicle_id: `${lane.lane_id}:static-slot:${slotNumber}`,
+          lane_id: lane.lane_id,
+          speed: 0,
+          is_priority: false,
+          synthetic: true,
+        });
+      }
+
+      let candidateSlot = 0;
+      items.forEach((vehicle) => {
+        let placement = null;
+        while (candidateSlot < maximumSlots && !placement) {
+          const distance = queueFromEnd
+            ? metrics.totalLength - leadMargin - candidateSlot * spacing
+            : leadMargin + candidateSlot * spacing;
+          candidateSlot += 1;
+          const point = samplePolyline(metrics, distance);
+          if (!point) continue;
+          const collisionBox = orientedBox(
+            point.x,
+            point.y,
+            point.angle,
+            collisionLength,
+            collisionBreadth,
+          );
+          if (occupiedBoxes.some((box) => boxesOverlap(box, collisionBox))) continue;
+          placement = {
+            ...vehicle,
+            lane_id: lane.lane_id,
+            x: point.x,
+            y: point.y,
+            angle: point.angle,
+            lane_distance: point.distance,
+            queue_from_end: queueFromEnd,
+            collision_box: collisionBox,
+          };
+          occupiedBoxes.push(collisionBox);
+          placements.push(placement);
+        }
+        if (!placement) omittedCount += 1;
+      });
+    });
+
+    return {
+      placements,
+      stats: {
+        sourceCount: vehicles.length,
+        requestedCount,
+        placedCount: placements.length,
+        omittedCount,
+        reassignedCount,
+        unassignedCount,
+      },
+    };
+  };
+
   class ZoneExplorer {
     constructor(root, options = {}) {
       this.root = root;
@@ -309,10 +572,20 @@
       this.projection = null;
       this.laneNodes = new Map();
       this.vehicleNodes = new Map();
+      this.vehiclePlacements = [];
+      this.vehicleLayoutStats = {
+        sourceCount: 0,
+        requestedCount: 0,
+        placedCount: 0,
+        omittedCount: 0,
+        reassignedCount: 0,
+        unassignedCount: 0,
+      };
       this.tlsNodes = new Map();
       this.pointerState = null;
       this.dragDistance = 0;
       this.buildShell();
+      this.root.dataset.staticLayout = "true";
       this.bindEvents();
     }
 
@@ -338,8 +611,8 @@
             </div>
           </header>
           <div class="zx-illustrative" id="mapNotice" data-zx="illustrative">
-            <strong data-zx="static-title">Статичний replay</strong>
-            <span data-zx="static-detail">Timeline змінює агреговані метрики й колір навантаження; позиції автомобілів не анімуються.</span>
+            <strong data-zx="static-title">Статичні черги на смугах</strong>
+            <span data-zx="static-detail">Автомобілі стоять у фіксованих lane-слотах без анімації та накладань; їхній колір відповідає завантаженості ділянки.</span>
           </div>
           <div class="zx-layout">
             <section class="zx-map-panel" id="zoneViewport" aria-label="Карта контрольованої зони">
@@ -517,14 +790,14 @@
     }
 
     updateHeader() {
-      const { source, zone, scene, timeline } = this.payload;
+      const { source, zone, scene } = this.payload;
       this.query("title").textContent = zone.name || "Zone Explorer";
       this.query("subtitle").textContent = (
         `${scene.intersections.length} перехресть · ${scene.lanes.length} контрольованих смуг · `
         + (
           source.illustrative
             ? "traffic snapshot відсутній. "
-            : `${scene.vehicles.length} авто у SUMO snapshot. `
+            : `${scene.vehicles.length} авто у telemetry; карта показує їх статично вздовж смуг. `
         )
         + "Виберіть вузол для пояснення керування."
       );
@@ -535,21 +808,17 @@
         this.tag(
           source.illustrative
             ? "network-only view"
-            : timeline.positions_are_static
-              ? "static SUMO snapshot"
-              : "SUMO live",
-          timeline.positions_are_static ? "warn" : "good",
+            : "static lane slots",
+          "warn",
         ),
       );
-      this.root.dataset.illustrative = String(Boolean(timeline.positions_are_static));
-      if (timeline.positions_are_static) {
-        this.query("static-title").textContent = source.illustrative
-          ? "Статична network-only сцена"
-          : "Статичний SUMO snapshot";
-        this.query("static-detail").textContent = source.illustrative
-          ? "Геометрія мережі реальна, але traffic snapshot відсутній: позиції авто й фактичну фазу не відтворено; timeline показує лише наявні агреговані метрики."
-          : "Позиції машин і фаза взяті зі збереженого SUMO snapshot. Timeline змінює лише підтверджені агреговані метрики, дії, прогнози та колір навантаження — траєкторія не вигадується.";
-      }
+      this.root.dataset.illustrative = String(Boolean(source.illustrative));
+      this.query("static-title").textContent = source.illustrative
+        ? "Статична network-only сцена"
+        : "Статичні черги на смугах";
+      this.query("static-detail").textContent = source.illustrative
+        ? "Показана реальна геометрія мережі без traffic snapshot; автомобілі не вигадуються."
+        : "Автомобілі розкладені один за одним у фіксованих слотах уздовж реальної SUMO-геометрії смуг. Спрайти не рухаються й не перекриваються; колір відповідає lane load.";
     }
 
     tag(text, kind = "") {
@@ -560,11 +829,11 @@
       this.map.replaceChildren();
       this.laneNodes.clear();
       this.vehicleNodes.clear();
+      this.vehiclePlacements = [];
       this.tlsNodes.clear();
       const points = [];
       this.payload.scene.lanes.forEach((lane) => lane.shape.forEach((point) => points.push(point)));
       this.payload.scene.intersections.forEach((item) => points.push([item.x, item.y]));
-      this.payload.scene.vehicles.forEach((item) => points.push([item.x, item.y]));
       if (!points.length) return;
 
       const xs = points.map((point) => point[0]);
@@ -582,7 +851,8 @@
       this.projection = {
         extent,
         markerRadius: clamp(extent * .0065, 11, 38),
-        vehicleWidth: clamp(extent * .0045, 8, 24),
+        vehicleLength: clamp(extent * .0024, 6.5, 10),
+        vehicleBreadth: clamp(extent * .0006, 1.9, 2.4),
         project: (x, y) => ({
           x: Number(x) - minX + padding,
           y: maxY - Number(y) + padding,
@@ -657,36 +927,43 @@
       });
       this.map.appendChild(laneLayer);
 
+      const layout = buildStaticVehicleLayout(
+        this.payload.scene.lanes,
+        this.payload.scene.vehicles,
+        this.projection,
+      );
+      this.vehiclePlacements = layout.placements;
+      this.vehicleLayoutStats = layout.stats;
       const vehicleLayer = svgElement("g", { class: "zx-vehicles" });
-      this.payload.scene.vehicles.forEach((vehicle) => {
-        const point = this.projection.project(vehicle.x, vehicle.y);
-        const widthValue = this.projection.vehicleWidth;
-        const heightValue = widthValue * .55;
+      this.vehiclePlacements.forEach((vehicle) => {
+        const lengthValue = this.projection.vehicleLength;
+        const breadthValue = this.projection.vehicleBreadth;
         const group = svgElement("g", {
-          class: `zx-vehicle${vehicle.is_priority ? " is-priority" : ""}${vehicle.speed < .35 ? " is-waiting" : ""}`,
-          transform: `translate(${point.x} ${point.y}) rotate(${asNumber(vehicle.angle, 0) - 90})`,
+          class: `zx-vehicle${vehicle.is_priority ? " is-priority" : ""}`,
+          transform: `translate(${vehicle.x} ${vehicle.y}) rotate(${vehicle.angle})`,
           "data-vehicle-id": vehicle.vehicle_id,
           "data-lane-id": vehicle.lane_id,
+          "data-static-slot": "true",
         });
         group.append(
           svgElement("rect", {
             class: "zx-vehicle-body",
-            x: -widthValue * .52,
-            y: -heightValue / 2,
-            width: widthValue,
-            height: heightValue,
-            rx: heightValue * .25,
+            x: -lengthValue * .5,
+            y: -breadthValue / 2,
+            width: lengthValue * .82,
+            height: breadthValue,
+            rx: breadthValue * .25,
             "stroke-width": 1,
           }),
           svgElement("path", {
             class: "zx-vehicle-body",
-            d: `M ${widthValue * .48} ${-heightValue / 2} L ${widthValue * .72} 0 L ${widthValue * .48} ${heightValue / 2} Z`,
+            d: `M ${lengthValue * .32} ${-breadthValue / 2} L ${lengthValue * .5} 0 L ${lengthValue * .32} ${breadthValue / 2} Z`,
             "stroke-width": 1,
           }),
         );
         appendTitle(
           group,
-          `${vehicle.vehicle_id} · ${format(vehicle.speed, " м/с")} · ${vehicle.lane_id || "lane —"}`,
+          `${vehicle.synthetic ? "Статичний lane-slot" : vehicle.vehicle_id} · ${vehicle.lane_id || "lane —"} · позиція схематична`,
         );
         vehicleLayer.appendChild(group);
         this.vehicleNodes.set(vehicle.vehicle_id, group);
@@ -818,15 +1095,10 @@
     }
 
     applyMapState() {
-      const illustrative = this.payload.timeline.positions_are_static;
-      const globalSeverity = this.globalCongestionSeverity();
       const selectedLanes = this.relatedLaneIds(this.selectedTlsId);
       const lanesById = new Map(this.payload.scene.lanes.map((lane) => [lane.lane_id, lane]));
       this.payload.scene.lanes.forEach((lane) => {
-        const baseSeverity = loadSeverity(lane.vehicle_count, lane.queue, lane.occupancy);
-        const severity = illustrative
-          ? clamp(baseSeverity * .58 + globalSeverity * .55, 0, 1)
-          : baseSeverity;
+        const severity = loadSeverity(lane.vehicle_count, lane.queue, lane.occupancy);
         const level = severityLevel(severity);
         const node = this.laneNodes.get(lane.lane_id);
         if (!node) return;
@@ -836,18 +1108,16 @@
         node.classList.toggle("is-dimmed", Boolean(this.selectedTlsId && !related));
       });
 
-      this.payload.scene.vehicles.forEach((vehicle) => {
+      this.vehiclePlacements.forEach((vehicle) => {
         const node = this.vehicleNodes.get(vehicle.vehicle_id);
         if (!node) return;
         const lane = lanesById.get(vehicle.lane_id);
-        const baseSeverity = lane
+        const severity = lane
           ? loadSeverity(lane.vehicle_count, lane.queue, lane.occupancy)
-          : globalSeverity;
-        const severity = illustrative
-          ? clamp(baseSeverity * .58 + globalSeverity * .55, 0, 1)
-          : baseSeverity;
+          : 0;
         const level = severityLevel(severity);
         node.style.setProperty("--car-color", vehicle.is_priority ? "#66b7ff" : LOAD_COLORS[level]);
+        node.dataset.load = level;
         node.classList.toggle(
           "is-dimmed",
           Boolean(this.selectedTlsId && !selectedLanes.has(vehicle.lane_id)),
@@ -862,10 +1132,7 @@
           intersection.incoming_queue,
           intersection.outgoing_occupancy,
         );
-        const severity = illustrative
-          ? clamp(baseSeverity * .62 + globalSeverity * .5, 0, 1)
-          : baseSeverity;
-        node.dataset.load = severityLevel(severity);
+        node.dataset.load = severityLevel(baseSeverity);
         node.dataset.signal = intersection.signal;
         node.classList.toggle("is-selected", intersection.tls_id === this.selectedTlsId);
         node.classList.toggle(
@@ -894,14 +1161,14 @@
       overlay.replaceChildren(
         this.tag(`SUMO ${formatTime(this.currentTime)}`, "info"),
         this.tag(`${this.payload.scene.intersections.length} TLS`, "good"),
-        this.tag(`${this.payload.scene.vehicles.length} авто`, ""),
+        this.tag(`${this.vehicleLayoutStats.placedCount} статичних авто`, ""),
         this.tag(
           this.payload.source.illustrative
             ? "network-only"
-            : this.payload.timeline.positions_are_static
-              ? "static positions"
-              : "live positions",
-          this.payload.timeline.positions_are_static ? "warn" : "good",
+            : this.vehicleLayoutStats.omittedCount
+              ? `${this.vehicleLayoutStats.omittedCount} не вмістилося`
+              : "без накладань",
+          this.vehicleLayoutStats.omittedCount ? "warn" : "good",
         ),
       );
     }
@@ -1283,9 +1550,7 @@
       this.query("play").disabled = this.samples.length < 2;
       this.query("timeline-note").textContent = this.payload.source.illustrative
         ? "Traffic snapshot відсутній: показана реальна геометрія мережі та наявні агреговані метрики."
-        : this.payload.timeline.positions_are_static
-        ? "Позиції авто та фаза — зі SUMO snapshot; колір відображає навантаження вибраного часового зрізу."
-        : "Live SUMO: карта оновлюється з новими snapshot, timeline показує накопичену історію метрик.";
+        : "Машини стоять у фіксованих lane-слотах уздовж доріг; колір авто й смуги відповідає останньому lane load. Timeline змінює лише метрики, дії та прогнози.";
     }
 
     stepTimeline(delta) {
@@ -1331,7 +1596,7 @@
       if (
         this.payload.source.kind === "live"
         && this.payload.source.status === "running"
-        && this.options.poll !== false
+        && this.options.poll === true
       ) {
         this.refreshTimer = window.setInterval(() => this.load({ quiet: true }), LIVE_REFRESH_MS);
       }
@@ -1457,6 +1722,14 @@
 
   let defaultInstance = null;
   window.FlowMindZoneExplorer = {
+    layout: {
+      polylineMetrics,
+      samplePolyline,
+      nearestLaneId,
+      orientedBox,
+      boxesOverlap,
+      buildStaticVehicleLayout,
+    },
     mount: (root, options) => {
       defaultInstance = mount(root, options) || defaultInstance;
       return defaultInstance;

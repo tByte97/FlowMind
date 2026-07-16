@@ -207,7 +207,8 @@
   line-height: 1.45;
 }
 
-.zone-explorer[data-illustrative="true"] .zx-illustrative {
+.zone-explorer[data-illustrative="true"] .zx-illustrative,
+.zone-explorer[data-static-layout="true"] .zx-illustrative {
   display: flex;
 }
 
@@ -404,7 +405,6 @@
 
 .zx-map-svg .zx-vehicle {
   pointer-events: none;
-  transition: opacity .18s ease;
 }
 
 .zx-map-svg .zx-vehicle.is-dimmed { opacity: .12; }
@@ -413,15 +413,12 @@
   fill: var(--car-color, var(--zx-cyan));
   stroke: rgba(5, 10, 16, .78);
   vector-effect: non-scaling-stroke;
+  transition: fill .2s linear;
 }
 
 .zx-map-svg .zx-vehicle.is-priority .zx-vehicle-body {
   fill: var(--zx-blue);
   filter: drop-shadow(0 0 7px rgba(102, 183, 255, .92));
-}
-
-.zx-map-svg .zx-vehicle.is-waiting .zx-vehicle-body {
-  filter: drop-shadow(0 0 5px rgba(242, 191, 94, .7));
 }
 
 .zx-inspector {

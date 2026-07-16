@@ -5712,8 +5712,8 @@ ZONE_EXPLORER_PAGE = r"""<!doctype html>
         </header>
 
         <div class="zx-illustrative" id="illustrativeNotice">
-          <strong>Статичний режим</strong>
-          <span>Позиції автомобілів походять із завершального SUMO snapshot; timeline змінює метрики та колір завантаженості, а не вигадує траєкторію.</span>
+          <strong>Статичні черги на смугах</strong>
+          <span>Автомобілі розкладені один за одним у фіксованих слотах уздовж реальної SUMO-геометрії; спрайти не рухаються й не перекриваються, а колір відповідає lane load.</span>
         </div>
 
         <div class="zx-layout">
@@ -5769,7 +5769,7 @@ ZONE_EXPLORER_PAGE = r"""<!doctype html>
             <input class="zx-range" id="timelineRange" type="range" min="0" max="0" value="0">
             <div class="zx-timeline-labels"><span>Початок</span><strong id="timelineLabel">Останній snapshot</strong><span>Кінець</span></div>
           </div>
-          <div class="zx-timeline-note" id="mapNotice">Позиції з SUMO; колір авто відповідає завантаженості lane.</div>
+          <div class="zx-timeline-note" id="mapNotice">Позиції схематичні й статичні; колір авто відповідає завантаженості lane.</div>
         </section>
       </div>
     </section>
