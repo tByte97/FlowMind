@@ -1,14 +1,22 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
 from flowmind.area_model import AreaModel, ControlledLink, Intersection
 from flowmind.config import ControlConfig
-from flowmind.controller import AreaSignalController
+from flowmind.controller import AreaSignalController, PreparedIntersectionDecision
 from flowmind.corridor_manager import CorridorManager, CorridorState
 from flowmind.queue_forecast import ForecastDiagnostics
 from flowmind.safety_validator import SafetyDecision
+from flowmind.signal_policy import PhaseScore
 from flowmind.traffic_state import LaneState, TrafficState
+from flowmind.zone_graph import (
+    AreaGraph,
+    IntersectionStorage,
+    ZoneDefinition,
+    ZoneIntersection,
+)
 
 
 class FakeLaneDomain:
@@ -104,6 +112,22 @@ class AreaSignalControllerTest(unittest.TestCase):
             )
         )
 
+    def area_graph(self) -> AreaGraph:
+        return AreaGraph(
+            zone=ZoneDefinition(
+                zone_id="test",
+                name="test",
+                intersections=(
+                    ZoneIntersection("tls", "tls", ("test-corridor",)),
+                ),
+                corridors=(),
+            ),
+            segments=(),
+            node_storage=(
+                IntersectionStorage("tls", ("south", "west"), 32.0),
+            ),
+        )
+
     def test_entering_clearance_applies_real_sumo_phase_duration(self) -> None:
         traci = FakeTraci()
         controller = AreaSignalController(
@@ -117,6 +141,188 @@ class AreaSignalControllerTest(unittest.TestCase):
 
         self.assertEqual(traci.trafficlight.phase, 1)
         self.assertEqual(traci.trafficlight.phase_durations, [("tls", 3.0)])
+
+    def test_zone_target_cannot_bypass_local_hysteresis(self) -> None:
+        traci = FakeTraci()
+        controller = AreaSignalController(
+            traci,
+            self.area(),
+            "flowmind",
+            ControlConfig(hysteresis=1.0),
+        )
+        decision = PreparedIntersectionDecision(
+            intersection=self.area().intersection("tls"),
+            current_phase=0,
+            spent=12.0,
+            max_green=60.0,
+            priority_link=None,
+            scores=(PhaseScore(0, 9.5), PhaseScore(2, 10.0)),
+            phase_masks={},
+        )
+
+        controller._apply_prepared_decision(  # type: ignore[attr-defined]
+            decision,
+            12.0,
+            target_phase=2,
+            coordination_gain=3.0,
+        )
+
+        self.assertEqual(traci.trafficlight.phase, 0)
+        self.assertEqual(traci.trafficlight.phase_durations, [("tls", 3.0)])
+        self.assertEqual(controller.stats.extensions, 1)
+        self.assertEqual(controller.stats.advances, 0)
+        self.assertEqual(controller.stats.zone_coordination_guarded_switches, 1)
+
+    def test_raw_flowmind_score_cannot_bypass_true_local_anchor(self) -> None:
+        traci = FakeTraci()
+        controller = AreaSignalController(
+            traci,
+            self.area(),
+            "flowmind",
+            ControlConfig(hysteresis=1.0),
+        )
+        decision = PreparedIntersectionDecision(
+            intersection=self.area().intersection("tls"),
+            current_phase=0,
+            spent=12.0,
+            max_green=60.0,
+            priority_link=None,
+            scores=(PhaseScore(0, 1.0), PhaseScore(2, 20.0)),
+            local_scores=(PhaseScore(0, 9.5), PhaseScore(2, 10.0)),
+            phase_masks={},
+        )
+
+        controller._apply_prepared_decision(  # type: ignore[attr-defined]
+            decision,
+            12.0,
+        )
+
+        self.assertEqual(traci.trafficlight.phase, 0)
+        self.assertEqual(controller.stats.extensions, 1)
+        self.assertEqual(controller.stats.advances, 0)
+
+    def test_skipped_tls_phase_is_passed_as_fixed_zone_context(self) -> None:
+        for phase, spent in ((1, 12.0), (0, 1.0)):
+            with self.subTest(phase=phase, spent=spent):
+                traci = FakeTraci()
+                traci.trafficlight.phase = phase
+                traci.trafficlight.spent = spent
+                controller = AreaSignalController(
+                    traci,
+                    self.area(),
+                    "flowmind",
+                    ControlConfig(),
+                    area_graph=self.area_graph(),
+                )
+
+                with patch(
+                    "flowmind.controller.optimize_zone_phases",
+                    return_value={},
+                ) as optimizer:
+                    controller.step(3.0)
+
+                self.assertEqual(
+                    optimizer.call_args.kwargs["current_phase_by_tls"],
+                    {"tls": phase},
+                )
+
+    def test_zone_target_can_switch_when_local_hysteresis_is_exceeded(self) -> None:
+        traci = FakeTraci()
+        controller = AreaSignalController(
+            traci,
+            self.area(),
+            "flowmind",
+            ControlConfig(hysteresis=1.0),
+        )
+        decision = PreparedIntersectionDecision(
+            intersection=self.area().intersection("tls"),
+            current_phase=0,
+            spent=12.0,
+            max_green=60.0,
+            priority_link=None,
+            scores=(PhaseScore(0, 7.0), PhaseScore(2, 10.0)),
+            phase_masks={},
+        )
+
+        controller._apply_prepared_decision(  # type: ignore[attr-defined]
+            decision,
+            12.0,
+            target_phase=2,
+            coordination_gain=3.0,
+        )
+
+        self.assertEqual(traci.trafficlight.phase, 1)
+        self.assertEqual(controller.stats.extensions, 0)
+        self.assertEqual(controller.stats.advances, 1)
+        self.assertEqual(controller.stats.zone_coordination_guarded_switches, 0)
+
+    def test_zone_can_hold_current_green_when_local_prefers_switch(self) -> None:
+        traci = FakeTraci()
+        controller = AreaSignalController(
+            traci,
+            self.area(),
+            "flowmind",
+            ControlConfig(hysteresis=1.0),
+        )
+        decision = PreparedIntersectionDecision(
+            intersection=self.area().intersection("tls"),
+            current_phase=0,
+            spent=12.0,
+            max_green=60.0,
+            priority_link=None,
+            scores=(PhaseScore(0, 8.5), PhaseScore(2, 10.0)),
+            phase_masks={},
+        )
+
+        controller._apply_prepared_decision(  # type: ignore[attr-defined]
+            decision,
+            12.0,
+            target_phase=0,
+            coordination_gain=4.0,
+        )
+
+        self.assertEqual(traci.trafficlight.phase, 0)
+        self.assertEqual(controller.stats.extensions, 1)
+        self.assertEqual(controller.stats.advances, 0)
+
+    def test_zone_hold_cannot_exceed_extra_green_budget(self) -> None:
+        traci = FakeTraci()
+        controller = AreaSignalController(
+            traci,
+            self.area(),
+            "flowmind",
+            ControlConfig(
+                hysteresis=1.0,
+                zone_hold_max_local_gap=2.0,
+                zone_hold_max_seconds=6.0,
+            ),
+        )
+        decision = PreparedIntersectionDecision(
+            intersection=self.area().intersection("tls"),
+            current_phase=0,
+            spent=12.0,
+            max_green=60.0,
+            priority_link=None,
+            scores=(PhaseScore(0, 8.5), PhaseScore(2, 10.0)),
+            phase_masks={},
+        )
+
+        controller._apply_prepared_decision(  # type: ignore[attr-defined]
+            decision,
+            12.0,
+            target_phase=0,
+            coordination_gain=4.0,
+        )
+        controller._apply_prepared_decision(  # type: ignore[attr-defined]
+            decision,
+            19.0,
+            target_phase=0,
+            coordination_gain=4.0,
+        )
+
+        self.assertEqual(controller.stats.extensions, 1)
+        self.assertEqual(controller.stats.advances, 1)
+        self.assertEqual(traci.trafficlight.phase, 1)
 
     def test_all_blocked_candidates_close_current_green(self) -> None:
         traci = FakeTraci()

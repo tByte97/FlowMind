@@ -78,7 +78,21 @@ class ControlConfig:
     objective_stops_weight: float = 0.5
     objective_throughput_weight: float = 1.0
     platoon_arrival_weight: float = 0.8
-    zone_coordination_weight: float = 1.5
+    zone_coordination_weight: float = 4.0
+    # Zone coordination is allowed to deviate from the independently best
+    # phase only when the joint corridor objective pays for that deviation.
+    # Returning every independent choice as a "zone target" used to bypass
+    # normal phase hysteresis and caused unnecessary switching.
+    zone_override_min_gain: float = 0.5
+    zone_override_max_local_loss: float = 2.0
+    max_zone_overrides_per_step: int = 2
+    zone_hold_max_local_gap: float = 2.0
+    zone_hold_max_seconds: float = 3.0
+    # Keep the proven per-TLS Local policy as the actuation anchor. Area-aware
+    # scores remain bounded diagnostics for the zone layer; they cannot cause
+    # an earlier phase switch than Local.
+    flowmind_zone_adjustment_limit: float = 1.5
+    flowmind_switch_hysteresis_bonus: float = 0.0
     queue_forecast_weight: float = 0.75
     queue_forecast_shadow_mode: bool = True
     queue_forecast_min_confidence: float = 0.70
@@ -180,6 +194,17 @@ class ControlConfig:
             "objective_throughput_weight": self.objective_throughput_weight,
             "platoon_arrival_weight": self.platoon_arrival_weight,
             "zone_coordination_weight": self.zone_coordination_weight,
+            "zone_override_min_gain": self.zone_override_min_gain,
+            "zone_override_max_local_loss": self.zone_override_max_local_loss,
+            "max_zone_overrides_per_step": self.max_zone_overrides_per_step,
+            "zone_hold_max_local_gap": self.zone_hold_max_local_gap,
+            "zone_hold_max_seconds": self.zone_hold_max_seconds,
+            "flowmind_zone_adjustment_limit": (
+                self.flowmind_zone_adjustment_limit
+            ),
+            "flowmind_switch_hysteresis_bonus": (
+                self.flowmind_switch_hysteresis_bonus
+            ),
             "queue_forecast_weight": self.queue_forecast_weight,
             "empty_approach_penalty": self.empty_approach_penalty,
             "empty_phase_penalty": self.empty_phase_penalty,

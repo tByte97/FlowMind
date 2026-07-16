@@ -67,6 +67,7 @@ class PreparedIntersectionDecision:
     priority_link: int | None
     scores: tuple[PhaseScore, ...]
     phase_masks: dict[int, tuple[int, ...]]
+    local_scores: tuple[PhaseScore, ...] = ()
     local_throughput_fallback: bool = False
 
 
@@ -93,6 +94,11 @@ class ControllerStats:
     invalid_state_skips: int = 0
     fallback_activations: int = 0
     throughput_fallback_activations: int = 0
+    zone_coordination_candidates: int = 0
+    zone_coordination_overrides: int = 0
+    zone_coordination_gain_total: float = 0.0
+    zone_coordination_guarded_switches: int = 0
+    zone_coordination_extra_holds: int = 0
     movement_mask_active_decisions: int = 0
     movement_mask_program_updates: int = 0
     movement_mask_updates: int = 0
@@ -168,6 +174,7 @@ class AreaSignalController:
         self._last_phase_by_tls: dict[str, int] = {}
         self._phase_started_at: dict[str, float] = {}
         self._pending_queue_forecasts: list[PendingQueueForecast] = []
+        self._zone_hold_started_at: dict[tuple[str, int], float] = {}
         self._corridor_recovery = CorridorRecoveryPlanner()
         self.stats = ControllerStats()
 
@@ -216,10 +223,9 @@ class AreaSignalController:
             preparation_overrides = {}
         corridor_target_ids = set(overrides) | set(preparation_overrides)
         prepared: list[PreparedIntersectionDecision] = []
+        current_phase_by_tls: dict[str, int] = {}
         for intersection in self._area.intersections:
             tls_id = intersection.tls_id
-            if tls_id in recovery_handled:
-                continue
             invalid_lane_ids = tuple(
                 sorted(
                     lane_id
@@ -240,6 +246,13 @@ class AreaSignalController:
             current_phase = int(self._traci.trafficlight.getPhase(tls_id))
             if not 0 <= current_phase < len(intersection.phases):
                 self.stats.phase_out_of_range_skips += 1
+                continue
+            # Even a TLS that is currently in clearance, below min-green, or
+            # owned by corridor recovery still affects its neighbours. It
+            # remains fixed context for this zone decision; only entries
+            # added to ``prepared`` may be optimized.
+            current_phase_by_tls[tls_id] = current_phase
+            if tls_id in recovery_handled:
                 continue
             spent = self._phase_elapsed(
                 tls_id,
@@ -375,6 +388,26 @@ class AreaSignalController:
                 snapshot.downstream_storage_by_outgoing_lane,
                 phase_masks,
             )
+            local_scores = (
+                scores
+                if self._mode == "local" or local_throughput_fallback
+                else score_phases(
+                    intersection,
+                    traffic,
+                    "local",
+                    self._config,
+                    priority_link,
+                    snapshot.area_pressure_by_incoming_lane,
+                    {},
+                    demand_wait_by_lane,
+                    snapshot.downstream_risk_by_outgoing_lane,
+                    preparation_link,
+                    queue_growth_by_lane,
+                    snapshot.platoon_arrival_by_incoming_lane,
+                    snapshot.downstream_storage_by_outgoing_lane,
+                    phase_masks,
+                )
+            )
             prepared.append(
                 PreparedIntersectionDecision(
                     intersection=intersection,
@@ -384,6 +417,7 @@ class AreaSignalController:
                     priority_link=priority_link,
                     scores=scores,
                     phase_masks=phase_masks,
+                    local_scores=local_scores,
                     local_throughput_fallback=local_throughput_fallback,
                 )
             )
@@ -411,6 +445,11 @@ class AreaSignalController:
                 for score in decision.scores
                 if not score.blocked_signal_indices
             )
+            safe_local_scores = tuple(
+                score
+                for score in decision.local_scores
+                if not score.blocked_signal_indices
+            )
             masked_prepared.append(
                 PreparedIntersectionDecision(
                     intersection=decision.intersection,
@@ -420,6 +459,7 @@ class AreaSignalController:
                     priority_link=decision.priority_link,
                     scores=safe_scores,
                     phase_masks={},
+                    local_scores=safe_local_scores,
                     local_throughput_fallback=decision.local_throughput_fallback,
                 )
             )
@@ -436,21 +476,57 @@ class AreaSignalController:
                 self._area_graph,
                 snapshot,
                 {
-                    decision.intersection.tls_id: decision.scores
+                    decision.intersection.tls_id: decision.local_scores
                     for decision in prepared
                     if not decision.local_throughput_fallback
                 },
                 self._config,
+                current_phase_by_tls=current_phase_by_tls,
             )
             if self._mode == "flowmind" and self._area_graph is not None
             else {}
         )
+        self.stats.zone_coordination_candidates += len(zone_choices)
+        actionable_choices = {
+            decision.intersection.tls_id: choice
+            for decision in prepared
+            if (
+                (choice := zone_choices.get(decision.intersection.tls_id))
+                is not None
+                and choice.is_override
+                and choice.phase_index == decision.current_phase
+            )
+        }
+        self.stats.zone_coordination_overrides += len(actionable_choices)
+        self.stats.zone_coordination_gain_total += sum(
+            choice.coordination_gain
+            for choice in actionable_choices.values()
+        )
+        self.stats.zone_coordination_guarded_switches += sum(
+            int(
+                choice.is_override
+                and choice.phase_index != decision.current_phase
+            )
+            for decision in prepared
+            if (
+                choice := zone_choices.get(decision.intersection.tls_id)
+            ) is not None
+        )
         for decision in prepared:
-            choice = zone_choices.get(decision.intersection.tls_id)
+            choice = actionable_choices.get(decision.intersection.tls_id)
             self._apply_prepared_decision(
                 decision,
                 simulation_time,
-                target_phase=(choice.phase_index if choice is not None else None),
+                target_phase=(
+                    choice.phase_index
+                    if choice is not None
+                    else None
+                ),
+                coordination_gain=(
+                    choice.coordination_gain
+                    if choice is not None
+                    else None
+                ),
             )
         self._remember_traffic(traffic, simulation_time)
 
@@ -1066,6 +1142,7 @@ class AreaSignalController:
         decision: PreparedIntersectionDecision,
         simulation_time: float,
         target_phase: int | None = None,
+        coordination_gain: float | None = None,
     ) -> None:
         intersection = decision.intersection
         tls_id = intersection.tls_id
@@ -1074,13 +1151,19 @@ class AreaSignalController:
         max_green = decision.max_green
         priority_link = decision.priority_link
         scores = decision.scores
+        local_scores = decision.local_scores or scores
+        local_best = choose_phase(local_scores)
         best = (
             next(
-                (item for item in scores if item.phase_index == target_phase),
+                (
+                    item
+                    for item in local_scores
+                    if item.phase_index == target_phase
+                ),
                 None,
             )
             if target_phase is not None
-            else choose_phase(scores)
+            else local_best
         )
         if best is None:
             self.stats.scoreless_skips += 1
@@ -1103,7 +1186,11 @@ class AreaSignalController:
             )
             return
         current_score = next(
-            (item.score for item in scores if item.phase_index == current_phase),
+            (
+                item.score
+                for item in local_scores
+                if item.phase_index == current_phase
+            ),
             float("-inf"),
         )
 
@@ -1111,18 +1198,57 @@ class AreaSignalController:
         if priority_link is not None:
             self.stats.priority_decisions += 1
 
-        should_extend = (
-            (
-                best.phase_index == current_phase
-                if target_phase is not None
-                else (
-                    best.phase_index == current_phase
-                    or current_score >= best.score - self._config.hysteresis
-                )
+        effective_hysteresis = float(self._config.hysteresis)
+        if self._mode == "flowmind":
+            effective_hysteresis += float(
+                self._config.flowmind_switch_hysteresis_bonus
             )
+        local_hysteresis_allows_extension = (
+            local_best is not None
+            and (
+                local_best.phase_index == current_phase
+                or current_score >= local_best.score - effective_hysteresis
+            )
+        )
+        local_gap = (
+            max(local_best.score - current_score, 0.0)
+            if local_best is not None
+            else float("inf")
+        )
+        hold_key = (tls_id, current_phase)
+        for key in tuple(self._zone_hold_started_at):
+            if key[0] == tls_id and key != hold_key:
+                self._zone_hold_started_at.pop(key, None)
+        zone_holds_current = (
+            target_phase is not None
+            and best.phase_index == current_phase
+            and local_gap <= float(self._config.zone_hold_max_local_gap)
+        )
+        if zone_holds_current and not local_hysteresis_allows_extension:
+            started_at = self._zone_hold_started_at.setdefault(
+                hold_key,
+                simulation_time,
+            )
+            zone_holds_current = (
+                simulation_time - started_at
+                < float(self._config.zone_hold_max_seconds)
+            )
+            if zone_holds_current:
+                self.stats.zone_coordination_extra_holds += 1
+        else:
+            self._zone_hold_started_at.pop(hold_key, None)
+        guarded_zone_switch = (
+            target_phase is not None
+            and best.phase_index != current_phase
+            and local_hysteresis_allows_extension
+        )
+        should_extend = (
+            (zone_holds_current or local_hysteresis_allows_extension)
             and spent < max_green
         )
         if should_extend:
+            if guarded_zone_switch:
+                self.stats.zone_coordination_guarded_switches += 1
             safety = self._safety.validate_extension(
                 tls_id,
                 current_phase,
@@ -1152,12 +1278,26 @@ class AreaSignalController:
                 (
                     "Продовжено зелений для швидкої"
                     if priority_link is not None
+                    else "Відхилено раннє зональне перемикання"
+                    if guarded_zone_switch
+                    else "Зонально узгоджено продовження зеленого"
+                    if coordination_gain is not None
                     else "Продовжено зелену фазу"
                 ),
                 (
                     f"Перехрестя {tls_id}: фаза {current_phase} продовжена "
                     f"на {max(remaining, 1.0):.0f} с; оцінка попиту "
-                    f"{best.score:.2f}."
+                    f"{current_score:.2f}"
+                    + (
+                        (
+                            f"; зональна ціль {target_phase} відкладена "
+                            "локальним hysteresis guard."
+                        )
+                        if guarded_zone_switch
+                        else f", joint gain {coordination_gain:.2f}."
+                        if coordination_gain is not None
+                        else "."
+                    )
                 ),
                 "success" if priority_link is not None else "info",
             )
@@ -1171,12 +1311,22 @@ class AreaSignalController:
                 title=(
                     "Підготовлено фазу для швидкої"
                     if priority_link is not None
+                    else "Зонально узгоджено зміну фази"
+                    if coordination_gain is not None
                     else "Змінено фазу через стан черги"
                 ),
                 detail=(
                     f"Перехрестя {tls_id}: перехід із фази {current_phase} "
                     f"до {(current_phase + 1) % len(intersection.phases)}; "
-                    f"найкраща оцінка {best.score:.2f}."
+                    f"найкраща оцінка {best.score:.2f}"
+                    + (
+                        (
+                            f", зональна ціль {target_phase}, "
+                            f"joint gain {coordination_gain:.2f}."
+                        )
+                        if coordination_gain is not None
+                        else "."
+                    )
                 ),
                 level="warning" if priority_link is not None else "info",
             )

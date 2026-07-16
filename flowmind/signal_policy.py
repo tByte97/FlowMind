@@ -256,35 +256,14 @@ def score_phases(
                 turns_per_incoming.get(link.incoming_lane, 1),
                 1,
             )
+            local_movement_score = (
+                float(incoming.queue)
+                if has_demand
+                else -float(config.empty_approach_penalty)
+            ) * turning_ratio
             if mode == "local":
-                movement_score = (
-                    float(incoming.queue)
-                    if has_demand
-                    else -float(config.empty_approach_penalty)
-                )
-                movement_score *= turning_ratio
+                movement_score = local_movement_score
             else:
-                movement_score = movement_pressure(
-                    incoming.queue,
-                    incoming.vehicle_count,
-                    incoming.occupancy,
-                    outgoing.queue,
-                    outgoing.occupancy,
-                    outgoing.free_slots,
-                    config,
-                )
-                movement_score += (
-                    area_pressure.get(link.incoming_lane, 0.0)
-                    * config.area_pressure_weight
-                )
-                movement_score += (
-                    queue_forecast.get((phase_index, link_index), 0.0)
-                    * config.queue_forecast_weight
-                )
-                movement_score -= (
-                    graph_spillback_risk * config.downstream_graph_weight
-                )
-                movement_score *= turning_ratio
                 horizon = float(config.coordination_horizon_seconds)
                 saturation_capacity = (
                     float(config.saturation_flow_vph_per_lane)
@@ -292,44 +271,55 @@ def score_phases(
                     * horizon
                     * turning_ratio
                 )
-                predicted_arrivals = platoon_arrival_by_incoming_lane.get(
-                    link.incoming_lane,
-                    0.0,
+                area_adjustment = (
+                    area_pressure.get(link.incoming_lane, 0.0)
+                    * config.area_pressure_weight
+                    * turning_ratio
                 )
-                discharge = min(
-                    float(incoming.vehicle_count) + predicted_arrivals,
-                    saturation_capacity,
+                area_adjustment += (
+                    queue_forecast.get((phase_index, link_index), 0.0)
+                    * config.queue_forecast_weight
+                    * turning_ratio
                 )
-                movement_score += (
-                    float(incoming.queue)
-                    * horizon
-                    / 60.0
-                    * config.objective_delay_weight
+                area_adjustment -= (
+                    graph_spillback_risk
+                    * (
+                        config.downstream_graph_weight
+                        + config.objective_spillback_weight
+                    )
+                    * turning_ratio
                 )
-                movement_score += max(
+                area_adjustment += max(
                     queue_growth_by_lane.get(link.incoming_lane, 0.0),
                     0.0,
-                ) * config.objective_queue_growth_weight
-                movement_score += (
-                    float(incoming.queue) * config.objective_stops_weight
-                )
-                movement_score += (
-                    discharge * config.objective_throughput_weight
-                )
-                movement_score += (
-                    predicted_arrivals * config.platoon_arrival_weight
-                )
-                movement_score -= (
-                    graph_spillback_risk * config.objective_spillback_weight
+                ) * config.objective_queue_growth_weight * turning_ratio
+                area_adjustment += (
+                    platoon_arrival_by_incoming_lane.get(
+                        link.incoming_lane,
+                        0.0,
+                    )
+                    * config.platoon_arrival_weight
+                    * turning_ratio
                 )
                 if downstream_storage_by_outgoing_lane:
-                    movement_score += min(
+                    area_adjustment += min(
                         downstream_storage_by_outgoing_lane.get(
                             link.outgoing_lane,
                             0.0,
                         ),
                         saturation_capacity,
                     ) * 0.05
+                adjustment_limit = float(
+                    config.flowmind_zone_adjustment_limit
+                )
+                area_adjustment = max(
+                    min(
+                        area_adjustment,
+                        adjustment_limit,
+                    ),
+                    -adjustment_limit,
+                )
+                movement_score = local_movement_score + area_adjustment
             if is_preparation_movement:
                 movement_score += float(config.corridor_prepare_bonus)
             if has_demand:

@@ -4,6 +4,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from api import web_dashboard
 
@@ -93,6 +94,24 @@ class WebDashboardApiTests(unittest.TestCase):
         self.assertIn('Авто: ≥10', page)
         self.assertIn('static fixed + FlowMind', page)
         self.assertIn('SUMO Actuated', web_dashboard.AVERAGES_PAGE)
+        self.assertIn(
+            "benchmark.emergency_route_evaluated",
+            web_dashboard.AVERAGES_PAGE,
+        )
+        self.assertIn(
+            "emergency route у цьому benchmark вимкнено",
+            web_dashboard.AVERAGES_PAGE,
+        )
+
+    def test_zone_explorer_page_discloses_static_snapshot_semantics(self) -> None:
+        script = web_dashboard.ZONE_EXPLORER_JS_PATH.read_text(encoding="utf-8")
+
+        self.assertIn('/assets/zone-explorer.css', web_dashboard.ZONE_EXPLORER_PAGE)
+        self.assertIn('/assets/zone-explorer.js', web_dashboard.ZONE_EXPLORER_PAGE)
+        self.assertIn("static SUMO snapshot", script)
+        self.assertIn("Статичний SUMO snapshot", script)
+        self.assertIn("benchmark-level", script)
+        self.assertNotIn("<strong>Ілюстративний replay</strong>", script)
 
     def test_stop_marker_disables_live_sumo_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -286,6 +305,369 @@ class WebDashboardApiTests(unittest.TestCase):
             120.0,
         )
         self.assertEqual(by_mode["fixed"]["count"], 1)
+
+    def test_averages_derive_spillback_metrics_and_flowmind_local_comparison(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            flowmind = root / "flowmind_run"
+            local = root / "local_run"
+            flowmind.mkdir()
+            local.mkdir()
+            columns = (
+                "mode,average_waiting_time,throughput,max_queue_length,"
+                "blocked_outgoing_share,simulated_duration,zone_outflow,"
+                "controller_decisions,phase_advances\n"
+            )
+            (flowmind / "summary.csv").write_text(
+                columns + "flowmind,20,120,12,0.02,40,120,30,5\n",
+                encoding="utf-8",
+            )
+            (local / "summary.csv").write_text(
+                columns + "local,22,110,14,0.03,40,110,20,6\n",
+                encoding="utf-8",
+            )
+            (flowmind / "flowmind_timeseries.csv").write_text(
+                (
+                    "time,blocked_outgoing_share\n"
+                    "10,0\n"
+                    "20,0\n"
+                    "30,0\n"
+                    "40,0\n"
+                ),
+                encoding="utf-8",
+            )
+            (local / "local_timeseries.csv").write_text(
+                (
+                    "time,blocked_outgoing_share\n"
+                    "10,0\n"
+                    "20,0.25\n"
+                    "30,0.25\n"
+                    "40,0\n"
+                ),
+                encoding="utf-8",
+            )
+
+            payload = web_dashboard.build_averages_payload(root)
+
+        by_mode = {item["mode"]: item for item in payload["modes"]}
+        self.assertEqual(
+            by_mode["flowmind"]["metrics"]["spillback_free_time_share"][
+                "average"
+            ],
+            1.0,
+        )
+        self.assertEqual(
+            by_mode["flowmind"]["metrics"]["spillback_episode_count"]["average"],
+            0.0,
+        )
+        self.assertEqual(
+            by_mode["local"]["metrics"]["spillback_free_time_share"]["average"],
+            0.5,
+        )
+        self.assertEqual(
+            by_mode["local"]["metrics"]["spillback_episode_count"]["average"],
+            1.0,
+        )
+        comparisons = {
+            item["key"]: item for item in payload["flowmind_vs_local"]
+        }
+        self.assertEqual(
+            comparisons["spillback_free_time_share"]["winner"],
+            "flowmind",
+        )
+        self.assertGreater(
+            comparisons["spillback_free_time_share"]["improvement_percent"],
+            0.0,
+        )
+        self.assertEqual(
+            comparisons["spillback_episode_count"]["winner"],
+            "flowmind",
+        )
+        self.assertIn(
+            "spillback_free_time_share",
+            {item["key"] for item in payload["flowmind_zone_wins"]},
+        )
+        self.assertEqual(
+            comparisons["outflow_per_control_action"]["status"],
+            "neutral",
+        )
+        self.assertEqual(
+            comparisons["outflow_per_control_action"]["winner"],
+            "neutral",
+        )
+        self.assertIsNone(
+            comparisons["outflow_per_control_action"]["improvement_percent"]
+        )
+        self.assertIsNotNone(
+            comparisons["outflow_per_control_action"]["difference_percent"]
+        )
+        self.assertEqual(
+            comparisons["clearance_action_share"]["status"],
+            "neutral",
+        )
+
+    def test_spillback_backfill_excludes_unobserved_intervals(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "flowmind_timeseries.csv"
+            path.write_text(
+                (
+                    "time,blocked_outgoing_share\n"
+                    "10,0.2\n"
+                    "20,\n"
+                    "30,0.3\n"
+                    "40,0\n"
+                ),
+                encoding="utf-8",
+            )
+
+            metrics = web_dashboard._spillback_metrics_from_timeseries(
+                path,
+                simulated_duration=40,
+            )
+
+        self.assertEqual(metrics["spillback_free_time_share"], 0.3333)
+        self.assertEqual(metrics["spillback_episode_count"], 2)
+
+    def test_static_zone_catalog_contains_full_control_area(self) -> None:
+        catalog = web_dashboard.build_static_zone_catalog()
+
+        self.assertEqual(catalog["intersection_count"], 20)
+        self.assertEqual(catalog["lane_count"], 221)
+        self.assertEqual(len(catalog["intersections"]), 20)
+        self.assertEqual(len(catalog["lanes"]), 221)
+        self.assertTrue(all(item["name"] for item in catalog["intersections"]))
+        self.assertTrue(all(item["shape"] for item in catalog["lanes"]))
+        self.assertTrue(
+            all(
+                "phase_duration" in item
+                and "incoming_queue" in item
+                and "incoming_vehicles" in item
+                for item in catalog["intersections"]
+            )
+        )
+
+    def test_zone_result_id_rejects_path_like_input_without_discovery(self) -> None:
+        with mock.patch.object(
+            web_dashboard,
+            "discover_result_sets",
+            side_effect=AssertionError("invalid ids must be rejected early"),
+        ):
+            result = web_dashboard.find_result_dir_by_id(
+                "../../etc/passwd",
+                Path("/tmp"),
+            )
+
+        self.assertIsNone(result)
+
+    def test_zone_default_prefers_completed_flowmind_real_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+
+            def write_status(
+                name: str,
+                *,
+                mode: str,
+                status: str,
+                snapshot: bool,
+            ) -> Path:
+                run_dir = root / name
+                run_dir.mkdir()
+                zone = {"status": status}
+                if snapshot:
+                    zone["intersections"] = [{"tls_id": "tls"}]
+                    zone["lanes"] = [{"lane_id": "lane"}]
+                (run_dir / "live_status.json").write_text(
+                    json.dumps(
+                        {
+                            "mode": mode,
+                            "system": {"simulation": {"status": status}},
+                            "zone_simulation": zone,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                return run_dir
+
+            flowmind = write_status(
+                "flowmind_completed",
+                mode="flowmind",
+                status="completed",
+                snapshot=True,
+            )
+            write_status(
+                "local_completed",
+                mode="local",
+                status="completed",
+                snapshot=True,
+            )
+            write_status(
+                "newer_failed",
+                mode="static_fixed",
+                status="failed",
+                snapshot=False,
+            )
+
+            selected = web_dashboard.find_preferred_zone_live_status(root)
+            payload = web_dashboard.build_zone_explorer_payload(base_dir=root)
+            running = write_status(
+                "current_running",
+                mode="flowmind",
+                status="running",
+                snapshot=False,
+            )
+            selected_running = web_dashboard.find_preferred_zone_live_status(
+                root,
+                running,
+            )
+
+        self.assertEqual(selected, flowmind / "live_status.json")
+        self.assertEqual(payload["source"]["result_id"], web_dashboard._result_id(flowmind))
+        self.assertEqual(payload["source"]["mode"], "flowmind")
+        self.assertEqual(selected_running, running / "live_status.json")
+
+    def test_zone_comparison_context_is_cached_for_live_polling(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            web_dashboard._ZONE_COMPARISON_CACHE.clear()
+            original = web_dashboard.build_averages_payload
+            with mock.patch.object(
+                web_dashboard,
+                "build_averages_payload",
+                wraps=original,
+            ) as build:
+                first = web_dashboard._zone_comparison_context(root)
+                second = web_dashboard._zone_comparison_context(root)
+
+        self.assertIs(first, second)
+        self.assertEqual(build.call_count, 1)
+
+    def test_completed_zone_archive_stays_static_and_overlays_telemetry(
+        self,
+    ) -> None:
+        catalog = web_dashboard.build_static_zone_catalog()
+        tls_id = catalog["intersections"][0]["tls_id"]
+        lane_id = catalog["lanes"][0]["lane_id"]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run_dir = root / "completed_zone"
+            run_dir.mkdir()
+            (run_dir / "live_status.json").write_text(
+                json.dumps(
+                    {
+                        "mode": "flowmind",
+                        "system": {
+                            "simulation": {
+                                "status": "completed",
+                            }
+                        },
+                        "zone_simulation": {
+                            "status": "completed",
+                            "simulated_time": 600,
+                            "intersections": [
+                                {
+                                    "tls_id": tls_id,
+                                    "phase": 2,
+                                    "state": "rrGG",
+                                    "phase_elapsed": 14.0,
+                                    "vehicle_count": 11,
+                                    "queue": 7,
+                                    "outgoing_occupancy": 0.4,
+                                }
+                            ],
+                            "lanes": [
+                                {
+                                    "lane_id": lane_id,
+                                    "vehicle_count": 8,
+                                    "queue": 5,
+                                    "occupancy": 0.75,
+                                    "mean_speed": 3.2,
+                                }
+                            ],
+                            "vehicles": [
+                                {
+                                    "id": "vehicle-1",
+                                    "lane_id": lane_id,
+                                    "x": 1.0,
+                                    "y": 2.0,
+                                }
+                            ],
+                        },
+                        "summary": {
+                            "mode": "flowmind",
+                            "throughput": 100,
+                            "simulated_duration": 600,
+                        },
+                        "decision_log": [
+                            {
+                                "tls_id": tls_id,
+                                "time": 590,
+                                "title": "Зональна координація",
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            result_id = web_dashboard._result_id(run_dir)
+
+            payload = web_dashboard.build_zone_explorer_payload(
+                result_id=result_id,
+                base_dir=root,
+            )
+
+        intersections = {
+            item["tls_id"]: item for item in payload["scene"]["intersections"]
+        }
+        lanes = {item["lane_id"]: item for item in payload["scene"]["lanes"]}
+        self.assertTrue(payload["available"])
+        self.assertEqual(payload["source"]["kind"], "archive")
+        self.assertEqual(payload["source"]["status"], "completed")
+        self.assertTrue(payload["source"]["scene_is_static"])
+        self.assertFalse(payload["source"]["illustrative"])
+        self.assertEqual(payload["source"]["snapshot_time"], 600.0)
+        self.assertTrue(payload["timeline"]["positions_are_static"])
+        self.assertEqual(intersections[tls_id]["queue"], 7)
+        self.assertEqual(intersections[tls_id]["vehicle_count"], 11)
+        self.assertTrue(intersections[tls_id]["name"])
+        self.assertEqual(lanes[lane_id]["queue"], 5)
+        self.assertEqual(lanes[lane_id]["occupancy"], 0.75)
+        self.assertTrue(lanes[lane_id]["shape"])
+        self.assertEqual(payload["scene"]["vehicles"][0]["id"], "vehicle-1")
+        self.assertEqual(payload["actions"][0]["tls_id"], tls_id)
+        self.assertFalse(payload["comparison"]["snapshot_specific"])
+
+    def test_running_without_snapshot_is_explicitly_network_only(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run_dir = root / "starting_zone"
+            run_dir.mkdir()
+            (run_dir / "live_status.json").write_text(
+                json.dumps(
+                    {
+                        "mode": "flowmind",
+                        "system": {"simulation": {"status": "running"}},
+                        "zone_simulation": {
+                            "status": "running",
+                            "intersections": [],
+                            "lanes": [],
+                            "vehicles": [],
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            payload = web_dashboard.build_zone_explorer_payload(
+                result_id=web_dashboard._result_id(run_dir),
+                base_dir=root,
+            )
+
+        self.assertEqual(payload["source"]["kind"], "static")
+        self.assertTrue(payload["source"]["illustrative"])
+        self.assertTrue(payload["source"]["scene_is_static"])
+        self.assertTrue(payload["timeline"]["positions_are_static"])
 
     def test_averages_prefers_complete_paired_evaluation_over_old_runs(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

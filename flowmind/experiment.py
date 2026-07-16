@@ -915,6 +915,22 @@ def run_experiment(config: RunConfig) -> dict[str, object]:
                     "throughput_fallback_activations": (
                         controller.stats.throughput_fallback_activations
                     ),
+                    "zone_coordination_candidates": (
+                        controller.stats.zone_coordination_candidates
+                    ),
+                    "zone_coordination_overrides": (
+                        controller.stats.zone_coordination_overrides
+                    ),
+                    "zone_coordination_gain_total": round(
+                        controller.stats.zone_coordination_gain_total,
+                        5,
+                    ),
+                    "zone_coordination_guarded_switches": (
+                        controller.stats.zone_coordination_guarded_switches
+                    ),
+                    "zone_coordination_extra_holds": (
+                        controller.stats.zone_coordination_extra_holds
+                    ),
                     "movement_mask_updates": (
                         controller.stats.movement_mask_updates
                     ),
@@ -976,6 +992,11 @@ def run_experiment(config: RunConfig) -> dict[str, object]:
                     "invalid_state_skips": 0,
                     "fallback_activations": 0,
                     "throughput_fallback_activations": 0,
+                    "zone_coordination_candidates": 0,
+                    "zone_coordination_overrides": 0,
+                    "zone_coordination_gain_total": 0.0,
+                    "zone_coordination_guarded_switches": 0,
+                    "zone_coordination_extra_holds": 0,
                     "movement_mask_updates": 0,
                     "movement_mask_active_decisions": 0,
                     "movement_mask_program_updates": 0,
@@ -987,6 +1008,47 @@ def run_experiment(config: RunConfig) -> dict[str, object]:
                     "corridor_recovery_actions": 0,
                 }
             )
+        duration_value = float(summary.get("simulated_duration") or 0.0)
+        outflow_value = summary.get("zone_outflow")
+        if outflow_value is None:
+            outflow_value = summary.get("throughput")
+        outflow_number = (
+            float(outflow_value) if outflow_value is not None else None
+        )
+        decision_count = int(summary.get("controller_decisions") or 0)
+        phase_advances = int(summary.get("phase_advances") or 0)
+        zone_candidates = int(summary.get("zone_coordination_candidates") or 0)
+        zone_overrides = int(summary.get("zone_coordination_overrides") or 0)
+        zone_gain_total = float(summary.get("zone_coordination_gain_total") or 0.0)
+        summary.update(
+            {
+                "zone_throughput_per_minute": (
+                    round(outflow_number * 60.0 / duration_value, 5)
+                    if outflow_number is not None and duration_value > 0
+                    else None
+                ),
+                "outflow_per_control_action": (
+                    round(outflow_number / decision_count, 5)
+                    if outflow_number is not None and decision_count > 0
+                    else None
+                ),
+                "clearance_action_share": (
+                    round(phase_advances / decision_count, 5)
+                    if decision_count > 0
+                    else None
+                ),
+                "zone_coordination_override_rate": (
+                    round(zone_overrides / zone_candidates, 5)
+                    if zone_candidates > 0
+                    else None
+                ),
+                "zone_coordination_mean_gain": (
+                    round(zone_gain_total / zone_overrides, 5)
+                    if zone_overrides > 0
+                    else None
+                ),
+            }
+        )
         summary["telemetry_failures"] = telemetry_failures
         summary.update(
             {
@@ -1280,6 +1342,31 @@ def build_live_system_status(
             ),
             "throughput_fallback_activations": (
                 controller_stats.throughput_fallback_activations
+                if controller_stats
+                else 0
+            ),
+            "zone_coordination_candidates": (
+                controller_stats.zone_coordination_candidates
+                if controller_stats
+                else 0
+            ),
+            "zone_coordination_overrides": (
+                controller_stats.zone_coordination_overrides
+                if controller_stats
+                else 0
+            ),
+            "zone_coordination_gain_total": (
+                round(controller_stats.zone_coordination_gain_total, 5)
+                if controller_stats
+                else 0.0
+            ),
+            "zone_coordination_guarded_switches": (
+                controller_stats.zone_coordination_guarded_switches
+                if controller_stats
+                else 0
+            ),
+            "zone_coordination_extra_holds": (
+                controller_stats.zone_coordination_extra_holds
                 if controller_stats
                 else 0
             ),

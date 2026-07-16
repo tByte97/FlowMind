@@ -8,7 +8,7 @@ from tempfile import TemporaryDirectory
 
 from flowmind.area_model import AreaModel, ControlledLink, Intersection
 from flowmind.config import CONTROL_MODES, ControlConfig
-from flowmind.metrics import MetricsCollector
+from flowmind.metrics import MetricSample, MetricsCollector
 from flowmind.zone_boundary import ZoneBoundary
 
 
@@ -141,6 +141,29 @@ class MetricsCollectorTest(unittest.TestCase):
                     links=(ControlledLink("in_0", "out_0", 0),),
                 ),
             )
+        )
+
+    @staticmethod
+    def metric_sample(
+        time: float,
+        blocked_outgoing_share: float | None,
+    ) -> MetricSample:
+        return MetricSample(
+            time=time,
+            active_vehicles=0,
+            departed=0,
+            arrived=0,
+            zone_inflow=None,
+            zone_outflow=None,
+            zone_inflow_per_minute=None,
+            zone_outflow_per_minute=None,
+            mean_speed=None,
+            waiting_time=None,
+            queue_length=None,
+            max_queue_length=None,
+            throughput=0,
+            stops_count=0,
+            blocked_outgoing_share=blocked_outgoing_share,
         )
 
     def test_summary_csv_keeps_all_four_control_modes_in_canonical_order(self) -> None:
@@ -374,6 +397,43 @@ class MetricsCollectorTest(unittest.TestCase):
         outcome = collector.trip_outcomes(5.0)[0]
         self.assertEqual(outcome.status, "unfinished_censored")
         self.assertIsNone(outcome.travel_time)
+
+    def test_summary_reports_time_without_spillback_and_episode_count(self) -> None:
+        collector = MetricsCollector(
+            FakeTraci(),
+            AreaModel(()),
+            ControlConfig(decision_interval=3),
+        )
+        collector.samples = [
+            self.metric_sample(3.0, 0.0),
+            self.metric_sample(6.0, 0.05),
+            self.metric_sample(9.0, 0.10),
+            self.metric_sample(12.0, 0.0),
+            self.metric_sample(15.0, 0.08),
+        ]
+
+        summary = collector.summary("flowmind", 15.0)
+
+        self.assertEqual(summary["spillback_free_time_share"], 0.4)
+        self.assertEqual(summary["spillback_episode_count"], 2)
+
+    def test_spillback_summary_is_unavailable_without_outgoing_observations(
+        self,
+    ) -> None:
+        collector = MetricsCollector(
+            FakeTraci(),
+            AreaModel(()),
+            ControlConfig(decision_interval=3),
+        )
+        collector.samples = [
+            self.metric_sample(3.0, None),
+            self.metric_sample(6.0, None),
+        ]
+
+        summary = collector.summary("local", 6.0)
+
+        self.assertIsNone(summary["spillback_free_time_share"])
+        self.assertIsNone(summary["spillback_episode_count"])
 
     def test_fractional_steps_do_not_duplicate_metric_samples(self) -> None:
         collector = MetricsCollector(

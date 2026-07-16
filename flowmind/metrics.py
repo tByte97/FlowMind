@@ -301,6 +301,10 @@ class MetricsCollector:
             for sample in self.samples
             if sample.blocked_outgoing_share is not None
         ]
+        (
+            spillback_free_time_share,
+            spillback_episode_count,
+        ) = self._spillback_summary(simulated_duration)
         censored = self._censored_trip_outcomes(simulated_duration)
         boundary_available = self._boundary_available
         result = {
@@ -359,6 +363,8 @@ class MetricsCollector:
             )
             if blocked_values
             else None,
+            "spillback_free_time_share": spillback_free_time_share,
+            "spillback_episode_count": spillback_episode_count,
             "emergency_departure_time": self._priority_departed,
             "emergency_arrival_time": self._priority_arrived,
             "emergency_eta": self._priority_eta,
@@ -372,6 +378,50 @@ class MetricsCollector:
             result.update(self._zone_boundary.as_summary())
         result.update(self._civilian_impact_summary())
         return result
+
+    def _spillback_summary(
+        self,
+        simulated_duration: float,
+    ) -> tuple[float | None, int | None]:
+        """Return time without blocked outgoing lanes and observed episodes."""
+
+        duration = max(float(simulated_duration), 0.0)
+        observed_duration = 0.0
+        free_duration = 0.0
+        episode_count = 0
+        previous_time = 0.0
+        previous_blocked: bool | None = None
+        latest_blocked: bool | None = None
+
+        for sample in self.samples:
+            sample_time = min(max(float(sample.time), previous_time), duration)
+            interval = max(sample_time - previous_time, 0.0)
+            share = sample.blocked_outgoing_share
+            if share is None:
+                previous_blocked = None
+                latest_blocked = None
+            else:
+                blocked = float(share) > 0.0
+                observed_duration += interval
+                if not blocked:
+                    free_duration += interval
+                if blocked and previous_blocked is not True:
+                    episode_count += 1
+                previous_blocked = blocked
+                latest_blocked = blocked
+            previous_time = sample_time
+            if sample_time >= duration:
+                break
+
+        if previous_time < duration and latest_blocked is not None:
+            interval = duration - previous_time
+            observed_duration += interval
+            if not latest_blocked:
+                free_duration += interval
+
+        if observed_duration <= 0.0:
+            return None, None
+        return round(free_duration / observed_duration, 4), episode_count
 
     @property
     def _boundary_available(self) -> bool:

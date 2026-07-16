@@ -13,6 +13,10 @@ class ZonePhaseChoice:
     tls_id: str
     phase_index: int
     joint_objective: float
+    local_phase_index: int
+    coordination_gain: float = 0.0
+    local_score_loss: float = 0.0
+    is_override: bool = False
 
 
 def optimize_zone_phases(
@@ -21,6 +25,8 @@ def optimize_zone_phases(
     snapshot: AreaDecisionSnapshot,
     scores_by_tls: dict[str, tuple[PhaseScore, ...]],
     config: ControlConfig,
+    *,
+    current_phase_by_tls: dict[str, int] | None = None,
 ) -> dict[str, ZonePhaseChoice]:
     """Coordinate phase targets over the whole zone.
 
@@ -29,6 +35,10 @@ def optimize_zone_phases(
     area snapshot without changing the optimizer.
     """
 
+    intersections = {
+        intersection.tls_id: intersection
+        for intersection in area.intersections
+    }
     candidates = {
         tls_id: tuple(item.phase_index for item in scores)
         for tls_id, scores in scores_by_tls.items()
@@ -39,20 +49,59 @@ def optimize_zone_phases(
         for tls_id, scores in scores_by_tls.items()
         for item in scores
     }
-    assignment = {
+    local_assignment = {
         tls_id: max(
             phases,
             key=lambda phase: (score_lookup[(tls_id, phase)], -phase),
         )
         for tls_id, phases in candidates.items()
     }
+    if current_phase_by_tls is not None:
+        # The controller deliberately permits zone coordination to hold an
+        # already-green phase, but never to request an earlier switch. Keep
+        # the optimizer's feasible set identical to that actuation contract;
+        # otherwise an ignored non-current phase can distort the joint
+        # assignment or consume the per-step override budget.
+        candidates = {
+            tls_id: tuple(
+                phase
+                for phase in phases
+                if phase
+                in {
+                    local_assignment[tls_id],
+                    current_phase_by_tls.get(tls_id),
+                }
+            )
+            for tls_id, phases in candidates.items()
+        }
+    assignment = dict(local_assignment)
     if not assignment:
         return {}
 
-    intersections = {
-        intersection.tls_id: intersection
-        for intersection in area.intersections
+    fixed_assignment = {
+        tls_id: int(phase_index)
+        for tls_id, phase_index in (current_phase_by_tls or {}).items()
+        if (
+            tls_id not in assignment
+            and (intersection := intersections.get(tls_id)) is not None
+            and 0 <= int(phase_index) < len(intersection.phases)
+        )
     }
+    for tls_id, phase_index in fixed_assignment.items():
+        score_lookup[(tls_id, phase_index)] = 0.0
+
+    def objective(candidate_assignment: dict[str, int]) -> float:
+        full_assignment = dict(fixed_assignment)
+        full_assignment.update(candidate_assignment)
+        return _joint_objective(
+            full_assignment,
+            intersections,
+            graph,
+            snapshot,
+            score_lookup,
+            config,
+        )
+
     # Deterministic coordinate descent captures pairwise corridor coupling
     # without an exponential product of phase combinations for 20+ TLS.
     for _iteration in range(4):
@@ -63,14 +112,7 @@ def optimize_zone_phases(
             for phase_index in candidates[tls_id]:
                 trial = dict(assignment)
                 trial[tls_id] = phase_index
-                value = _joint_objective(
-                    trial,
-                    intersections,
-                    graph,
-                    snapshot,
-                    score_lookup,
-                    config,
-                )
+                value = objective(trial)
                 if value > best_value + 1e-9 or (
                     abs(value - best_value) <= 1e-9
                     and phase_index < best_phase
@@ -83,16 +125,81 @@ def optimize_zone_phases(
         if not changed:
             break
 
-    objective = _joint_objective(
-        assignment,
-        intersections,
-        graph,
-        snapshot,
-        score_lookup,
-        config,
-    )
+    def validated_overrides() -> tuple[
+        dict[str, tuple[float, float]],
+        tuple[str, ...],
+    ]:
+        diagnostics: dict[str, tuple[float, float]] = {}
+        rejected: list[str] = []
+        current_objective = objective(assignment)
+        for tls_id, phase_index in assignment.items():
+            local_phase = local_assignment[tls_id]
+            if phase_index == local_phase:
+                continue
+            local_trial = dict(assignment)
+            local_trial[tls_id] = local_phase
+            gain = current_objective - objective(local_trial)
+            local_loss = max(
+                score_lookup[(tls_id, local_phase)]
+                - score_lookup[(tls_id, phase_index)],
+                0.0,
+            )
+            if (
+                gain + 1e-9 < float(config.zone_override_min_gain)
+                or local_loss
+                > float(config.zone_override_max_local_loss) + 1e-9
+            ):
+                rejected.append(tls_id)
+                continue
+            diagnostics[tls_id] = (gain, local_loss)
+        return diagnostics, tuple(rejected)
+
+    # Removing a weak override changes the joint objective seen by every
+    # remaining override. Revalidate until the assignment is stable rather
+    # than publishing stale coordination gains.
+    while True:
+        override_diagnostics, rejected_overrides = validated_overrides()
+        if not rejected_overrides:
+            break
+        for tls_id in rejected_overrides:
+            assignment[tls_id] = local_assignment[tls_id]
+
+    allowed_overrides = max(int(config.max_zone_overrides_per_step), 0)
+    if len(override_diagnostics) > allowed_overrides:
+        keep = {
+            tls_id
+            for tls_id, _values in sorted(
+                override_diagnostics.items(),
+                key=lambda item: (-item[1][0], item[1][1], item[0]),
+            )[:allowed_overrides]
+        }
+        for tls_id in tuple(override_diagnostics):
+            if tls_id in keep:
+                continue
+            assignment[tls_id] = local_assignment[tls_id]
+
+        # The cap can remove a complementary phase that supplied most of a
+        # kept override's joint gain. Recompute against the final capped
+        # assignment and conservatively discard any override that no longer
+        # clears the configured threshold.
+        while True:
+            override_diagnostics, rejected_overrides = validated_overrides()
+            if not rejected_overrides:
+                break
+            for tls_id in rejected_overrides:
+                assignment[tls_id] = local_assignment[tls_id]
+
+    joint_objective = objective(assignment)
     return {
-        tls_id: ZonePhaseChoice(tls_id, phase_index, objective)
+        tls_id: ZonePhaseChoice(
+            tls_id=tls_id,
+            phase_index=phase_index,
+            joint_objective=joint_objective,
+            local_phase_index=local_assignment[tls_id],
+            coordination_gain=override_diagnostics.get(tls_id, (0.0, 0.0))[0],
+            local_score_loss=override_diagnostics.get(tls_id, (0.0, 0.0))[1],
+            is_override=tls_id in override_diagnostics,
+        )
         for tls_id, phase_index in assignment.items()
     }
 
@@ -159,26 +266,35 @@ def _segment_coordination_value(
         snapshot.platoon_arrival_by_incoming_lane.get(lane_id, 0.0)
         for lane_id in segment.downstream_incoming_lanes
     )
-    horizon = float(config.coordination_horizon_seconds)
-    travel_seconds = float(segment.length_meters) / 13.9
-    horizon_factor = max(0.0, 1.0 - travel_seconds / horizon)
-    storage_ratio = state.free_slots / max(state.capacity_slots, 1.0)
     risk = max(min(state.spillback_probability, 1.0), 0.0)
+    platoon_strength = max(
+        min(
+            incoming_platoon
+            / max(state.capacity_slots * 0.25, 1.0),
+            1.0,
+        ),
+        0.0,
+    )
+    safe_receiving = 1.0 - risk
     weight = float(config.zone_coordination_weight)
 
-    if releases and receives:
-        return weight * horizon_factor * (
-            min(incoming_platoon + state.occupied_slots, state.capacity_slots)
-            * max(storage_ratio, 0.05)
-            - risk * config.objective_spillback_weight
-        )
-    if releases:
-        return -weight * (
-            risk * config.objective_spillback_weight
-            + incoming_platoon * max(horizon_factor, 0.25)
-        )
     if receives:
-        return weight * incoming_platoon * horizon_factor * 0.5
+        # The platoon estimate describes vehicles already travelling on this
+        # segment. Keeping its downstream green is useful even when the
+        # upstream TLS is not releasing more vehicles in the same decision
+        # step; discounting that case made useful green-wave holds too rare.
+        return weight * platoon_strength * safe_receiving
+    if (
+        releases
+        and risk >= float(config.spillback_hard_gate_probability)
+    ):
+        # Do not suppress an upstream discharge merely because vehicles are
+        # already travelling along the segment: that platoon belongs to the
+        # downstream receiving decision and may be tens of seconds away.
+        # A release penalty is reserved for physically severe storage risk;
+        # ordinary probabilistic risk remains a soft diagnostic and the
+        # movement-mask layer retains the final safety authority.
+        return -weight * risk
     return 0.0
 
 
