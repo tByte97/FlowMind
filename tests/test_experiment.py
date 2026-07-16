@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import ast
+import inspect
 import json
 import os
 import unittest
@@ -18,6 +20,31 @@ from flowmind.tls_safety import TlsSafetyReport
 
 
 class ExperimentEnvironmentTest(unittest.TestCase):
+    def test_live_status_builder_call_sites_match_signature(self) -> None:
+        tree = ast.parse(inspect.getsource(experiment.run_experiment))
+        accepted_keywords = set(
+            inspect.signature(
+                experiment.build_live_system_status
+            ).parameters
+        )
+        call_keywords = [
+            {
+                keyword.arg
+                for keyword in node.keywords
+                if keyword.arg is not None
+            }
+            for node in ast.walk(tree)
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "build_live_system_status"
+            )
+        ]
+
+        self.assertGreaterEqual(len(call_keywords), 2)
+        for keywords in call_keywords:
+            self.assertLessEqual(keywords, accepted_keywords)
+
     def test_telemetry_failures_are_isolated_from_control_loop(self) -> None:
         class BrokenPublisher:
             @staticmethod

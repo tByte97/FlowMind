@@ -1116,7 +1116,6 @@ def run_experiment(config: RunConfig) -> dict[str, object]:
                 active_tls_programs=active_tls_programs,
                 tls_safety_report=tls_safety_report,
                 area_graph=area_graph,
-                demand_profile=config.demand_profile,
                 running=False,
             ),
             decision_log=build_decision_log(
