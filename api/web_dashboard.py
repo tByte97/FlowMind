@@ -70,6 +70,12 @@ AVERAGE_METRICS = {
     "sensor_range_meters": "Радіус датчиків, м",
     "simulated_duration": "Тривалість, с",
 }
+PAIRED_BENCHMARK_MODES = (
+    "static_fixed",
+    "sumo_actuated",
+    "local",
+    "flowmind",
+)
 
 
 def _python_executable() -> Path:
@@ -259,6 +265,150 @@ def primary_summary_for_result(result_dir: Path) -> dict[str, Any]:
     return {}
 
 
+def _paired_report_rank(
+    path: Path,
+    report: dict[str, Any],
+) -> tuple[int, int, int, int, float]:
+    preferred_id = os.environ.get("FLOWMIND_DASHBOARD_EVALUATION_ID", "").strip()
+    evaluation_id = str(report.get("evaluation_id") or path.parent.name)
+    final_benchmark = not bool(report.get("not_a_final_benchmark", False))
+    emergency_evaluated = bool(report.get("emergency_route_evaluated", False))
+    valid_pairs = int(report.get("valid_pair_count") or 0)
+    return (
+        int(bool(preferred_id and evaluation_id == preferred_id)),
+        int(final_benchmark),
+        int(emergency_evaluated),
+        valid_pairs,
+        _safe_stat_mtime(path),
+    )
+
+
+def _summary_matches_pair(
+    summary: dict[str, Any],
+    pair: dict[str, Any],
+    mode: str,
+    *,
+    emergency_route_evaluated: bool,
+) -> bool:
+    if str(summary.get("mode")) != mode:
+        return False
+    expected_pair_id = str(pair.get("pair_id") or "")
+    actual_pair_id = str(summary.get("evaluation_pair_id") or "")
+    if actual_pair_id and expected_pair_id and actual_pair_id != expected_pair_id:
+        return False
+    expected_seed = pair.get("seed")
+    if expected_seed is not None and summary.get("seed") is not None:
+        if int(summary["seed"]) != int(expected_seed):
+            return False
+    expected_config = str(pair.get("pair_config_sha256") or "")
+    actual_config = str(summary.get("pair_config_sha256") or "")
+    if expected_config and actual_config != expected_config:
+        return False
+    if emergency_route_evaluated:
+        expected_route = str(pair.get("emergency_route_sha256") or "")
+        actual_route = str(summary.get("emergency_route_sha256") or "")
+        if expected_route and actual_route != expected_route:
+            return False
+    return True
+
+
+def _paired_evaluation_rows(
+    base_dir: Path,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    reports: list[tuple[Path, dict[str, Any]]] = []
+    for path in base_dir.glob("evaluation/*/evaluation_report.json"):
+        report = _read_json(path)
+        required_modes = set(report.get("required_modes") or ())
+        if (
+            int(report.get("valid_pair_count") or 0) > 0
+            and "static_fixed" in required_modes
+            and "flowmind" in required_modes
+        ):
+            reports.append((path, report))
+    reports.sort(
+        key=lambda item: _paired_report_rank(item[0], item[1]),
+        reverse=True,
+    )
+
+    for report_path, report in reports:
+        evaluation_dir = report_path.parent
+        valid_pairs = report.get("valid_pairs")
+        if not isinstance(valid_pairs, list) or not valid_pairs:
+            continue
+        requested_modes = [
+            mode
+            for mode in PAIRED_BENCHMARK_MODES
+            if mode in set(report.get("required_modes") or ())
+        ]
+        summaries_by_pair: list[dict[str, dict[str, Any]]] = []
+        emergency_evaluated = bool(report.get("emergency_route_evaluated", False))
+        for pair in valid_pairs:
+            if not isinstance(pair, dict):
+                continue
+            try:
+                replicate = int(pair["replicate"])
+                seed = int(pair["seed"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            pair_dir = evaluation_dir / f"pair_{replicate:03d}_seed_{seed}"
+            pair_summaries: dict[str, dict[str, Any]] = {}
+            for mode in requested_modes:
+                summary = _read_json(pair_dir / mode / f"{mode}_summary.json")
+                if _summary_matches_pair(
+                    summary,
+                    pair,
+                    mode,
+                    emergency_route_evaluated=emergency_evaluated,
+                ):
+                    pair_summaries[mode] = summary
+            if "static_fixed" in pair_summaries and "flowmind" in pair_summaries:
+                summaries_by_pair.append(pair_summaries)
+
+        if not summaries_by_pair:
+            continue
+
+        excluded_modes: dict[str, str] = {}
+        included_modes = [
+            mode
+            for mode in requested_modes
+            if all(mode in pair for pair in summaries_by_pair)
+        ]
+        if "sumo_actuated" in included_modes:
+            coverage_complete = all(
+                pair["sumo_actuated"].get("actuated_detector_coverage_complete")
+                is True
+                for pair in summaries_by_pair
+            )
+            if not coverage_complete:
+                included_modes.remove("sumo_actuated")
+                excluded_modes["sumo_actuated"] = (
+                    "incomplete actuated detector coverage"
+                )
+
+        rows = [
+            pair[mode]
+            for pair in summaries_by_pair
+            for mode in included_modes
+        ]
+        if not rows:
+            continue
+        return rows, {
+            "scope": "paired_evaluation",
+            "evaluation_id": str(report.get("evaluation_id") or evaluation_dir.name),
+            "report_path": _display_path(report_path),
+            "pair_count": len(summaries_by_pair),
+            "reported_valid_pair_count": int(report.get("valid_pair_count") or 0),
+            "included_modes": included_modes,
+            "excluded_modes": excluded_modes,
+            "emergency_route_evaluated": emergency_evaluated,
+            "overall_status": report.get("overall_status"),
+            "validation_profile": report.get("validation_profile"),
+            "not_a_final_benchmark": bool(report.get("not_a_final_benchmark", False)),
+            "same_seed_and_scenario": True,
+        }
+    return [], {}
+
+
 def find_latest_live_status(
     base_dir: Path = RESULTS_DIR,
     preferred_dir: Path | None = None,
@@ -401,23 +551,39 @@ def build_result_detail_payload(result_id: str) -> dict[str, Any]:
 
 
 def build_averages_payload(base_dir: Path = RESULTS_DIR) -> dict[str, Any]:
+    discovered_results = discover_result_sets(base_dir)
+    paired_rows, benchmark = _paired_evaluation_rows(base_dir)
     grouped: dict[str, dict[str, list[float]]] = {}
     result_count_by_mode: dict[str, int] = {}
     total_rows = 0
-    for result in discover_result_sets(base_dir):
-        path = result.get("path")
-        if not isinstance(path, str):
-            continue
-        result_dir = PROJECT_ROOT / path
-        for row in summary_rows_for_result(result_dir):
-            mode = str(row.get("mode") or result.get("mode") or "unknown")
-            total_rows += 1
-            result_count_by_mode[mode] = result_count_by_mode.get(mode, 0) + 1
-            metrics = grouped.setdefault(mode, {})
-            for key in AVERAGE_METRICS:
-                value = _as_float(row.get(key))
-                if value is not None:
-                    metrics.setdefault(key, []).append(value)
+    if paired_rows:
+        rows_with_modes = [
+            (row, str(row.get("mode") or "unknown"))
+            for row in paired_rows
+        ]
+    else:
+        rows_with_modes = []
+        for result in discovered_results:
+            path = result.get("path")
+            if not isinstance(path, str):
+                continue
+            result_dir = PROJECT_ROOT / path
+            rows_with_modes.extend(
+                (
+                    row,
+                    str(row.get("mode") or result.get("mode") or "unknown"),
+                )
+                for row in summary_rows_for_result(result_dir)
+            )
+
+    for row, mode in rows_with_modes:
+        total_rows += 1
+        result_count_by_mode[mode] = result_count_by_mode.get(mode, 0) + 1
+        metrics = grouped.setdefault(mode, {})
+        for key in AVERAGE_METRICS:
+            value = _as_float(row.get(key))
+            if value is not None:
+                metrics.setdefault(key, []).append(value)
 
     modes: list[dict[str, Any]] = []
     for mode, metric_values in grouped.items():
@@ -445,7 +611,10 @@ def build_averages_payload(base_dir: Path = RESULTS_DIR) -> dict[str, Any]:
         "modes": modes,
         "metrics": AVERAGE_METRICS,
         "total_rows": total_rows,
-        "total_results": len(discover_result_sets(base_dir)),
+        "total_results": total_rows if paired_rows else len(discovered_results),
+        "historical_result_count": len(discovered_results),
+        "scope": "paired_evaluation" if paired_rows else "historical_all_runs",
+        "benchmark": benchmark,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -4469,6 +4638,15 @@ AVERAGES_PAGE = r"""<!doctype html>
       font-weight: 650;
     }
     .empty { color: var(--muted); padding: 18px; border: 1px dashed var(--line); border-radius: 8px; background: var(--panel-soft); }
+    .scope-note {
+      margin-bottom: 16px;
+      padding: 11px 13px;
+      border: 1px solid rgba(77, 223, 212, .35);
+      border-radius: 8px;
+      background: rgba(77, 223, 212, .08);
+      color: #c7d1df;
+    }
+    .scope-note strong { color: var(--ink); }
     @media (max-width: 900px) {
       .topbar { grid-template-columns: 1fr; }
       .cards { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -4489,7 +4667,7 @@ AVERAGES_PAGE = r"""<!doctype html>
           <div class="mark" aria-hidden="true"></div>
           <div>
             <h1>FlowMind Averages</h1>
-            <p class="subtitle">Порівняння static fixed, SUMO actuated, local і FlowMind по збережених симуляціях.</p>
+            <p class="subtitle">Чесне порівняння режимів на однакових paired seed, сценаріях і маршрутах швидкої.</p>
           </div>
         </div>
         <nav class="nav" aria-label="Averages navigation">
@@ -4500,11 +4678,12 @@ AVERAGES_PAGE = r"""<!doctype html>
         </nav>
       </div>
       <div class="status-line">
-        <span class="tag good">Metrics</span>
+        <span class="tag good" id="scopeTag">Paired metrics</span>
         <span class="tag" id="totalTag">0 результатів</span>
       </div>
     </header>
 
+    <div class="scope-note" id="scopeNote">Завантаження scope benchmark...</div>
     <section class="cards" id="overview"></section>
     <div id="comparison"></div>
     <div id="modeSections"></div>
@@ -4588,7 +4767,7 @@ AVERAGES_PAGE = r"""<!doctype html>
       if (!delta) return `<span class="delta">немає</span>`;
       return `<span class="delta ${delta.kind}">${delta.label}</span>`;
     }
-    function renderModeCard(mode, fixedMode, winners) {
+    function renderModeCard(mode, fixedMode, winners, paired = false) {
       const stats = keyMetrics.slice(0, 4).map(metric => {
         const value = metricValue(mode, metric.key);
         const winner = winners[metric.key] === mode.mode;
@@ -4603,13 +4782,13 @@ AVERAGES_PAGE = r"""<!doctype html>
       return `<article class="mode-card ${modeClass(mode.mode)}">
         <div class="section-header" style="padding:0;border:0;background:transparent;">
           <h3>${modeLabels[mode.mode] || mode.mode}</h3>
-          <span class="tag">${mode.count || 0} запусків</span>
+          <span class="tag">${mode.count || 0} ${paired ? "пар" : "запусків"}</span>
         </div>
         ${stats}
         <div class="mode-stat"><span>Очікування vs static fixed</span><strong>${deltas}</strong></div>
       </article>`;
     }
-    function renderComparison(modes) {
+    function renderComparison(modes, benchmark = {}) {
       const ordered = orderedModes(modes);
       const map = byMode(ordered);
       const fixedMode = map.static_fixed || map.fixed || null;
@@ -4621,10 +4800,10 @@ AVERAGES_PAGE = r"""<!doctype html>
         "sumo_actuated",
         "local",
         "flowmind",
-      ];
+      ].filter((modeName, index, values) => map[modeName] && values.indexOf(modeName) === index);
       const winners = Object.fromEntries(keyMetrics.map(metric => [metric.key, bestModeFor(comparable, metric)]));
       const cards = comparable.length
-        ? `<div class="compare-grid">${comparable.map(mode => renderModeCard(mode, fixedMode, winners)).join("")}</div>`
+        ? `<div class="compare-grid">${comparable.map(mode => renderModeCard(mode, fixedMode, winners, benchmark.scope === "paired_evaluation")).join("")}</div>`
         : "";
       const rows = keyMetrics.map(metric => {
         const best = winners[metric.key];
@@ -4646,7 +4825,7 @@ AVERAGES_PAGE = r"""<!doctype html>
       return `<section class="section">
         <div class="section-header">
           <h2>Порівняння режимів</h2>
-          <span class="tag good">Static Fixed = baseline</span>
+          <span class="tag good">${benchmark.pair_count ? `${benchmark.pair_count} paired seeds` : "Static Fixed = baseline"}</span>
         </div>
         <div class="section-body">
           ${cards}
@@ -4687,7 +4866,18 @@ AVERAGES_PAGE = r"""<!doctype html>
     }
     async function loadAverages() {
       const payload = await api("/api/averages");
-      $("totalTag").textContent = `${payload.total_results || 0} результатів`;
+      const benchmark = payload.benchmark || {};
+      const paired = payload.scope === "paired_evaluation";
+      $("scopeTag").textContent = paired ? "Paired benchmark" : "Historical aggregate";
+      $("totalTag").textContent = paired
+        ? `${benchmark.pair_count || 0} paired seeds`
+        : `${payload.total_results || 0} результатів`;
+      const excluded = Object.entries(benchmark.excluded_modes || {})
+        .map(([mode, reason]) => `${mode}: ${reason}`)
+        .join("; ");
+      $("scopeNote").innerHTML = paired
+        ? `<strong>${benchmark.evaluation_id || "paired evaluation"}</strong>: показано ${benchmark.pair_count || 0} повних пар з однаковими seed, scenario і emergency route. Старі та непарні прогони не впливають на середні.${excluded ? ` Виключено ${excluded}.` : ""}${benchmark.not_a_final_benchmark ? " Це preflight, а не фінальний benchmark." : ""}`
+        : `<strong>Historical aggregate:</strong> paired evaluation не знайдено, тому показано всі сумісні summary rows.`;
       const modes = orderedModes(payload.modes || []);
       const flowmind = modes.find(item => item.mode === "flowmind") || { metrics: {} };
       const fixed = modes.find(item => item.mode === "static_fixed")
@@ -4700,12 +4890,12 @@ AVERAGES_PAGE = r"""<!doctype html>
       const improvement = fixedWait && wait ? ((fixedWait - wait) / fixedWait) * 100 : null;
       const localImprovement = fixedWait && localWait ? ((fixedWait - localWait) / fixedWait) * 100 : null;
       $("overview").innerHTML = [
-        card("Усього результатів", fmt(payload.total_results, "", 0), `${payload.total_rows || 0} summary rows`),
+        card(paired ? "Paired seeds" : "Усього результатів", fmt(paired ? benchmark.pair_count : payload.total_results, "", 0), paired ? `${payload.total_rows || 0} mode summaries` : `${payload.total_rows || 0} summary rows`),
         card("Режимів", fmt(modes.length, "", 0), modes.map(item => item.mode).join(", ")),
         card("FlowMind vs static fixed", improvement == null ? "немає" : fmt(improvement, "%"), `очікування: ${fmt(wait, " с")}`),
         card("Local vs static fixed", localImprovement == null ? "немає" : fmt(localImprovement, "%"), `очікування: ${fmt(localWait, " с")}`),
       ].join("");
-      $("comparison").innerHTML = modes.length ? renderComparison(modes) : `<div class="empty">Немає summary.csv для агрегації.</div>`;
+      $("comparison").innerHTML = modes.length ? renderComparison(modes, benchmark) : `<div class="empty">Немає paired summaries для агрегації.</div>`;
       $("modeSections").innerHTML = modes.length ? `<section class="section">
         <div class="section-header">
           <h2>Деталізація середніх</h2>

@@ -287,6 +287,81 @@ class WebDashboardApiTests(unittest.TestCase):
         )
         self.assertEqual(by_mode["fixed"]["count"], 1)
 
+    def test_averages_prefers_complete_paired_evaluation_over_old_runs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            old_run = root / "old_aggressive_flowmind"
+            old_run.mkdir()
+            (old_run / "summary.csv").write_text(
+                "mode,average_waiting_time,throughput\nflowmind,100,50\n",
+                encoding="utf-8",
+            )
+
+            evaluation = root / "evaluation" / "defense_v1"
+            pair_dir = evaluation / "pair_001_seed_42"
+            pair = {
+                "pair_id": "defense_v1:pair:001",
+                "replicate": 1,
+                "seed": 42,
+                "pair_config_sha256": "paired-config",
+                "emergency_route_sha256": "paired-route",
+            }
+            for mode, wait, throughput in (
+                ("static_fixed", 40, 100),
+                ("sumo_actuated", 35, 110),
+                ("local", 32, 120),
+                ("flowmind", 30, 125),
+            ):
+                mode_dir = pair_dir / mode
+                mode_dir.mkdir(parents=True)
+                summary = {
+                    "mode": mode,
+                    "seed": 42,
+                    "evaluation_pair_id": pair["pair_id"],
+                    "pair_config_sha256": pair["pair_config_sha256"],
+                    "emergency_route_sha256": pair["emergency_route_sha256"],
+                    "average_waiting_time": wait,
+                    "throughput": throughput,
+                }
+                if mode == "sumo_actuated":
+                    summary["actuated_detector_coverage_complete"] = False
+                (mode_dir / f"{mode}_summary.json").write_text(
+                    json.dumps(summary),
+                    encoding="utf-8",
+                )
+            evaluation.mkdir(parents=True, exist_ok=True)
+            (evaluation / "evaluation_report.json").write_text(
+                json.dumps(
+                    {
+                        "evaluation_id": "defense_v1",
+                        "required_modes": [
+                            "static_fixed",
+                            "sumo_actuated",
+                            "local",
+                            "flowmind",
+                        ],
+                        "valid_pair_count": 1,
+                        "valid_pairs": [pair],
+                        "emergency_route_evaluated": True,
+                        "overall_status": "complete",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            payload = web_dashboard.build_averages_payload(root)
+
+        by_mode = {item["mode"]: item for item in payload["modes"]}
+        self.assertEqual(payload["scope"], "paired_evaluation")
+        self.assertEqual(payload["benchmark"]["pair_count"], 1)
+        self.assertEqual(payload["historical_result_count"], 1)
+        self.assertEqual(set(by_mode), {"static_fixed", "local", "flowmind"})
+        self.assertEqual(
+            by_mode["flowmind"]["metrics"]["average_waiting_time"]["average"],
+            30.0,
+        )
+        self.assertIn("sumo_actuated", payload["benchmark"]["excluded_modes"])
+
     def test_summary_context_prefers_static_fixed_over_legacy_fixed(self) -> None:
         context = web_dashboard.build_summary_context(
             {
