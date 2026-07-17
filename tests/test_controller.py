@@ -1,0 +1,716 @@
+from __future__ import annotations
+
+import unittest
+from unittest.mock import patch
+
+from flowmind.area_model import AreaModel, ControlledLink, Intersection
+from flowmind.config import ControlConfig
+from flowmind.controller import AreaSignalController, PreparedIntersectionDecision
+from flowmind.corridor_manager import CorridorManager, CorridorState
+from flowmind.queue_forecast import ForecastDiagnostics
+from flowmind.safety_validator import SafetyDecision
+from flowmind.signal_policy import PhaseScore
+from flowmind.traffic_state import LaneState, TrafficState
+from flowmind.zone_graph import (
+    AreaGraph,
+    IntersectionStorage,
+    ZoneDefinition,
+    ZoneIntersection,
+)
+
+
+class FakeLaneDomain:
+    counts = {"north": 0, "south": 0, "east": 10, "west": 0}
+
+    def __init__(self) -> None:
+        self.fail = False
+
+    def getLength(self, _lane_id: str) -> float:
+        if self.fail:
+            raise RuntimeError("sensor unavailable")
+        return 120.0
+
+    def getLastStepVehicleIDs(self, _lane_id: str) -> tuple[str, ...]:
+        return ()
+
+    def getLastStepVehicleNumber(self, lane_id: str) -> int:
+        return self.counts[lane_id]
+
+    def getLastStepHaltingNumber(self, lane_id: str) -> int:
+        return self.counts[lane_id]
+
+    def getLastStepOccupancy(self, lane_id: str) -> float:
+        return self.counts[lane_id] / 16.0 * 100.0
+
+    def getLastStepMeanSpeed(self, _lane_id: str) -> float:
+        return 0.0
+
+
+class FakeVehicleDomain:
+    def getIDList(self) -> tuple[str, ...]:
+        return ()
+
+
+class FakeTrafficLightDomain:
+    def __init__(self) -> None:
+        self.phase = 0
+        self.spent = 12.0
+        self.phase_durations: list[tuple[str, float]] = []
+        self.get_phase_calls = 0
+        self.programs: list[tuple[str, str]] = []
+
+    def getPhase(self, _tls_id: str) -> int:
+        self.get_phase_calls += 1
+        return self.phase
+
+    def getSpentDuration(self, _tls_id: str) -> float:
+        return self.spent
+
+    def setPhase(self, _tls_id: str, phase: int) -> None:
+        self.phase = phase
+
+    def setPhaseDuration(self, tls_id: str, duration: float) -> None:
+        self.phase_durations.append((tls_id, duration))
+
+    def setProgram(self, tls_id: str, program_id: str) -> None:
+        self.programs.append((tls_id, program_id))
+
+
+class FakeTraci:
+    def __init__(self) -> None:
+        self.lane = FakeLaneDomain()
+        self.vehicle = FakeVehicleDomain()
+        self.trafficlight = FakeTrafficLightDomain()
+
+
+class FakeQueueForecast:
+    def __init__(self, diagnostics: ForecastDiagnostics) -> None:
+        self.last_diagnostics = diagnostics
+        self.evaluation_horizon_seconds = 3
+        self.prediction_target = "target_incoming_queue_3s"
+
+    def predict_intersection(self, **_kwargs: object) -> dict[tuple[int, int], float]:
+        return {(0, 0): 1.0, (2, 1): 9.0}
+
+
+class AreaSignalControllerTest(unittest.TestCase):
+    @staticmethod
+    def area() -> AreaModel:
+        return AreaModel(
+            (
+                Intersection(
+                    tls_id="tls",
+                    position=(0.0, 0.0),
+                    phases=("Gr", "yr", "rG", "ry"),
+                    links=(
+                        ControlledLink("north", "south", 0),
+                        ControlledLink("east", "west", 1),
+                    ),
+                    phase_durations=(6.0, 3.0, 6.0, 3.0),
+                    program_id="0",
+                ),
+            )
+        )
+
+    def area_graph(self) -> AreaGraph:
+        return AreaGraph(
+            zone=ZoneDefinition(
+                zone_id="test",
+                name="test",
+                intersections=(
+                    ZoneIntersection("tls", "tls", ("test-corridor",)),
+                ),
+                corridors=(),
+            ),
+            segments=(),
+            node_storage=(
+                IntersectionStorage("tls", ("south", "west"), 32.0),
+            ),
+        )
+
+    def test_entering_clearance_applies_real_sumo_phase_duration(self) -> None:
+        traci = FakeTraci()
+        controller = AreaSignalController(
+            traci,
+            self.area(),
+            "local",
+            ControlConfig(clearance_seconds=5),
+        )
+
+        controller.step(12.0)
+
+        self.assertEqual(traci.trafficlight.phase, 1)
+        self.assertEqual(traci.trafficlight.phase_durations, [("tls", 3.0)])
+
+    def test_zone_target_cannot_bypass_local_hysteresis(self) -> None:
+        traci = FakeTraci()
+        controller = AreaSignalController(
+            traci,
+            self.area(),
+            "flowmind",
+            ControlConfig(hysteresis=1.0),
+        )
+        decision = PreparedIntersectionDecision(
+            intersection=self.area().intersection("tls"),
+            current_phase=0,
+            spent=12.0,
+            max_green=60.0,
+            priority_link=None,
+            scores=(PhaseScore(0, 9.5), PhaseScore(2, 10.0)),
+            phase_masks={},
+        )
+
+        controller._apply_prepared_decision(  # type: ignore[attr-defined]
+            decision,
+            12.0,
+            target_phase=2,
+            coordination_gain=3.0,
+        )
+
+        self.assertEqual(traci.trafficlight.phase, 0)
+        self.assertEqual(traci.trafficlight.phase_durations, [("tls", 3.0)])
+        self.assertEqual(controller.stats.extensions, 1)
+        self.assertEqual(controller.stats.advances, 0)
+        self.assertEqual(controller.stats.zone_coordination_guarded_switches, 1)
+
+    def test_raw_flowmind_score_cannot_bypass_true_local_anchor(self) -> None:
+        traci = FakeTraci()
+        controller = AreaSignalController(
+            traci,
+            self.area(),
+            "flowmind",
+            ControlConfig(hysteresis=1.0),
+        )
+        decision = PreparedIntersectionDecision(
+            intersection=self.area().intersection("tls"),
+            current_phase=0,
+            spent=12.0,
+            max_green=60.0,
+            priority_link=None,
+            scores=(PhaseScore(0, 1.0), PhaseScore(2, 20.0)),
+            local_scores=(PhaseScore(0, 9.5), PhaseScore(2, 10.0)),
+            phase_masks={},
+        )
+
+        controller._apply_prepared_decision(  # type: ignore[attr-defined]
+            decision,
+            12.0,
+        )
+
+        self.assertEqual(traci.trafficlight.phase, 0)
+        self.assertEqual(controller.stats.extensions, 1)
+        self.assertEqual(controller.stats.advances, 0)
+
+    def test_skipped_tls_phase_is_passed_as_fixed_zone_context(self) -> None:
+        for phase, spent in ((1, 12.0), (0, 1.0)):
+            with self.subTest(phase=phase, spent=spent):
+                traci = FakeTraci()
+                traci.trafficlight.phase = phase
+                traci.trafficlight.spent = spent
+                controller = AreaSignalController(
+                    traci,
+                    self.area(),
+                    "flowmind",
+                    ControlConfig(),
+                    area_graph=self.area_graph(),
+                )
+
+                with patch(
+                    "flowmind.controller.optimize_zone_phases",
+                    return_value={},
+                ) as optimizer:
+                    controller.step(3.0)
+
+                self.assertEqual(
+                    optimizer.call_args.kwargs["current_phase_by_tls"],
+                    {"tls": phase},
+                )
+
+    def test_zone_target_can_switch_when_local_hysteresis_is_exceeded(self) -> None:
+        traci = FakeTraci()
+        controller = AreaSignalController(
+            traci,
+            self.area(),
+            "flowmind",
+            ControlConfig(hysteresis=1.0),
+        )
+        decision = PreparedIntersectionDecision(
+            intersection=self.area().intersection("tls"),
+            current_phase=0,
+            spent=12.0,
+            max_green=60.0,
+            priority_link=None,
+            scores=(PhaseScore(0, 7.0), PhaseScore(2, 10.0)),
+            phase_masks={},
+        )
+
+        controller._apply_prepared_decision(  # type: ignore[attr-defined]
+            decision,
+            12.0,
+            target_phase=2,
+            coordination_gain=3.0,
+        )
+
+        self.assertEqual(traci.trafficlight.phase, 1)
+        self.assertEqual(controller.stats.extensions, 0)
+        self.assertEqual(controller.stats.advances, 1)
+        self.assertEqual(controller.stats.zone_coordination_guarded_switches, 0)
+
+    def test_zone_can_hold_current_green_when_local_prefers_switch(self) -> None:
+        traci = FakeTraci()
+        controller = AreaSignalController(
+            traci,
+            self.area(),
+            "flowmind",
+            ControlConfig(hysteresis=1.0),
+        )
+        decision = PreparedIntersectionDecision(
+            intersection=self.area().intersection("tls"),
+            current_phase=0,
+            spent=12.0,
+            max_green=60.0,
+            priority_link=None,
+            scores=(PhaseScore(0, 8.5), PhaseScore(2, 10.0)),
+            phase_masks={},
+        )
+
+        controller._apply_prepared_decision(  # type: ignore[attr-defined]
+            decision,
+            12.0,
+            target_phase=0,
+            coordination_gain=4.0,
+        )
+
+        self.assertEqual(traci.trafficlight.phase, 0)
+        self.assertEqual(controller.stats.extensions, 1)
+        self.assertEqual(controller.stats.advances, 0)
+
+    def test_zone_hold_cannot_exceed_extra_green_budget(self) -> None:
+        traci = FakeTraci()
+        controller = AreaSignalController(
+            traci,
+            self.area(),
+            "flowmind",
+            ControlConfig(
+                hysteresis=1.0,
+                zone_hold_max_local_gap=2.0,
+                zone_hold_max_seconds=6.0,
+            ),
+        )
+        decision = PreparedIntersectionDecision(
+            intersection=self.area().intersection("tls"),
+            current_phase=0,
+            spent=12.0,
+            max_green=60.0,
+            priority_link=None,
+            scores=(PhaseScore(0, 8.5), PhaseScore(2, 10.0)),
+            phase_masks={},
+        )
+
+        controller._apply_prepared_decision(  # type: ignore[attr-defined]
+            decision,
+            12.0,
+            target_phase=0,
+            coordination_gain=4.0,
+        )
+        controller._apply_prepared_decision(  # type: ignore[attr-defined]
+            decision,
+            19.0,
+            target_phase=0,
+            coordination_gain=4.0,
+        )
+
+        self.assertEqual(controller.stats.extensions, 1)
+        self.assertEqual(controller.stats.advances, 1)
+        self.assertEqual(traci.trafficlight.phase, 1)
+
+    def test_all_blocked_candidates_close_current_green(self) -> None:
+        traci = FakeTraci()
+        traci.lane.counts = {
+            "north": 10,
+            "south": 16,
+            "east": 10,
+            "west": 16,
+        }
+        controller = AreaSignalController(
+            traci,
+            self.area(),
+            "flowmind",
+            ControlConfig(),
+        )
+
+        controller.step(12.0)
+
+        self.assertEqual(traci.trafficlight.phase, 1)
+        self.assertEqual(controller.stats.scoreless_skips, 1)
+        self.assertEqual(controller.stats.advances, 1)
+
+    def test_throughput_circuit_breaker_falls_back_and_recovers_per_tls(self) -> None:
+        controller = AreaSignalController(
+            FakeTraci(),
+            self.area(),
+            "flowmind",
+            ControlConfig(
+                throughput_fallback_enabled=True,
+                throughput_fallback_window_seconds=30,
+                throughput_fallback_queue_threshold=10,
+                throughput_fallback_min_discharge_rate=0.02,
+                throughput_fallback_confirmation_samples=2,
+                throughput_fallback_recovery_samples=2,
+            ),
+        )
+        intersection = self.area().intersection("tls")
+        traffic = TrafficState(
+            {
+                "north": LaneState(10, 10, 0.6, 0.0, 6.0),
+                "south": LaneState(0, 0, 0.0, 10.0, 16.0),
+                "east": LaneState(10, 10, 0.6, 0.0, 6.0),
+                "west": LaneState(0, 0, 0.0, 10.0, 16.0),
+            },
+            sample_time=33.0,
+        )
+        stalled = {
+            "north": {"discharge_rate_30s": 0.0},
+            "east": {"discharge_rate_30s": 0.0},
+        }
+
+        self.assertFalse(
+            controller._update_throughput_fallback(  # type: ignore[attr-defined]
+                intersection, traffic, stalled, 30.0
+            )
+        )
+        self.assertTrue(
+            controller._update_throughput_fallback(  # type: ignore[attr-defined]
+                intersection, traffic, stalled, 33.0
+            )
+        )
+        self.assertEqual(controller.stats.throughput_fallback_activations, 1)
+
+        recovered = {
+            "north": {"discharge_rate_30s": 0.2},
+            "east": {"discharge_rate_30s": 0.2},
+        }
+        self.assertTrue(
+            controller._update_throughput_fallback(  # type: ignore[attr-defined]
+                intersection, traffic, recovered, 36.0
+            )
+        )
+        self.assertFalse(
+            controller._update_throughput_fallback(  # type: ignore[attr-defined]
+                intersection, traffic, recovered, 39.0
+            )
+        )
+
+    def test_all_intersections_are_prepared_before_first_tls_write(self) -> None:
+        class MultiTrafficLightDomain:
+            def __init__(self) -> None:
+                self.events: list[str] = []
+                self.phases = {"tls-a": 0, "tls-b": 0}
+
+            def getPhase(self, tls_id: str) -> int:
+                self.events.append(f"read:{tls_id}")
+                return self.phases[tls_id]
+
+            def getSpentDuration(self, _tls_id: str) -> float:
+                return 12.0
+
+            def setPhase(self, tls_id: str, phase: int) -> None:
+                self.events.append(f"write:{tls_id}")
+                self.phases[tls_id] = phase
+
+            def setPhaseDuration(self, _tls_id: str, _duration: float) -> None:
+                return None
+
+        traci = FakeTraci()
+        traci.trafficlight = MultiTrafficLightDomain()
+        traci.lane.counts = {
+            "a-north": 0,
+            "a-south": 0,
+            "a-east": 10,
+            "a-west": 0,
+            "b-north": 0,
+            "b-south": 0,
+            "b-east": 10,
+            "b-west": 0,
+        }
+        area = AreaModel(
+            tuple(
+                Intersection(
+                    tls_id=f"tls-{suffix}",
+                    position=(0.0, 0.0),
+                    phases=("Gr", "yr", "rG", "ry"),
+                    links=(
+                        ControlledLink(f"{suffix}-north", f"{suffix}-south", 0),
+                        ControlledLink(f"{suffix}-east", f"{suffix}-west", 1),
+                    ),
+                )
+                for suffix in ("a", "b")
+            )
+        )
+        controller = AreaSignalController(
+            traci,
+            area,
+            "flowmind",
+            ControlConfig(),
+        )
+
+        controller.step(12.0)
+
+        events = traci.trafficlight.events
+        self.assertLess(events.index("read:tls-b"), events.index("write:tls-a"))
+        self.assertEqual(traci.trafficlight.phases, {"tls-a": 1, "tls-b": 1})
+
+    def test_fractional_steps_trigger_only_one_decision_per_interval(self) -> None:
+        traci = FakeTraci()
+        controller = AreaSignalController(
+            traci,
+            self.area(),
+            "local",
+            ControlConfig(decision_interval=3),
+        )
+
+        controller.step(3.1)
+        calls_after_first_tick = traci.trafficlight.get_phase_calls
+        controller.step(3.5)
+        controller.step(3.9)
+
+        self.assertEqual(calls_after_first_tick, 1)
+        self.assertEqual(traci.trafficlight.get_phase_calls, 1)
+
+    def test_invalid_sensor_state_activates_verified_program_fallback(self) -> None:
+        traci = FakeTraci()
+        traci.lane.fail = True
+        controller = AreaSignalController(
+            traci,
+            self.area(),
+            "flowmind",
+            ControlConfig(sensor_last_known_good_ttl=2.0),
+        )
+
+        controller.step(3.0)
+        controller.step(6.0)
+
+        self.assertEqual(controller.stats.fallback_activations, 1)
+        self.assertEqual(controller.stats.invalid_state_skips, 2)
+        self.assertGreater(controller.stats.sensor_failures, 0)
+        self.assertEqual(traci.trafficlight.programs, [("tls", "0")])
+        self.assertEqual(traci.trafficlight.get_phase_calls, 0)
+
+    def test_sensor_failure_falls_back_only_affected_tls(self) -> None:
+        class SelectiveLaneDomain(FakeLaneDomain):
+            counts = {
+                "a-north": 0,
+                "a-south": 0,
+                "a-east": 10,
+                "a-west": 0,
+                "b-north": 0,
+                "b-south": 0,
+                "b-east": 10,
+                "b-west": 0,
+            }
+
+            def getLength(self, lane_id: str) -> float:
+                if lane_id == "a-north":
+                    raise RuntimeError("camera a unavailable")
+                return 120.0
+
+        class MultiTrafficLightDomain:
+            def __init__(self) -> None:
+                self.phases = {"tls-a": 0, "tls-b": 0}
+                self.reads: list[str] = []
+                self.programs: list[tuple[str, str]] = []
+
+            def getPhase(self, tls_id: str) -> int:
+                self.reads.append(tls_id)
+                return self.phases[tls_id]
+
+            def getSpentDuration(self, _tls_id: str) -> float:
+                return 12.0
+
+            def setPhase(self, tls_id: str, phase: int) -> None:
+                self.phases[tls_id] = phase
+
+            def setPhaseDuration(self, _tls_id: str, _duration: float) -> None:
+                return None
+
+            def setProgram(self, tls_id: str, program_id: str) -> None:
+                self.programs.append((tls_id, program_id))
+
+        traci = FakeTraci()
+        traci.lane = SelectiveLaneDomain()
+        traci.trafficlight = MultiTrafficLightDomain()
+        area = AreaModel(
+            tuple(
+                Intersection(
+                    tls_id=f"tls-{suffix}",
+                    position=(0.0, 0.0),
+                    phases=("Gr", "yr", "rG", "ry"),
+                    links=(
+                        ControlledLink(f"{suffix}-north", f"{suffix}-south", 0),
+                        ControlledLink(f"{suffix}-east", f"{suffix}-west", 1),
+                    ),
+                    program_id="0",
+                )
+                for suffix in ("a", "b")
+            )
+        )
+        controller = AreaSignalController(
+            traci,
+            area,
+            "flowmind",
+            ControlConfig(),
+        )
+
+        controller.step(12.0)
+
+        self.assertEqual(traci.trafficlight.programs, [("tls-a", "0")])
+        self.assertNotIn("tls-a", traci.trafficlight.reads)
+        self.assertIn("tls-b", traci.trafficlight.reads)
+        self.assertEqual(traci.trafficlight.phases["tls-b"], 1)
+
+    def test_safety_rejection_reason_is_counted_and_logged(self) -> None:
+        class RejectingSafety:
+            @staticmethod
+            def validate_transition(*_args: object, **_kwargs: object) -> SafetyDecision:
+                return SafetyDecision(False, "test safety reason")
+
+        traci = FakeTraci()
+        controller = AreaSignalController(
+            traci,
+            self.area(),
+            "local",
+            ControlConfig(),
+        )
+        controller._safety = RejectingSafety()  # type: ignore[assignment]
+
+        controller.step(12.0)
+
+        self.assertEqual(controller.stats.safety_rejections, 1)
+        self.assertEqual(
+            controller.stats.safety_rejection_reasons,
+            {"test safety reason": 1},
+        )
+        self.assertEqual(
+            controller.stats.decision_events[-1].title,
+            "Safety відхилив команду",
+        )
+
+    def test_ml_shadow_predictions_are_measured_but_not_used(self) -> None:
+        traci = FakeTraci()
+        forecast = FakeQueueForecast(
+            ForecastDiagnostics("current_policy", 1.0, False, (), True)
+        )
+        controller = AreaSignalController(
+            traci,
+            self.area(),
+            "flowmind",
+            ControlConfig(queue_forecast_shadow_mode=True),
+            queue_forecast=forecast,  # type: ignore[arg-type]
+        )
+
+        controller.step(12.0)
+        controller.step(15.0)
+
+        self.assertEqual(controller.stats.queue_forecast_predictions, 2)
+        self.assertEqual(controller.stats.queue_forecast_shadow_predictions, 2)
+        self.assertEqual(controller.stats.queue_forecast_control_predictions, 0)
+        self.assertEqual(controller.stats.queue_forecast_shadow_evaluations, 1)
+        self.assertEqual(controller.stats.queue_forecast_shadow_mae, 1.0)
+        sample = controller.stats.queue_forecast_samples[0]
+        self.assertFalse(sample.used_for_control)
+        # Only the movement served by the observed phase is eligible for
+        # shadow validation; alternative phase predictions are counterfactual.
+        self.assertEqual(sample.observed_mean, 0.0)
+        self.assertEqual(sample.mean_absolute_error, 1.0)
+
+    def test_ood_forecast_is_gated_even_when_shadow_mode_is_disabled(self) -> None:
+        traci = FakeTraci()
+        forecast = FakeQueueForecast(
+            ForecastDiagnostics(
+                "current_policy",
+                0.4,
+                True,
+                ("unseen_lane",),
+                False,
+            )
+        )
+        controller = AreaSignalController(
+            traci,
+            self.area(),
+            "flowmind",
+            ControlConfig(queue_forecast_shadow_mode=False),
+            queue_forecast=forecast,  # type: ignore[arg-type]
+        )
+
+        controller.step(12.0)
+
+        self.assertEqual(controller.stats.queue_forecast_control_predictions, 0)
+        self.assertEqual(controller.stats.queue_forecast_ood_predictions, 2)
+        self.assertEqual(
+            controller.stats.queue_forecast_rejection_reasons,
+            {"unseen_lane": 1, "confidence_below_threshold": 1},
+        )
+
+    def test_emergency_override_is_hard_gated_by_downstream_storage(self) -> None:
+        traci = FakeTraci()
+        traci.lane.counts = {
+            "north": 0,
+            "south": 0,
+            "east": 10,
+            "west": 16,
+        }
+        manager = CorridorManager("ambulance")
+        manager.step(
+            10.0,
+            vehicle_in_network=True,
+            next_tls_info=("tls", 1, 100.0),
+        )
+        controller = AreaSignalController(
+            traci,
+            self.area(),
+            "flowmind",
+            ControlConfig(),
+        )
+        controller.set_corridor_manager(manager)
+
+        controller.step(12.0)
+
+        self.assertEqual(controller.stats.priority_decisions, 0)
+        self.assertEqual(controller.stats.corridor_downstream_blocks, 1)
+        self.assertEqual(manager.downstream_block_count, 1)
+        self.assertIn(
+            "downstream storage or graph spillback is blocked",
+            manager.downstream_block_reasons,
+        )
+
+    def test_recovery_restores_captured_phase_offset(self) -> None:
+        traci = FakeTraci()
+        traci.trafficlight.spent = 2.0
+        manager = CorridorManager("ambulance")
+        manager.state = CorridorState.RECOVERY
+        manager.affected_tls = ["tls"]
+        manager.recovery_tls = ["tls"]
+        controller = AreaSignalController(
+            traci,
+            self.area(),
+            "flowmind",
+            ControlConfig(),
+        )
+        controller.set_corridor_manager(manager)
+        controller._corridor_recovery.capture(  # type: ignore[attr-defined]
+            self.area().intersection("tls"),
+            phase_index=0,
+            phase_elapsed=2.0,
+            simulation_time=12.0,
+        )
+
+        controller.step(12.0)
+
+        self.assertEqual(traci.trafficlight.phase_durations, [("tls", 4.0)])
+        self.assertEqual(controller.stats.corridor_recovery_actions, 1)
+        self.assertEqual(manager.state, CorridorState.NORMAL)
+        self.assertEqual(manager.restored_tls, ["tls"])
+
+
+if __name__ == "__main__":
+    unittest.main()

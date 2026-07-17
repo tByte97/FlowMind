@@ -267,6 +267,34 @@ class EmergencyVehicleManager:
             self._traci.vehicle.setColor(config.vehicle_id, config.color)
         except Exception:
             pass
+
+    def replace_scheduled_route(
+        self,
+        edges: tuple[str, ...],
+        *,
+        route_length: float,
+        expected_travel_time: float,
+        predicted_eta: float,
+    ) -> bool:
+        """Apply a fresh route assessment before the vehicle departs."""
+
+        if self.details is None:
+            raise RuntimeError("Emergency vehicle must be installed before rerouting")
+        if len(edges) < 2:
+            raise ValueError("Emergency reroute must contain at least two edges")
+        if edges == self.details.route_edges:
+            return False
+        self._traci.vehicle.setRoute(self.config.vehicle_id, edges)
+        self.details = replace(
+            self.details,
+            route_edges=edges,
+            route_edge_count=len(edges),
+            route_length=float(route_length),
+            expected_travel_time=float(expected_travel_time),
+            predicted_eta=float(predicted_eta),
+        )
+        self._draw_route_overlay(edges)
+        return True
         try:
             self._traci.vehicle.highlight(
                 config.vehicle_id,
@@ -283,6 +311,13 @@ class EmergencyVehicleManager:
 
         if not hasattr(self._traci, "lane") or not hasattr(self._traci, "polygon"):
             return
+        polygon = getattr(self._traci, "polygon", None)
+        if polygon is not None:
+            for polygon_id in self._route_overlay_ids:
+                try:
+                    polygon.remove(polygon_id)
+                except Exception:
+                    pass
         self._route_overlay_ids.clear()
         try:
             lane_by_edge = {

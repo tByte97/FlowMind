@@ -7,7 +7,7 @@ import random
 import sys
 import time
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -16,9 +16,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from flowmind.config import DEFAULT_QUEUE_MODEL_PATHS, PROJECT_ROOT, ControlConfig, RunConfig
 from flowmind.experiment import run_experiment
+from flowmind.emergency_vehicle import load_emergency_config
+from flowmind.ml_dataset import ML_DATASET_SCHEMA_VERSION, ml_dataset_schema_sha256
+from flowmind.provenance import (
+    canonical_sha256,
+    controller_source_sha256,
+    file_sha256,
+    scenario_provenance,
+)
 
 
 INDEX_COLUMNS = (
+    "dataset_fingerprint",
     "run_id",
     "mode",
     "scenario",
@@ -47,6 +56,9 @@ INDEX_COLUMNS = (
     "priority_distance",
     "max_priority_override",
     "clearance_seconds",
+    "demand_profile",
+    "demand_scale",
+    "emergency_active",
     "started_at",
     "finished_at",
     "elapsed_seconds",
@@ -63,7 +75,7 @@ INDEX_COLUMNS = (
     "departed_vehicles",
     "peak_active_vehicles",
     "stops_count",
-    "gridlock_risk",
+    "blocked_outgoing_share",
     "controller_decisions",
     "phase_extensions",
     "phase_advances",
@@ -72,6 +84,11 @@ INDEX_COLUMNS = (
     "clearance_phase_skips",
     "min_green_skips",
     "scoreless_skips",
+    "throughput_fallback_activations",
+    "movement_mask_updates",
+    "movement_mask_active_decisions",
+    "movement_mask_program_updates",
+    "movement_mask_failures",
     "queue_forecast_enabled",
     "queue_forecast_model",
     "queue_forecast_target",
@@ -94,12 +111,19 @@ class DatasetRun:
     sample_interval: int
     control: ControlConfig
     run_index: int | None = None
+    demand_profile: str = "normal"
+    demand_scale: float = 1.0
+    emergency_active: bool = False
 
 
 def default_scenario_file(name: str) -> Path:
-    new_area = PROJECT_ROOT / "simulation" / "new_area" / name
-    if new_area.exists():
-        return new_area
+    """Return the versioned Rivne production/demo scenario by default.
+
+    ``simulation/new_area`` is retained as an optional fixture, but it must
+    never silently replace the configured Rivne zone during dataset creation.
+    Callers that need another map pass ``--config`` and ``--zone`` explicitly.
+    """
+
     return PROJECT_ROOT / "simulation" / "rivne_area" / name
 
 
@@ -124,23 +148,24 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "Run many headless FlowMind simulations and write ML-ready CSV "
             "samples for queue prediction. Use --full-real for the complete "
-            "100-cycle fixed/local/flowmind training plan."
+            "100-cycle static_fixed/sumo_actuated/local/flowmind training plan."
         )
     )
     parser.add_argument("--runs-per-mode", type=int, default=100)
     parser.add_argument(
         "--modes",
         nargs="+",
-        choices=("local", "fixed", "flowmind"),
-        default=("local", "fixed", "flowmind"),
+        choices=("static_fixed", "sumo_actuated", "local", "flowmind"),
+        default=("static_fixed", "sumo_actuated", "local", "flowmind"),
     )
     parser.add_argument(
         "--full-real",
         action="store_true",
         help=(
-            "Use the full realistic training profile: fixed/local/flowmind, "
+            "Use the full realistic training profile: "
+            "static_fixed/sumo_actuated/local/flowmind, "
             "randomized sensor-window control settings, paired seeds, and "
-            "100 cycles by default. This produces 300 runs unless "
+            "100 cycles by default. This produces 400 runs unless "
             "--runs-per-mode is changed."
         ),
     )
@@ -207,6 +232,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Future horizons in seconds used for target columns.",
     )
     parser.add_argument(
+        "--emergency-config",
+        type=Path,
+        default=PROJECT_ROOT / "simulation" / "rivne_area" / "emergency.json",
+    )
+    parser.add_argument(
+        "--emergency-share",
+        type=float,
+        default=0.15,
+        help="Fraction of randomized seed cycles that include an emergency vehicle.",
+    )
+    parser.add_argument(
         "--config",
         type=Path,
         default=default_scenario_file("focused.sumocfg"),
@@ -257,6 +293,8 @@ def main() -> None:
         raise ValueError("--runs-per-mode must be positive")
     if args.sample_interval <= 0:
         raise ValueError("--sample-interval must be positive")
+    if not 0.0 <= args.emergency_share <= 1.0:
+        raise ValueError("--emergency-share must be between 0 and 1")
     if args.seed_min <= 0 or args.seed_max <= 0 or args.seed_min > args.seed_max:
         raise ValueError("--seed-min/--seed-max must be positive and ordered")
 
@@ -280,7 +318,11 @@ def main() -> None:
     summaries_dir.mkdir(parents=True, exist_ok=True)
 
     runs = list(planned_runs(args, default_duration))
-    write_plan_manifest(output_dir / "dataset_plan.json", args, runs)
+    manifest_path = output_dir / "dataset_plan.json"
+    fingerprint = dataset_fingerprint(args, runs)
+    if args.resume and _dataset_artifacts_exist(output_dir):
+        validate_resume_fingerprint(manifest_path, fingerprint)
+    write_plan_manifest(manifest_path, args, runs, fingerprint)
     print(
         f"Dataset plan: {len(runs)} runs, "
         f"randomized={'yes' if args.randomize else 'no'}"
@@ -308,6 +350,7 @@ def main() -> None:
     print(f"Config: {args.config}")
     print(f"Zone:   {args.zone}")
     print(f"Output: {output_dir}")
+    print(f"Fingerprint: {fingerprint}")
 
     if args.dry_run:
         for run in runs:
@@ -336,6 +379,7 @@ def main() -> None:
         started = time.monotonic()
         failure: Exception | None = None
         row: dict[str, Any] = {
+            "dataset_fingerprint": fingerprint,
             "run_id": current_run_id,
             "mode": run.mode,
             "scenario": args.scenario_name,
@@ -366,6 +410,9 @@ def main() -> None:
             "priority_distance": run.control.priority_distance,
             "max_priority_override": run.control.max_priority_override,
             "clearance_seconds": run.control.clearance_seconds,
+            "demand_profile": run.demand_profile,
+            "demand_scale": run.demand_scale,
+            "emergency_active": int(run.emergency_active),
             "started_at": started_at,
             "summary_dir": str(summary_dir),
         }
@@ -386,6 +433,16 @@ def main() -> None:
                     dataset_scenario=args.scenario_name,
                     dataset_sample_interval=run.sample_interval,
                     dataset_target_horizons=tuple(args.target_horizons),
+                    dataset_fingerprint=fingerprint,
+                    demand_profile=run.demand_profile,
+                    demand_scale=run.demand_scale,
+                    dataset_emergency_active=run.emergency_active,
+                    emergency=(
+                        load_emergency_config(args.emergency_config)
+                        if run.emergency_active
+                        else None
+                    ),
+                    enable_live_telemetry=False,
                 )
             )
             row.update(summary)
@@ -418,7 +475,7 @@ def apply_full_real_profile(args: argparse.Namespace) -> None:
     if not args.full_real:
         return
     args.randomize = True
-    args.modes = ("fixed", "local", "flowmind")
+    args.modes = ("static_fixed", "sumo_actuated", "local", "flowmind")
     args.independent_random_seeds = False
 
 
@@ -436,6 +493,9 @@ def planned_runs(
             duration=default_duration,
             sample_interval=args.sample_interval,
             control=ControlConfig(),
+            demand_profile="normal",
+            demand_scale=1.0,
+            emergency_active=False,
         )
         for mode in args.modes
         for offset in range(args.runs_per_mode)
@@ -459,6 +519,8 @@ def randomized_runs(args: argparse.Namespace) -> tuple[DatasetRun, ...]:
             duration = rng.randint(args.duration_min, args.duration_max)
             sample_interval = rng.choice(tuple(args.random_sample_intervals))
             control = random_control_config(rng)
+            demand_profile, demand_scale = random_demand_profile(rng)
+            emergency_active = rng.random() < args.emergency_share
             for mode in args.modes:
                 runs.append(
                     DatasetRun(
@@ -468,6 +530,9 @@ def randomized_runs(args: argparse.Namespace) -> tuple[DatasetRun, ...]:
                         sample_interval=sample_interval,
                         control=control,
                         run_index=offset + 1,
+                        demand_profile=demand_profile,
+                        demand_scale=demand_scale,
+                        emergency_active=emergency_active,
                     )
                 )
         rng.shuffle(runs)
@@ -477,6 +542,8 @@ def randomized_runs(args: argparse.Namespace) -> tuple[DatasetRun, ...]:
         for offset in range(args.runs_per_mode):
             seed = unique_random_seed(rng, args.seed_min, args.seed_max, used_seeds)
             control = random_control_config(rng)
+            demand_profile, demand_scale = random_demand_profile(rng)
+            emergency_active = rng.random() < args.emergency_share
             runs.append(
                 DatasetRun(
                     mode=mode,
@@ -485,6 +552,9 @@ def randomized_runs(args: argparse.Namespace) -> tuple[DatasetRun, ...]:
                     sample_interval=rng.choice(tuple(args.random_sample_intervals)),
                     control=control,
                     run_index=offset + 1,
+                    demand_profile=demand_profile,
+                    demand_scale=demand_scale,
+                    emergency_active=emergency_active,
                 )
             )
 
@@ -536,6 +606,22 @@ def random_control_config(rng: random.Random) -> ControlConfig:
     )
 
 
+def random_demand_profile(rng: random.Random) -> tuple[str, float]:
+    """Choose a real SUMO demand scale, not a cosmetic dataset label."""
+
+    profiles = (
+        ("off_peak", 0.65, 0.85),
+        ("normal", 0.90, 1.10),
+        ("morning_peak", 1.10, 1.35),
+        ("evening_peak", 1.20, 1.50),
+        ("oversaturated", 1.45, 1.80),
+        ("incident", 1.00, 1.30),
+        ("lane_closure", 0.90, 1.20),
+    )
+    name, minimum, maximum = rng.choice(profiles)
+    return name, round(rng.uniform(minimum, maximum), 3)
+
+
 def validate_random_sample_intervals(
     sample_intervals: tuple[int, ...],
     target_horizons: tuple[int, ...],
@@ -578,6 +664,8 @@ def describe_run(scenario: str, run: DatasetRun) -> str:
         f"downstream_weight={run.control.downstream_weight} "
         f"area_weight={run.control.area_pressure_weight} "
         f"queue_weight={run.control.queue_forecast_weight}"
+        f" demand={run.demand_profile}@{run.demand_scale}"
+        f" emergency={'yes' if run.emergency_active else 'no'}"
     )
 
 
@@ -585,9 +673,14 @@ def write_plan_manifest(
     path: Path,
     args: argparse.Namespace,
     runs: list[DatasetRun],
+    fingerprint: str,
 ) -> None:
     payload = {
-        "schema_version": 1,
+        "schema_version": 2,
+        "dataset_schema_version": ML_DATASET_SCHEMA_VERSION,
+        "dataset_schema_sha256": ml_dataset_schema_sha256(),
+        "controller_source_sha256": controller_source_sha256(),
+        "dataset_fingerprint": fingerprint,
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "scenario": args.scenario_name,
         "config": str(args.config),
@@ -620,6 +713,9 @@ def write_plan_manifest(
                 "duration": run.duration,
                 "sample_interval": run.sample_interval,
                 "sensor_range_meters": run.control.sensor_range_meters,
+                "demand_profile": run.demand_profile,
+                "demand_scale": run.demand_scale,
+                "emergency_active": run.emergency_active,
             }
             for run in runs[:20]
         ],
@@ -627,6 +723,79 @@ def write_plan_manifest(
     path.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
+    )
+
+
+def dataset_fingerprint(args: argparse.Namespace, runs: list[DatasetRun]) -> str:
+    config_path = args.config.resolve()
+    zone_path = args.zone.resolve()
+    network_path = config_path.parent / "osm.net.xml.gz"
+    provenance = scenario_provenance(
+        config_path,
+        zone_path,
+        network_path,
+        args.scenario_name,
+    )
+    scenario_contract = asdict(provenance)
+    # Deployment paths differ between a checkout and /app in the container;
+    # fingerprints identify content, never a host-specific absolute path.
+    scenario_contract.pop("manifest_path", None)
+    payload = {
+        "dataset_schema_version": ML_DATASET_SCHEMA_VERSION,
+        "dataset_schema_sha256": ml_dataset_schema_sha256(),
+        "scenario": scenario_contract,
+        "scenario_name": args.scenario_name,
+        "modes": list(args.modes),
+        "plan_seed": args.plan_seed,
+        "target_horizons": list(args.target_horizons),
+        "emergency_config_sha256": file_sha256(args.emergency_config),
+        "emergency_share": args.emergency_share,
+        "runs": [
+            {
+                "mode": run.mode,
+                "seed": run.seed,
+                "duration": run.duration,
+                "sample_interval": run.sample_interval,
+                "run_index": run.run_index,
+                "demand_profile": run.demand_profile,
+                "demand_scale": run.demand_scale,
+                "emergency_active": run.emergency_active,
+                "control": asdict(run.control),
+            }
+            for run in runs
+        ],
+    }
+    return canonical_sha256(payload)
+
+
+def validate_resume_fingerprint(path: Path, requested: str) -> None:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as error:
+        raise ValueError(
+            "Cannot --resume: dataset_plan.json is missing; use a new output "
+            "directory or start without --resume"
+        ) from error
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"Cannot --resume invalid dataset manifest: {error}") from error
+    existing = str(payload.get("dataset_fingerprint", ""))
+    if not existing:
+        raise ValueError(
+            "Cannot --resume legacy dataset without dataset_fingerprint; "
+            "archive it and start a clean dataset"
+        )
+    if existing != requested:
+        raise ValueError(
+            "Cannot --resume: dataset fingerprint mismatch "
+            f"(existing={existing}, requested={requested})"
+        )
+
+
+def _dataset_artifacts_exist(output_dir: Path) -> bool:
+    return (
+        (output_dir / "dataset_plan.json").exists()
+        or (output_dir / "dataset_index.csv").exists()
+        or any((output_dir / "samples").glob("*.csv"))
     )
 
 

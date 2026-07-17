@@ -328,14 +328,12 @@ TraCI застосовує тільки дозволений план
 
 ### Методика
 
-Для кожного сценарію:
-
-- Fixed;
-- Local Adaptive;
-- FlowMind;
-- 10–20 різних seed;
-- однакова тривалість;
-- однаковий транспортний попит.
+Базовий focused benchmark уже реалізований у
+`experiments/run_evaluation.py`. Кожна з 30–50 replicate-пар містить
+`static_fixed`, `sumo_actuated`, `local` і `flowmind` з однаковими seed,
+duration, demand/network/config hashes та фактичним emergency route. Інші
+сценарії з переліку вище мають підключатися як окремі manifests, не змішуючись
+в одну статистичну вибірку.
 
 ### Метрики
 
@@ -345,7 +343,7 @@ TraCI застосовує тільки дозволений план
 - maximum queue;
 - throughput;
 - stops count;
-- gridlock risk;
+- blocked outgoing share;
 - emergency ETA;
 - civil traffic penalty;
 - recovery time після швидкої;
@@ -354,37 +352,32 @@ TraCI застосовує тільки дозволений план
 
 ### Статистика
 
-Потрібно рахувати:
-
-- mean;
-- median;
-- minimum;
-- maximum;
-- standard deviation;
-- p95;
-- відсоткову різницю від Fixed;
-- відсоткову різницю від Local Adaptive.
+`flowmind/evaluation.py` рахує mean paired difference, 95% Student-t CI,
+двосторонній paired t-test і Cohen's dz для FlowMind проти кожного baseline.
+Відсутні значення залишаються `null`, зменшують paired sample count і можуть
+перевести gate у `insufficient_data`.
 
 ### Новий скрипт
 
 ```text
-experiments/run_benchmark.py
+experiments/run_evaluation.py
 ```
 
 Приклад:
 
 ```bash
-python experiments/run_benchmark.py \
-  --scenario rush_hour \
-  --seeds 20 \
-  --duration 1800
+python experiments/run_evaluation.py \
+  --replicates 30 \
+  --duration 1800 \
+  --workers 4 \
+  --evaluation-id rivne_full_v1
 ```
 
 ### Критерій готовності
 
 - результати не базуються на одному вдалому запуску;
 - можна повторити весь benchmark однією командою;
-- таблиця містить median і p95;
+- звіт містить paired CI/tests і regression gates;
 - презентаційні твердження підтверджуються збереженими даними;
 - негативні результати також не приховуються.
 

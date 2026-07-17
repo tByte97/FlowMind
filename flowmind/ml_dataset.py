@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import csv
+import hashlib
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -8,6 +10,11 @@ from typing import Any
 from .area_model import AreaModel
 from .config import ControlConfig
 from .traffic_state import TrafficStateReader
+from .zone_graph import AreaGraph
+
+
+ML_DATASET_SCHEMA_VERSION = 4
+HISTORY_WINDOWS_SECONDS = (15, 30)
 
 
 @dataclass(frozen=True)
@@ -20,6 +27,10 @@ class MLDatasetConfig:
     duration: int
     sample_interval: int = 5
     target_horizons: tuple[int, ...] = (30, 60, 90)
+    dataset_fingerprint: str = ""
+    demand_profile: str = "normal"
+    demand_scale: float = 1.0
+    emergency_active: bool = False
 
 
 class MLDatasetCollector:
@@ -31,17 +42,22 @@ class MLDatasetCollector:
         area: AreaModel,
         control: ControlConfig,
         config: MLDatasetConfig,
+        area_graph: AreaGraph | None = None,
     ) -> None:
         self._traci = traci_connection
         self._area = area
         self._control = control
         self._config = config
+        self._area_graph = area_graph
         self._reader = TrafficStateReader(
             traci_connection,
             area,
             control.sensor_range_meters,
+            area_graph.monitored_lane_ids if area_graph is not None else (),
         )
         self._rows: list[dict[str, object]] = []
+        self._next_sample_at = 0.0
+        self._lane_history: dict[str, list[tuple[float, int, int]]] = {}
 
     @property
     def output_path(self) -> Path:
@@ -52,10 +68,19 @@ class MLDatasetCollector:
         return len(self._rows)
 
     def collect(self, simulation_time: float) -> None:
-        if int(simulation_time) % self._config.sample_interval:
+        if not self._sample_is_due(simulation_time):
             return
 
-        state = self._reader.read()
+        state = self._reader.read(simulation_time)
+        history_features = {
+            lane_id: self._historical_features(
+                lane_id,
+                simulation_time,
+                lane.queue,
+                lane.vehicle_count,
+            )
+            for lane_id, lane in state.lanes.items()
+        }
         for intersection in self._area.intersections:
             tls_id = intersection.tls_id
             current_phase = self._safe_int(
@@ -73,6 +98,7 @@ class MLDatasetCollector:
                 if 0 <= current_phase < len(intersection.phases)
                 else ""
             )
+            neighbour_features = self._neighbour_features(tls_id, state)
 
             for link in intersection.links:
                 incoming = state.lane(link.incoming_lane)
@@ -87,9 +113,15 @@ class MLDatasetCollector:
                 )
                 self._rows.append(
                     {
+                        "dataset_schema_version": ML_DATASET_SCHEMA_VERSION,
+                        "dataset_schema_sha256": ml_dataset_schema_sha256(),
+                        "dataset_fingerprint": self._config.dataset_fingerprint,
                         "run_id": self._config.run_id,
                         "scenario": self._config.scenario,
                         "mode": self._config.mode,
+                        "demand_profile": self._config.demand_profile,
+                        "demand_scale": self._config.demand_scale,
+                        "emergency_active": int(self._config.emergency_active),
                         "seed": self._config.seed,
                         "duration": self._config.duration,
                         "sample_interval": self._config.sample_interval,
@@ -135,10 +167,20 @@ class MLDatasetCollector:
                         "incoming_lane": link.incoming_lane,
                         "outgoing_lane": link.outgoing_lane,
                         "signal_index": link.signal_index,
+                        "current_signal_state": signal,
                         "signal_state": signal,
                         "is_green": int(signal in "Gg"),
                         "current_phase": current_phase,
+                        # No alternative outcome is observed in a normal SUMO
+                        # rollout.  Keep the legacy column empty rather than
+                        # pretending that the current phase is a sampled
+                        # counterfactual candidate.
+                        "candidate_phase": "",
+                        "action_phase": current_phase,
+                        "action_is_observed": 1,
                         "phase_state": phase_state,
+                        "candidate_phase_state": "",
+                        "action_phase_state": phase_state,
                         "phase_elapsed": round(spent_duration, 3),
                         "phase_count": len(intersection.phases),
                         "incoming_queue": incoming.queue,
@@ -152,8 +194,28 @@ class MLDatasetCollector:
                         "outgoing_mean_speed": round(outgoing.mean_speed, 5),
                         "outgoing_free_slots": round(outgoing.free_slots, 5),
                         "downstream_blocked": int(downstream_blocked),
+                        **history_features.get(link.incoming_lane, {}),
+                        **neighbour_features,
                     }
                 )
+
+        for lane_id, lane in state.lanes.items():
+            history = self._lane_history.setdefault(lane_id, [])
+            history.append(
+                (float(simulation_time), int(lane.queue), int(lane.vehicle_count))
+            )
+            cutoff = float(simulation_time) - max(HISTORY_WINDOWS_SECONDS) - 5.0
+            while len(history) > 1 and history[1][0] < cutoff:
+                history.pop(0)
+
+    def _sample_is_due(self, simulation_time: float) -> bool:
+        now = float(simulation_time)
+        if now + 1e-9 < self._next_sample_at:
+            return False
+        interval = float(self._config.sample_interval)
+        elapsed_intervals = int((now - self._next_sample_at) // interval) + 1
+        self._next_sample_at += elapsed_intervals * interval
+        return True
 
     def write(self) -> dict[str, object]:
         self._config.output_dir.mkdir(parents=True, exist_ok=True)
@@ -170,6 +232,9 @@ class MLDatasetCollector:
             "dataset_target_horizons": ",".join(
                 str(value) for value in self._config.target_horizons
             ),
+            "dataset_schema_version": ML_DATASET_SCHEMA_VERSION,
+            "dataset_schema_sha256": ml_dataset_schema_sha256(),
+            "dataset_fingerprint": self._config.dataset_fingerprint,
         }
 
     def _with_targets(self) -> list[dict[str, object]]:
@@ -197,8 +262,110 @@ class MLDatasetCollector:
                 enriched_row[f"target_downstream_blocked_{suffix}"] = (
                     future["downstream_blocked"] if future is not None else ""
                 )
+                enriched_row[f"target_delta_queue_{suffix}"] = (
+                    int(future["incoming_queue"]) - int(row["incoming_queue"])
+                    if future is not None
+                    else ""
+                )
+                enriched_row[f"target_queue_reduction_{suffix}"] = (
+                    int(row["incoming_queue"]) - int(future["incoming_queue"])
+                    if future is not None
+                    else ""
+                )
+                enriched_row[f"target_future_waiting_{suffix}"] = (
+                    future["incoming_queue"] if future is not None else ""
+                )
+                enriched_row[f"target_discharged_vehicles_{suffix}"] = (
+                    max(
+                        int(row["incoming_vehicle_count"])
+                        - int(future["incoming_vehicle_count"]),
+                        0,
+                    )
+                    if future is not None
+                    else ""
+                )
             enriched.append(enriched_row)
         return enriched
+
+    def _historical_features(
+        self,
+        lane_id: str,
+        simulation_time: float,
+        queue: int,
+        vehicle_count: int,
+    ) -> dict[str, float]:
+        history = self._lane_history.get(lane_id, ())
+        features: dict[str, float] = {}
+        for window in HISTORY_WINDOWS_SECONDS:
+            previous = next(
+                (
+                    item
+                    for item in reversed(history)
+                    if item[0] <= float(simulation_time) - window + 1e-9
+                ),
+                None,
+            )
+            previous_queue = int(previous[1]) if previous is not None else int(queue)
+            previous_count = (
+                int(previous[2]) if previous is not None else int(vehicle_count)
+            )
+            elapsed = max(
+                float(simulation_time) - float(previous[0])
+                if previous is not None
+                else float(window),
+                1.0,
+            )
+            queue_growth = int(queue) - previous_queue
+            count_delta = int(vehicle_count) - previous_count
+            features[f"incoming_queue_growth_{window}s"] = float(queue_growth)
+            features[f"arrival_rate_{window}s"] = max(count_delta, 0) / elapsed
+            features[f"discharge_rate_{window}s"] = max(-count_delta, 0) / elapsed
+        return features
+
+    def _neighbour_features(
+        self,
+        tls_id: str,
+        state: Any,
+    ) -> dict[str, float]:
+        if self._area_graph is None:
+            return {
+                "upstream_neighbour_queue": 0.0,
+                "downstream_neighbour_occupancy": 0.0,
+                "downstream_storage_slots": 0.0,
+                "platoon_arrival_30s": 0.0,
+            }
+        incoming = self._area_graph.incoming_segments(tls_id)
+        outgoing = self._area_graph.outgoing_segments(tls_id)
+        upstream_queue = sum(
+            state.lane(lane_id).queue
+            for segment in incoming
+            for lane_id in segment.lane_ids
+        )
+        downstream_lanes = tuple(
+            lane_id
+            for segment in outgoing
+            for lane_id in segment.lane_ids
+        )
+        downstream_occupancy = max(
+            (state.lane(lane_id).occupancy for lane_id in downstream_lanes),
+            default=0.0,
+        )
+        downstream_storage = sum(
+            max(segment.capacity_slots, 0.0)
+            for segment in outgoing
+        )
+        platoon = sum(
+            state.lane(lane_id).vehicle_count
+            for segment in incoming
+            if segment.length_meters / 13.9 <= 30.0
+            for lane_id in segment.lane_ids
+        )
+        return {
+            "upstream_neighbour_queue": float(upstream_queue),
+            "downstream_neighbour_occupancy": float(downstream_occupancy),
+            "downstream_storage_slots": float(downstream_storage),
+            "platoon_arrival_30s": float(platoon),
+        }
 
     @staticmethod
     def _fieldnames(rows: list[dict[str, object]]) -> list[str]:
@@ -226,3 +393,23 @@ class MLDatasetCollector:
             return int(function(*args))
         except Exception:
             return default
+
+
+def ml_dataset_schema_sha256() -> str:
+    payload = {
+        "version": ML_DATASET_SCHEMA_VERSION,
+        "history_windows": HISTORY_WINDOWS_SECONDS,
+        "action_contract": "observational_action_conditioned",
+        "targets": (
+            "incoming_queue",
+            "incoming_occupancy",
+            "outgoing_occupancy",
+            "downstream_blocked",
+            "delta_queue",
+            "queue_reduction",
+            "future_waiting",
+            "discharged_vehicles",
+        ),
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()

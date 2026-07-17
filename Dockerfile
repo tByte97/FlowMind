@@ -1,5 +1,10 @@
 FROM python:3.12-slim-bookworm
 
+ARG FLOWMIND_GIT_COMMIT=unversioned
+
+LABEL org.opencontainers.image.title="FlowMind" \
+      org.opencontainers.image.revision="${FLOWMIND_GIT_COMMIT}"
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
@@ -36,7 +41,9 @@ RUN useradd --create-home --uid 10001 --shell /usr/sbin/nologin flowmind \
 USER flowmind
 
 ENV FLOWMIND_RESULTS_DIR=/app/results \
-    FLOWMIND_WEB_RESULTS_DIR=/app/results/web_demo
+    FLOWMIND_WEB_RESULTS_DIR=/app/results/web_demo \
+    FLOWMIND_IMAGE_COMMIT=${FLOWMIND_GIT_COMMIT} \
+    FLOWMIND_CONTROLLER_COMMIT=${FLOWMIND_GIT_COMMIT}
 
 EXPOSE 8000
 

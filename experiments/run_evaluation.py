@@ -1,0 +1,646 @@
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from dataclasses import asdict, dataclass, replace
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Mapping, Sequence
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from flowmind.config import (
+    CONTROL_MODES,
+    DEFAULT_QUEUE_MODEL_PATHS,
+    FLOWMIND_MODE,
+    PROJECT_ROOT,
+    ControlConfig,
+    RunConfig,
+)
+from flowmind.emergency_vehicle import EmergencyVehicleConfig, load_emergency_config
+from flowmind.control_config_io import load_control_config
+from flowmind.evaluation import (
+    DEFAULT_MAX_PAIRS,
+    DEFAULT_MIN_PAIRS,
+    analyze_paired_summaries,
+    write_evaluation_report,
+)
+from flowmind.experiment import run_experiment
+from flowmind.dataset_quality import parse_missing_detector_links
+
+
+EVALUATION_RUNNER_SCHEMA_VERSION = 1
+BASELINE_MODES = tuple(mode for mode in CONTROL_MODES if mode != FLOWMIND_MODE)
+
+
+@dataclass(frozen=True)
+class EvaluationPairRequest:
+    evaluation_id: str
+    evaluation_dir: Path
+    replicate: int
+    seed: int
+    duration: int
+    zone_size: int
+    config_path: Path
+    zone_path: Path
+    scenario_name: str | None
+    emergency: EmergencyVehicleConfig | None
+    control: ControlConfig
+    queue_model_paths: tuple[Path, ...]
+    modes: tuple[str, ...]
+    resume: bool
+    require_complete_actuated_detectors: bool = True
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Run reproducible paired FlowMind evaluation against selected "
+            "baseline control modes"
+        )
+    )
+    parser.add_argument("--replicates", type=int, default=DEFAULT_MIN_PAIRS)
+    parser.add_argument("--duration", type=int, default=1800)
+    parser.add_argument("--seed-start", type=int, default=42)
+    parser.add_argument("--zone-size", type=int, default=20)
+    parser.add_argument(
+        "--sensor-range",
+        type=float,
+        default=ControlConfig().sensor_range_meters,
+    )
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=PROJECT_ROOT / "simulation" / "rivne_area" / "focused.sumocfg",
+    )
+    parser.add_argument(
+        "--zone",
+        type=Path,
+        default=PROJECT_ROOT / "simulation" / "rivne_area" / "central_zone.json",
+    )
+    parser.add_argument(
+        "--emergency-config",
+        type=Path,
+        default=PROJECT_ROOT / "simulation" / "rivne_area" / "emergency.json",
+    )
+    parser.add_argument(
+        "--without-emergency",
+        action="store_true",
+        help="Skip the emergency ETA gate (the resulting report is partial).",
+    )
+    parser.add_argument(
+        "--results-dir",
+        type=Path,
+        default=PROJECT_ROOT / "results" / "evaluation",
+    )
+    parser.add_argument("--evaluation-id")
+    parser.add_argument("--scenario-name")
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Number of independent paired SUMO workers (1–8).",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Reuse validated completed summaries in an existing evaluation.",
+    )
+    parser.add_argument(
+        "--allow-small",
+        action="store_true",
+        help="Allow fewer than 30 pairs for smoke testing only.",
+    )
+    parser.add_argument(
+        "--fail-on-regression",
+        action="store_true",
+        help="Return a non-zero exit code unless the full report passes.",
+    )
+    parser.add_argument(
+        "--queue-model",
+        dest="queue_models",
+        type=Path,
+        nargs="+",
+        action="extend",
+    )
+    parser.add_argument("--no-queue-model", action="store_true")
+    parser.add_argument(
+        "--enable-queue-control",
+        action="store_true",
+        help="Enable accepted ML predictions; default evaluation is shadow mode.",
+    )
+    parser.add_argument(
+        "--control-config",
+        type=Path,
+        help="Load a tuned ControlConfig JSON artifact.",
+    )
+    parser.add_argument(
+        "--allow-incomplete-actuated-detectors",
+        action="store_true",
+        help=(
+            "Archive/smoke escape hatch. Final benchmarks reject every "
+            "SUMO actuated run whose startup log reports an uncovered link."
+        ),
+    )
+    parser.add_argument(
+        "--baselines",
+        nargs="+",
+        choices=BASELINE_MODES,
+        default=BASELINE_MODES,
+        help=(
+            "Baseline modes admitted to this benchmark. FlowMind is always "
+            "included. Exclude sumo_actuated when detector startup coverage "
+            "is incomplete instead of weakening the detector gate."
+        ),
+    )
+    return parser
+
+
+def validate_replicate_count(replicates: int, allow_small: bool) -> None:
+    if replicates <= 0:
+        raise ValueError("replicates must be positive")
+    if allow_small:
+        if replicates > DEFAULT_MAX_PAIRS:
+            raise ValueError(f"replicates cannot exceed {DEFAULT_MAX_PAIRS}")
+        return
+    if not DEFAULT_MIN_PAIRS <= replicates <= DEFAULT_MAX_PAIRS:
+        raise ValueError(
+            f"Full evaluation requires {DEFAULT_MIN_PAIRS}–"
+            f"{DEFAULT_MAX_PAIRS} paired replicates"
+        )
+
+
+def select_evaluation_modes(
+    baselines: Sequence[str],
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    selected_baselines = tuple(baselines)
+    if not selected_baselines:
+        raise ValueError("At least one baseline mode is required")
+    if len(set(selected_baselines)) != len(selected_baselines):
+        raise ValueError("Baseline modes must be unique")
+    unknown = set(selected_baselines) - set(BASELINE_MODES)
+    if unknown:
+        raise ValueError(
+            "Unknown baseline mode(s): " + ", ".join(sorted(unknown))
+        )
+    return selected_baselines, (*selected_baselines, FLOWMIND_MODE)
+
+
+def main() -> None:
+    args = build_parser().parse_args()
+    validate_replicate_count(args.replicates, args.allow_small)
+    if args.duration <= 0:
+        raise ValueError("duration must be positive")
+    if not 1 <= args.workers <= 8:
+        raise ValueError("workers must be between 1 and 8")
+    baselines, modes = select_evaluation_modes(args.baselines)
+
+    evaluation_id = args.evaluation_id or datetime.now(timezone.utc).strftime(
+        "eval_%Y%m%dT%H%M%SZ"
+    )
+    evaluation_dir = args.results_dir.resolve() / evaluation_id
+    if evaluation_dir.exists() and not args.resume:
+        raise FileExistsError(
+            f"Evaluation directory already exists: {evaluation_dir}; "
+            "use --resume or choose another --evaluation-id"
+        )
+    evaluation_dir.mkdir(parents=True, exist_ok=True)
+
+    emergency = (
+        None
+        if args.without_emergency
+        else load_emergency_config(args.emergency_config)
+    )
+    if emergency is not None and emergency.depart_time >= args.duration:
+        raise ValueError(
+            "Evaluation duration must extend beyond emergency departure time"
+        )
+    queue_model_paths = (
+        ()
+        if args.no_queue_model
+        else tuple(args.queue_models or DEFAULT_QUEUE_MODEL_PATHS)
+    )
+    base_control = (
+        load_control_config(args.control_config)
+        if args.control_config is not None
+        else ControlConfig()
+    )
+    control = replace(
+        base_control,
+        sensor_range_meters=args.sensor_range,
+        queue_forecast_shadow_mode=not args.enable_queue_control,
+    )
+    manifest_path = evaluation_dir / "evaluation_manifest.json"
+    manifest = _initial_manifest(
+        evaluation_id=evaluation_id,
+        args=args,
+        evaluation_dir=evaluation_dir,
+        emergency_enabled=emergency is not None,
+        queue_model_paths=queue_model_paths,
+        control=control,
+    )
+    if args.resume and manifest_path.is_file():
+        _validate_resume_manifest(manifest_path, manifest)
+    _write_json_atomic(manifest_path, manifest)
+
+    summaries_by_replicate: dict[int, list[dict[str, object]]] = {}
+    try:
+        requests = [
+            EvaluationPairRequest(
+                evaluation_id=evaluation_id,
+                evaluation_dir=evaluation_dir,
+                replicate=replicate,
+                seed=args.seed_start + replicate - 1,
+                duration=args.duration,
+                zone_size=args.zone_size,
+                config_path=args.config,
+                zone_path=args.zone,
+                scenario_name=args.scenario_name,
+                emergency=emergency,
+                control=control,
+                queue_model_paths=queue_model_paths,
+                modes=modes,
+                resume=args.resume,
+                require_complete_actuated_detectors=(
+                    not args.allow_incomplete_actuated_detectors
+                ),
+            )
+            for replicate in range(1, args.replicates + 1)
+        ]
+        if args.workers == 1:
+            for request in requests:
+                replicate, pair_summaries = _run_pair(request)
+                summaries_by_replicate[replicate] = pair_summaries
+                _checkpoint(
+                    evaluation_dir,
+                    manifest_path,
+                    manifest,
+                    summaries_by_replicate,
+                )
+        else:
+            with ProcessPoolExecutor(max_workers=args.workers) as executor:
+                futures = {
+                    executor.submit(_run_pair, request): request.replicate
+                    for request in requests
+                }
+                for future in as_completed(futures):
+                    replicate, pair_summaries = future.result()
+                    summaries_by_replicate[replicate] = pair_summaries
+                    print(
+                        f"completed pair {replicate}/{args.replicates}",
+                        flush=True,
+                    )
+                    _checkpoint(
+                        evaluation_dir,
+                        manifest_path,
+                        manifest,
+                        summaries_by_replicate,
+                    )
+
+        summaries = _flatten_summaries(summaries_by_replicate)
+
+        minimum = 1 if args.allow_small else DEFAULT_MIN_PAIRS
+        report = analyze_paired_summaries(
+            summaries,
+            baselines=baselines,
+            min_pairs=minimum,
+            max_pairs=DEFAULT_MAX_PAIRS,
+        )
+        report["validation_profile"] = (
+            "smoke" if args.allow_small else "full_30_to_50_pairs"
+        )
+        report["evaluation_id"] = evaluation_id
+        artifacts = write_evaluation_report(report, evaluation_dir)
+        manifest.update(
+            {
+                "status": "completed",
+                "completed_pairs": args.replicates,
+                "completed_runs": len(summaries),
+                "overall_status": report["overall_status"],
+                "artifacts": artifacts,
+            }
+        )
+        _write_json_atomic(manifest_path, manifest)
+        print(json.dumps(report, ensure_ascii=False, indent=2), flush=True)
+        if args.fail_on_regression and report["overall_status"] != "pass":
+            raise SystemExit(2)
+    except Exception as error:
+        manifest["status"] = "failed"
+        manifest["error"] = f"{type(error).__name__}: {error}"
+        _write_json_atomic(manifest_path, manifest)
+        raise
+
+
+def emergency_route_edges(summary: Mapping[str, object]) -> tuple[str, ...]:
+    raw = summary.get("emergency_route_edges")
+    if isinstance(raw, str):
+        return tuple(edge for edge in raw.split() if edge)
+    if isinstance(raw, (list, tuple)):
+        return tuple(str(edge) for edge in raw if str(edge))
+    return ()
+
+
+def _initial_manifest(
+    *,
+    evaluation_id: str,
+    args: argparse.Namespace,
+    evaluation_dir: Path,
+    emergency_enabled: bool,
+    queue_model_paths: tuple[Path, ...],
+    control: ControlConfig,
+) -> dict[str, object]:
+    return {
+        "evaluation_runner_schema_version": EVALUATION_RUNNER_SCHEMA_VERSION,
+        "evaluation_id": evaluation_id,
+        "status": "running",
+        "modes": [*args.baselines, FLOWMIND_MODE],
+        "replicates": args.replicates,
+        "duration": args.duration,
+        "seed_start": args.seed_start,
+        "seeds": [args.seed_start + index for index in range(args.replicates)],
+        "zone_size": args.zone_size,
+        "sensor_range_meters": args.sensor_range,
+        "sumo_config": str(args.config.resolve()),
+        "zone_config": str(args.zone.resolve()),
+        "scenario_name": args.scenario_name,
+        "emergency_enabled": emergency_enabled,
+        "emergency_config": (
+            str(args.emergency_config.resolve()) if emergency_enabled else None
+        ),
+        "emergency_route_policy": "fixed_within_each_pair",
+        "queue_forecast_shadow_mode": not args.enable_queue_control,
+        "queue_model_paths": [str(path.resolve()) for path in queue_model_paths],
+        "control_config": asdict(control),
+        "require_complete_actuated_detectors": (
+            not args.allow_incomplete_actuated_detectors
+        ),
+        "live_telemetry": False,
+        "workers": args.workers,
+        "evaluation_dir": str(evaluation_dir),
+        "completed_pairs": 0,
+        "completed_runs": 0,
+    }
+
+
+def _validate_resume_manifest(
+    manifest_path: Path,
+    requested: Mapping[str, object],
+) -> None:
+    try:
+        existing = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"Cannot resume invalid manifest: {error}") from error
+    invariant_fields = (
+        "evaluation_runner_schema_version",
+        "evaluation_id",
+        "modes",
+        "replicates",
+        "duration",
+        "seed_start",
+        "seeds",
+        "zone_size",
+        "sensor_range_meters",
+        "sumo_config",
+        "zone_config",
+        "scenario_name",
+        "emergency_enabled",
+        "emergency_config",
+        "emergency_route_policy",
+        "queue_forecast_shadow_mode",
+        "queue_model_paths",
+        "control_config",
+        "require_complete_actuated_detectors",
+    )
+    # Values written to JSON lose Python-only container types (notably the
+    # tuple used by queue_forecast_horizon_weights).  Compare the canonical
+    # JSON representation so an identical config can actually be resumed.
+    canonical_requested = json.loads(json.dumps(requested))
+    mismatched = [
+        field
+        for field in invariant_fields
+        if existing.get(field) != canonical_requested.get(field)
+    ]
+    if mismatched:
+        raise ValueError(
+            "Resume settings differ from the existing manifest: "
+            + ", ".join(mismatched)
+        )
+
+
+def _load_resumable_summary(
+    path: Path,
+    *,
+    evaluation_id: str,
+    pair_id: str,
+    replicate: int,
+    seed: int,
+    mode: str,
+) -> dict[str, object] | None:
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"Cannot resume summary {path}: {error}") from error
+    if not isinstance(payload, dict):
+        raise ValueError(f"Cannot resume non-object summary: {path}")
+    expected = {
+        "evaluation_id": evaluation_id,
+        "evaluation_pair_id": pair_id,
+        "evaluation_replicate": replicate,
+        "seed": seed,
+        "mode": mode,
+    }
+    mismatched = [
+        key for key, value in expected.items() if payload.get(key) != value
+    ]
+    if mismatched:
+        raise ValueError(
+            f"Resume summary metadata mismatch in {path}: "
+            + ", ".join(mismatched)
+        )
+    return payload
+
+
+def _run_pair(
+    request: EvaluationPairRequest,
+) -> tuple[int, list[dict[str, object]]]:
+    pair_id = f"{request.evaluation_id}:pair:{request.replicate:03d}"
+    pair_dir = request.evaluation_dir / (
+        f"pair_{request.replicate:03d}_seed_{request.seed}"
+    )
+    fixed_route: tuple[str, ...] = ()
+    summaries: list[dict[str, object]] = []
+    print(
+        f"[{request.replicate}] seed={request.seed} pair={pair_id}",
+        flush=True,
+    )
+    for mode in request.modes:
+        mode_dir = pair_dir / mode
+        summary_path = mode_dir / f"{mode}_summary.json"
+        summary = (
+            _load_resumable_summary(
+                summary_path,
+                evaluation_id=request.evaluation_id,
+                pair_id=pair_id,
+                replicate=request.replicate,
+                seed=request.seed,
+                mode=mode,
+            )
+            if request.resume
+            else None
+        )
+        if summary is None:
+            print(f"  [{request.replicate}] running {mode}", flush=True)
+            summary = run_experiment(
+                RunConfig(
+                    mode=mode,
+                    duration=request.duration,
+                    seed=request.seed,
+                    zone_size=request.zone_size,
+                    config_path=request.config_path,
+                    zone_path=request.zone_path,
+                    results_dir=mode_dir,
+                    scenario_name=request.scenario_name,
+                    emergency=request.emergency,
+                    control=request.control,
+                    queue_model_paths=request.queue_model_paths,
+                    evaluation_id=request.evaluation_id,
+                    evaluation_pair_id=pair_id,
+                    evaluation_replicate=request.replicate,
+                    fixed_emergency_route_edges=fixed_route,
+                    allow_emergency_reroute=False,
+                    enable_live_telemetry=False,
+                    require_complete_actuated_detectors=(
+                        request.require_complete_actuated_detectors
+                    ),
+                )
+            )
+        else:
+            print(f"  [{request.replicate}] resumed {mode}", flush=True)
+
+        route = emergency_route_edges(summary)
+        if mode == "sumo_actuated":
+            detector_audit = audit_actuated_detector_log(mode_dir)
+            summary.update(detector_audit)
+            _write_json_atomic(summary_path, summary)
+            if (
+                request.require_complete_actuated_detectors
+                and not detector_audit["actuated_detector_coverage_complete"]
+            ):
+                raise RuntimeError(
+                    f"{pair_id}/{mode} has incomplete actuated detector "
+                    f"coverage ({detector_audit['missing_actuated_detector_links']} "
+                    "uncovered links); final benchmark refused"
+                )
+        if request.emergency is not None:
+            if not route:
+                raise RuntimeError(
+                    f"{pair_id}/{mode} did not produce an emergency route"
+                )
+            if fixed_route and route != fixed_route:
+                raise RuntimeError(
+                    f"{pair_id}/{mode} used a different emergency route"
+                )
+            fixed_route = route
+        summaries.append(summary)
+    return request.replicate, summaries
+
+
+def audit_actuated_detector_log(mode_dir: Path) -> dict[str, object]:
+    log_path = mode_dir / "raw" / "sumo_actuated_sumo.log"
+    startup_audit = _read_json_file(
+        mode_dir / "actuated_detector_startup_audit.json"
+    )
+    try:
+        log_text = log_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return {
+            "actuated_detector_coverage_complete": False,
+            "missing_actuated_detector_links": None,
+            "actuated_detector_audit_log": str(log_path),
+        }
+    missing = parse_missing_detector_links(log_text)
+    raw_controlled_links = startup_audit.get("controlled_links", [])
+    controlled_links = {
+        (str(item["tls_id"]), int(item["signal_index"]))
+        for item in raw_controlled_links
+        if isinstance(item, dict)
+        and "tls_id" in item
+        and "signal_index" in item
+    }
+    relevant_missing = missing & controlled_links if controlled_links else missing
+    relevant_missing_count = len(relevant_missing)
+    coverage_complete = not relevant_missing
+    controlled_link_count = len(controlled_links)
+    coverage = (
+        1.0 - relevant_missing_count / controlled_link_count
+        if controlled_link_count
+        else None
+    )
+    return {
+        "actuated_detector_coverage_complete": bool(coverage_complete),
+        "missing_actuated_detector_links": relevant_missing_count,
+        "actuated_detector_coverage": (
+            round(coverage, 7) if coverage is not None else None
+        ),
+        "actuated_detector_controlled_links": controlled_link_count or None,
+        "actuated_detector_missing_by_tls": {
+                tls_id: sorted(
+                    index
+                    for item_tls, index in relevant_missing
+                    if item_tls == tls_id
+                )
+                for tls_id in sorted(
+                    {tls_id for tls_id, _index in relevant_missing}
+                )
+        },
+        "actuated_detector_audit_log": str(log_path),
+    }
+
+
+def _read_json_file(path: Path) -> dict[str, object]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _checkpoint(
+    evaluation_dir: Path,
+    manifest_path: Path,
+    manifest: dict[str, object],
+    summaries_by_replicate: Mapping[int, list[dict[str, object]]],
+) -> None:
+    summaries = _flatten_summaries(summaries_by_replicate)
+    _write_json_atomic(evaluation_dir / "summaries.json", summaries)
+    manifest["completed_pairs"] = len(summaries_by_replicate)
+    manifest["completed_runs"] = len(summaries)
+    _write_json_atomic(manifest_path, manifest)
+
+
+def _flatten_summaries(
+    summaries_by_replicate: Mapping[int, list[dict[str, object]]],
+) -> list[dict[str, object]]:
+    return [
+        summary
+        for replicate in sorted(summaries_by_replicate)
+        for summary in summaries_by_replicate[replicate]
+    ]
+
+
+def _write_json_atomic(path: Path, payload: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+
+
+if __name__ == "__main__":
+    main()

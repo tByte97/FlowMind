@@ -215,6 +215,14 @@ class EmergencyRouter:
             ),
         )
 
+    def route_option_from_edges(
+        self,
+        edges: tuple[str, ...],
+    ) -> EmergencyRouteOption | None:
+        """Evaluate a fixed route supplied by a paired experiment plan."""
+
+        return self._route_option_from_edges(tuple(edges))
+
     def _network_alternatives(
         self,
         start_edge: str,
@@ -254,6 +262,7 @@ class EmergencyRouter:
         vtype: str,
         depart_time: float,
         num_alternatives: int = 3,
+        allowed_tls_ids: tuple[str, ...] | None = None,
     ) -> tuple[EmergencyRouteOption | None, list[dict[str, Any]]]:
         """Find multiple valid alternative routes and select the best one.
 
@@ -321,16 +330,26 @@ class EmergencyRouter:
         if not alternatives:
             return None, []
 
-        # Choose the route with the lowest predicted ETA
-        best_route = min(alternatives, key=lambda r: r.predicted_eta)
+        allowed = set(allowed_tls_ids) if allowed_tls_ids is not None else None
+        eligible = [
+            route
+            for route in alternatives
+            if allowed is None or set(route.tls_sequence).issubset(allowed)
+        ]
+        best_route = (
+            min(eligible, key=lambda route: route.predicted_eta)
+            if eligible
+            else None
+        )
         
         logs = []
         for alt in alternatives:
-            reason = (
-                "Selected (Lowest ETA)"
-                if alt == best_route
-                else "Rejected (Higher ETA)"
-            )
+            if allowed is not None and not set(alt.tls_sequence).issubset(allowed):
+                reason = "Rejected (Outside Controlled Zone)"
+            elif alt == best_route:
+                reason = "Selected (Lowest ETA)"
+            else:
+                reason = "Rejected (Higher ETA)"
             log_entry = alt.as_dict()
             log_entry["reason"] = reason
             logs.append(log_entry)

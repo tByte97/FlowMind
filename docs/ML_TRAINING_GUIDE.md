@@ -62,7 +62,8 @@ Dataset:
 results/dataset/
 ├── dataset_index.csv
 ├── samples/
-│   ├── rivne_focused_fixed_seed_00042.csv
+│   ├── rivne_focused_static_fixed_seed_00042.csv
+│   ├── rivne_focused_sumo_actuated_seed_00042.csv
 │   ├── rivne_focused_local_seed_00042.csv
 │   └── rivne_focused_flowmind_seed_00042.csv
 └── summaries/
@@ -140,14 +141,14 @@ python experiments/run_dataset.py --full-real --resume
 
 ```text
 100 різних seed cycles
-кожен seed проходить fixed, local і flowmind
-= 300 simulations
+кожен seed проходить static_fixed, sumo_actuated, local і flowmind
+= 400 simulations
 ```
 
 `--full-real` вмикає різні seed-и, тривалості, sample interval-и, локальну
 дальність датчиків біля перехресть та різні параметри `ControlConfig`.
-Один і той самий seed/config проходить усі режими, щоб `fixed`, `local` і
-`flowmind` можна було чесно порівнювати між собою.
+Один і той самий seed/config проходить усі режими, щоб `static_fixed`,
+`sumo_actuated`, `local` і `flowmind` можна було чесно порівнювати між собою.
 
 За замовчуванням використовується:
 
@@ -360,7 +361,7 @@ python experiments/train_queue_model.py \
 Samples: ... files
 Rows after target cleanup: ...
 Target: target_incoming_queue_60s
-Modes: fixed, local, flowmind
+Modes: static_fixed, sumo_actuated, local, flowmind
 Split rows: train=..., validation=..., test=...
 Split seeds: train=..., validation=..., test=...
 ```
@@ -441,7 +442,7 @@ python experiments/train_queue_model.py \
 Для першої production-like моделі краще використовувати всі режими:
 
 ```text
-fixed + local + flowmind
+static_fixed + sumo_actuated + local + flowmind
 ```
 
 Так модель бачить і погані затори, і адаптивну поведінку системи.
@@ -950,7 +951,7 @@ python experiments/train_queue_model.py --full-dataset
 ```bash
 python experiments/train_queue_model.py \
   --target target_incoming_queue_60s \
-  --modes fixed local flowmind
+  --modes static_fixed sumo_actuated local flowmind
 ```
 
 ## 19. Рекомендований робочий цикл

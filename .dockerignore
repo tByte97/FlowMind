@@ -5,6 +5,7 @@
 .venv
 venv
 results
+models/archive
 __pycache__
 *.py[cod]
 .pytest_cache

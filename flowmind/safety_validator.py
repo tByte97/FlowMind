@@ -13,6 +13,31 @@ class SafetyDecision:
     reason: str = "ok"
 
 
+def clearance_duration(
+    intersection: object,
+    phase_index: int,
+    fallback_seconds: float,
+) -> float:
+    """Return the clearance duration encoded by the active SUMO program.
+
+    ``duration`` is the normal lifetime of a yellow/all-red phase.  Actuated
+    programs may additionally provide ``minDur``; when they do, it remains a
+    hard lower bound.  The FlowMind setting is used only for programs that do
+    not expose either value.
+    """
+
+    duration_getter = getattr(intersection, "default_phase_duration", None)
+    minimum_getter = getattr(intersection, "phase_min_duration", None)
+    duration = duration_getter(phase_index) if callable(duration_getter) else None
+    minimum = minimum_getter(phase_index) if callable(minimum_getter) else None
+    known_values = tuple(
+        float(value) for value in (duration, minimum) if value is not None
+    )
+    if known_values:
+        return max(known_values)
+    return float(fallback_seconds)
+
+
 class SafetyValidator:
     """Validate signal phase decisions before TraCI applies them.
 
@@ -90,14 +115,28 @@ class SafetyValidator:
 
         if any(signal in "Gg" for signal in current_state):
             if spent < min_green:
-                return SafetyDecision(False, "min green not satisfied")
-        elif (
-            "y" in current_state.lower()
-            and spent < self._config.clearance_seconds
-        ):
-            return SafetyDecision(False, "yellow clearance not satisfied")
+                sumo_minimum = intersection.phase_min_duration(current_phase)
+                reason = (
+                    "SUMO minDur not satisfied"
+                    if sumo_minimum is not None and spent < sumo_minimum
+                    else "min green not satisfied"
+                )
+                return SafetyDecision(False, reason)
+        elif "y" in current_state.lower():
+            clearance_seconds = clearance_duration(
+                intersection,
+                current_phase,
+                self._config.clearance_seconds,
+            )
+            if spent < clearance_seconds:
+                return SafetyDecision(False, "yellow clearance not satisfied")
         elif not any(signal in "GgYy" for signal in current_state):
-            if spent < self._config.clearance_seconds:
+            clearance_seconds = clearance_duration(
+                intersection,
+                current_phase,
+                self._config.clearance_seconds,
+            )
+            if spent < clearance_seconds:
                 return SafetyDecision(False, "all-red clearance not satisfied")
 
         return SafetyDecision(True)

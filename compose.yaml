@@ -1,19 +1,42 @@
 name: flowmind
 
 services:
+  model-init:
+    image: flowmind:local
+    container_name: flowmind-model-init
+    user: "0:0"
+    restart: "no"
+    volumes:
+      - flowmind_models:/models
+    entrypoint: ["/bin/sh", "-ec"]
+    command: ["mkdir -p /models && chown -R 10001:10001 /models"]
+    security_opt:
+      - no-new-privileges:true
+
   web:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        FLOWMIND_GIT_COMMIT: ${FLOWMIND_GIT_COMMIT:-unversioned}
     image: flowmind:local
     container_name: flowmind-web
     init: true
     restart: unless-stopped
+    depends_on:
+      model-init:
+        condition: service_completed_successfully
     environment:
       FLOWMIND_RESULTS_DIR: /app/results
       FLOWMIND_WEB_RESULTS_DIR: /app/results/web_demo
+      FLOWMIND_STRICT_STARTUP: ${FLOWMIND_STRICT_STARTUP:-1}
+      FLOWMIND_ENABLE_QUEUE_CONTROL: ${FLOWMIND_ENABLE_QUEUE_CONTROL:-0}
+      FLOWMIND_CONTROL_CONFIG: ${FLOWMIND_CONTROL_CONFIG:-}
+      FLOWMIND_DASHBOARD_EVALUATION_ID: ${FLOWMIND_DASHBOARD_EVALUATION_ID:-}
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
       GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.1-flash-lite}
+      FLOWMIND_REQUIRE_MUTATION_AUTH: ${FLOWMIND_REQUIRE_MUTATION_AUTH:-1}
+      FLOWMIND_MUTATION_TOKEN: ${FLOWMIND_MUTATION_TOKEN:-}
       OMP_NUM_THREADS: ${FLOWMIND_CPU_THREADS:-4}
       OPENBLAS_NUM_THREADS: ${FLOWMIND_CPU_THREADS:-4}
       MKL_NUM_THREADS: ${FLOWMIND_CPU_THREADS:-4}
@@ -21,6 +44,7 @@ services:
       - "${FLOWMIND_BIND_IP:-127.0.0.1}:${FLOWMIND_PORT:-8010}:8000"
     volumes:
       - flowmind_results:/app/results
+      - flowmind_models:/app/models:ro
     read_only: true
     tmpfs:
       - /tmp:size=512m,mode=1777
@@ -53,11 +77,13 @@ services:
     restart: "no"
     environment:
       FLOWMIND_RESULTS_DIR: /app/results
+      FLOWMIND_STRICT_STARTUP: ${FLOWMIND_STRICT_STARTUP:-1}
       OMP_NUM_THREADS: ${FLOWMIND_CPU_THREADS:-4}
       OPENBLAS_NUM_THREADS: ${FLOWMIND_CPU_THREADS:-4}
       MKL_NUM_THREADS: ${FLOWMIND_CPU_THREADS:-4}
     volumes:
       - flowmind_results:/app/results
+      - flowmind_models:/app/models:ro
     read_only: true
     tmpfs:
       - /tmp:size=512m,mode=1777
@@ -70,6 +96,8 @@ services:
       options:
         max-size: 10m
         max-file: "3"
+    healthcheck:
+      disable: true
     command:
       - python
       - -u
@@ -79,6 +107,141 @@ services:
       - --keep-going
       - --output-dir
       - /app/results/dataset
+      - --no-queue-model
+      - --config
+      - /app/simulation/rivne_area/focused.sumocfg
+      - --zone
+      - /app/simulation/rivne_area/central_zone.json
+
+  dataset-audit:
+    image: flowmind:local
+    container_name: flowmind-dataset-audit
+    profiles:
+      - audit
+      - training
+    init: true
+    restart: "no"
+    volumes:
+      - flowmind_results:/app/results
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      disable: true
+    command:
+      - python
+      - -u
+      - experiments/audit_dataset.py
+      - --dataset-dir
+      - /app/results/dataset
+      - --output
+      - /app/results/dataset/quality_report.json
+      - --expected-runs
+      - ${FLOWMIND_DATASET_EXPECTED_RUNS:-400}
+      - --max-teleport-rate
+      - ${FLOWMIND_MAX_TELEPORT_RATE:-0.05}
+      - --max-emergency-brakes-per-1000
+      - ${FLOWMIND_MAX_EMERGENCY_BRAKES_PER_1000:-20}
+      - --max-collisions
+      - ${FLOWMIND_MAX_COLLISIONS:-0}
+      - --min-actuated-detector-coverage
+      - ${FLOWMIND_MIN_ACTUATED_DETECTOR_COVERAGE:-1.0}
+
+  counterfactual-dataset:
+    image: flowmind:local
+    container_name: flowmind-counterfactual-dataset
+    profiles:
+      - counterfactual
+    init: true
+    restart: "no"
+    environment:
+      FLOWMIND_RESULTS_DIR: /app/results
+      FLOWMIND_STRICT_STARTUP: ${FLOWMIND_STRICT_STARTUP:-1}
+      OMP_NUM_THREADS: ${FLOWMIND_CPU_THREADS:-4}
+      OPENBLAS_NUM_THREADS: ${FLOWMIND_CPU_THREADS:-4}
+      MKL_NUM_THREADS: ${FLOWMIND_CPU_THREADS:-4}
+    volumes:
+      - flowmind_results:/app/results
+    read_only: true
+    tmpfs:
+      - /tmp:size=1g,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 512
+    stop_grace_period: 60s
+    logging:
+      driver: json-file
+      options:
+        max-size: 20m
+        max-file: "3"
+    healthcheck:
+      disable: true
+    command:
+      - python
+      - -u
+      - experiments/run_counterfactual_dataset.py
+      - --runs
+      - ${FLOWMIND_COUNTERFACTUAL_RUNS:-12}
+      - --resume
+      - --output-dir
+      - /app/results/counterfactual_dataset
+      - --config
+      - /app/simulation/rivne_area/focused.sumocfg
+      - --zone
+      - /app/simulation/rivne_area/central_zone.json
+
+  counterfactual-trainer:
+    image: flowmind:local
+    container_name: flowmind-counterfactual-trainer
+    profiles:
+      - counterfactual
+    init: true
+    restart: "no"
+    depends_on:
+      model-init:
+        condition: service_completed_successfully
+      counterfactual-dataset:
+        condition: service_completed_successfully
+    environment:
+      FLOWMIND_STRICT_STARTUP: ${FLOWMIND_STRICT_STARTUP:-1}
+      OMP_NUM_THREADS: ${FLOWMIND_CPU_THREADS:-4}
+      OPENBLAS_NUM_THREADS: ${FLOWMIND_CPU_THREADS:-4}
+      MKL_NUM_THREADS: ${FLOWMIND_CPU_THREADS:-4}
+    volumes:
+      - flowmind_results:/app/results
+      - flowmind_models:/app/models
+    read_only: true
+    tmpfs:
+      - /tmp:size=1g,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 512
+    stop_grace_period: 60s
+    logging:
+      driver: json-file
+      options:
+        max-size: 20m
+        max-file: "3"
+    healthcheck:
+      disable: true
+    command:
+      - python
+      - -u
+      - experiments/train_queue_ensemble.py
+      - --dataset-dir
+      - /app/results/counterfactual_dataset
+      - --output-dir
+      - /app/models/counterfactual_candidate
+      - --rows-per-file
+      - ${FLOWMIND_COUNTERFACTUAL_ROWS_PER_FILE:-10000}
+      - --jobs
+      - ${FLOWMIND_CPU_THREADS:-4}
+      - --quality-report
+      - /app/results/counterfactual_dataset/quality_report.json
+      - --forecast-contract
+      - counterfactual
 
   trainer:
     image: flowmind:local
@@ -87,12 +250,19 @@ services:
       - training
     init: true
     restart: "no"
+    depends_on:
+      model-init:
+        condition: service_completed_successfully
+      dataset-audit:
+        condition: service_completed_successfully
     environment:
+      FLOWMIND_STRICT_STARTUP: ${FLOWMIND_STRICT_STARTUP:-1}
       OMP_NUM_THREADS: ${FLOWMIND_CPU_THREADS:-4}
       OPENBLAS_NUM_THREADS: ${FLOWMIND_CPU_THREADS:-4}
       MKL_NUM_THREADS: ${FLOWMIND_CPU_THREADS:-4}
     volumes:
       - flowmind_results:/app/results
+      - flowmind_models:/app/models
     read_only: true
     tmpfs:
       - /tmp:size=1g,mode=1777
@@ -105,6 +275,8 @@ services:
       options:
         max-size: 10m
         max-file: "3"
+    healthcheck:
+      disable: true
     command:
       - python
       - -u
@@ -112,12 +284,133 @@ services:
       - --dataset-dir
       - /app/results/dataset
       - --output-dir
-      - /app/results/trained_models
+      - /app/models
       - --rows-per-file
       - ${FLOWMIND_TRAIN_ROWS_PER_FILE:-5000}
       - --jobs
       - ${FLOWMIND_CPU_THREADS:-4}
+      - --quality-report
+      - /app/results/dataset/quality_report.json
+
+  evaluation-preflight:
+    image: flowmind:local
+    container_name: flowmind-evaluation-preflight
+    profiles:
+      - evaluation
+    restart: "no"
+    volumes:
+      - flowmind_results:/app/results
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      disable: true
+    command:
+      - python
+      - experiments/check_disk_space.py
+      - --path
+      - /app/results/evaluation
+      - --min-free-gb
+      - ${FLOWMIND_EVALUATION_MIN_FREE_GB:-12}
+
+  evaluation:
+    image: flowmind:local
+    container_name: flowmind-evaluation
+    profiles:
+      - evaluation
+    init: true
+    restart: "no"
+    depends_on:
+      model-init:
+        condition: service_completed_successfully
+      evaluation-preflight:
+        condition: service_completed_successfully
+    environment:
+      FLOWMIND_RESULTS_DIR: /app/results
+      FLOWMIND_STRICT_STARTUP: ${FLOWMIND_STRICT_STARTUP:-1}
+      OMP_NUM_THREADS: ${FLOWMIND_CPU_THREADS:-4}
+      OPENBLAS_NUM_THREADS: ${FLOWMIND_CPU_THREADS:-4}
+      MKL_NUM_THREADS: ${FLOWMIND_CPU_THREADS:-4}
+    volumes:
+      - flowmind_results:/app/results
+      - flowmind_models:/app/models:ro
+    read_only: true
+    tmpfs:
+      - /tmp:size=1g,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 512
+    stop_grace_period: 60s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+    healthcheck:
+      disable: true
+    command:
+      - python
+      - -u
+      - experiments/run_evaluation.py
+      - --replicates
+      - ${FLOWMIND_EVALUATION_REPLICATES:-30}
+      - --duration
+      - ${FLOWMIND_EVALUATION_DURATION:-1800}
+      - --workers
+      - ${FLOWMIND_EVALUATION_WORKERS:-4}
+      - --evaluation-id
+      - ${FLOWMIND_EVALUATION_ID:-rivne_full_v1}
+      - --results-dir
+      - /app/results/evaluation
+      - --resume
+
+  tuning:
+    image: flowmind:local
+    container_name: flowmind-tuning
+    profiles:
+      - tuning
+    init: true
+    restart: "no"
+    environment:
+      FLOWMIND_RESULTS_DIR: /app/results
+      FLOWMIND_STRICT_STARTUP: ${FLOWMIND_STRICT_STARTUP:-1}
+      OMP_NUM_THREADS: ${FLOWMIND_CPU_THREADS:-4}
+      OPENBLAS_NUM_THREADS: ${FLOWMIND_CPU_THREADS:-4}
+      MKL_NUM_THREADS: ${FLOWMIND_CPU_THREADS:-4}
+    volumes:
+      - flowmind_results:/app/results
+      - flowmind_models:/app/models:ro
+    read_only: true
+    tmpfs:
+      - /tmp:size=1g,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 512
+    stop_grace_period: 60s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+    healthcheck:
+      disable: true
+    command:
+      - python
+      - -u
+      - experiments/tune_control.py
+      - --trials
+      - ${FLOWMIND_TUNING_TRIALS:-60}
+      - --duration
+      - ${FLOWMIND_TUNING_DURATION:-900}
+      - --seeds-per-trial
+      - ${FLOWMIND_TUNING_SEEDS:-3}
+      - --storage
+      - sqlite:////app/results/tuning/optuna.db
+      - --results-dir
+      - /app/results/tuning
 
 volumes:
   flowmind_results:
     name: flowmind_results
+  flowmind_models:
+    name: flowmind_models

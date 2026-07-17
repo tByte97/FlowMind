@@ -8,7 +8,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from flowmind.config import (
+    CONTROL_MODES,
     DEFAULT_QUEUE_MODEL_PATHS,
+    LEGACY_CONTROL_MODE_ALIASES,
     PROJECT_ROOT,
     ControlConfig,
     RunConfig,
@@ -20,10 +22,13 @@ from flowmind.experiment import run_experiment
 def build_parser(default_mode: str | None = None) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run a FlowMind SUMO experiment")
     if default_mode is None:
-        parser.add_argument("mode", choices=("fixed", "local", "flowmind"))
+        parser.add_argument(
+            "mode",
+            choices=(*CONTROL_MODES, *LEGACY_CONTROL_MODE_ALIASES),
+        )
     parser.add_argument("--duration", type=int, default=900)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--zone-size", type=int, default=6)
+    parser.add_argument("--zone-size", type=int, default=20)
     parser.add_argument(
         "--sensor-range",
         type=float,
@@ -80,6 +85,14 @@ def build_parser(default_mode: str | None = None) -> argparse.ArgumentParser:
         action="store_true",
         help="Disable ML queue forecast and run classic FlowMind scoring.",
     )
+    parser.add_argument(
+        "--enable-queue-control",
+        action="store_true",
+        help=(
+            "Allow in-domain, high-confidence ML predictions to affect control. "
+            "The safe default is shadow-only evaluation."
+        ),
+    )
     parser.set_defaults(default_mode=default_mode)
     return parser
 
@@ -109,7 +122,10 @@ def main(default_mode: str | None = None) -> None:
             tls_ids=tuple(args.tls),
             priority_vehicle=args.priority_vehicle,
             emergency=emergency,
-            control=ControlConfig(sensor_range_meters=args.sensor_range),
+            control=ControlConfig(
+                sensor_range_meters=args.sensor_range,
+                queue_forecast_shadow_mode=not args.enable_queue_control,
+            ),
             queue_model_paths=selected_queue_model_paths(args),
         )
     )

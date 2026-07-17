@@ -21,11 +21,11 @@ class TrainQueueEnsembleTests(unittest.TestCase):
         self.assertEqual(command[0], sys.executable)
         self.assertEqual(
             command[command.index("--target") + 1],
-            "target_incoming_queue_60s",
+            "target_queue_reduction_60s",
         )
         self.assertEqual(
             command[command.index("--output") + 1],
-            "/models/queue_lgbm_60s_current.joblib",
+            "/models/queue_lgbm_60s_decision.joblib",
         )
         self.assertEqual(command[command.index("--rows-per-file") + 1], "5000")
 

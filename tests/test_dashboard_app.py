@@ -29,6 +29,11 @@ class DashboardAppTests(unittest.TestCase):
             ],
             "system": {
                 "simulation": {"status": "running", "expected_vehicles": 5},
+                "tls_programs": {
+                    "status": "audited",
+                    "count": 6,
+                    "items": [{"tls_id": "tls_1", "program_type": 3}],
+                },
                 "corridor": {
                     "corridor_state": "GREEN_WINDOW",
                     "corridor_active_tls": "tls_1",
@@ -41,7 +46,13 @@ class DashboardAppTests(unittest.TestCase):
 
         self.assertEqual(history["departed"].tolist(), [2, 4])
         self.assertEqual(rows[0]["Стан"], "running")
-        self.assertEqual(rows[1]["Стан"], "GREEN_WINDOW")
+        tls_row = next(row for row in rows if row["Компонент"] == "SUMO TLS programs")
+        self.assertEqual(tls_row["Стан"], "audited")
+        self.assertEqual(tls_row["Деталі"], "count=6")
+        corridor_row = next(
+            row for row in rows if row["Компонент"] == "Emergency corridor"
+        )
+        self.assertEqual(corridor_row["Стан"], "GREEN_WINDOW")
 
     def test_live_average_metrics_and_simulation_status(self) -> None:
         payload = {
@@ -51,18 +62,18 @@ class DashboardAppTests(unittest.TestCase):
                     "queue_length": 4,
                     "waiting_time": 6,
                     "mean_speed": 8,
-                    "inflow_per_minute": 10,
-                    "outflow_per_minute": 5,
-                    "gridlock_risk": 0.1,
+                    "zone_inflow_per_minute": 10,
+                    "zone_outflow_per_minute": 5,
+                    "blocked_outgoing_share": 0.1,
                 },
                 {
                     "active_vehicles": 4,
                     "queue_length": 8,
                     "waiting_time": 10,
                     "mean_speed": 12,
-                    "inflow_per_minute": 20,
-                    "outflow_per_minute": 15,
-                    "gridlock_risk": 0.3,
+                    "zone_inflow_per_minute": 20,
+                    "zone_outflow_per_minute": 15,
+                    "blocked_outgoing_share": 0.3,
                 },
             ],
             "system": {"simulation": {"status": "running"}},
@@ -97,7 +108,7 @@ class DashboardAppTests(unittest.TestCase):
         summary = pd.DataFrame(
             [
                 {
-                    "mode": "fixed",
+                    "mode": "static_fixed",
                     "average_waiting_time": 40.0,
                     "average_queue_length": 20.0,
                     "stops_count": 100,
@@ -122,6 +133,16 @@ class DashboardAppTests(unittest.TestCase):
         self.assertEqual(rows[0]["after"], 20.0)
         self.assertEqual(rows[0]["improvement"], 50.0)
         self.assertEqual(rows[3]["improvement"], 20.0)
+
+    def test_legacy_fixed_results_remain_available_as_baseline(self) -> None:
+        self.assertEqual(
+            app.select_baseline_mode(("fixed", "local", "flowmind")),
+            "fixed",
+        )
+        self.assertEqual(
+            app.select_baseline_mode(("fixed", "static_fixed", "flowmind")),
+            "static_fixed",
+        )
 
     def test_decision_and_corridor_helpers_read_live_payload(self) -> None:
         payload = {

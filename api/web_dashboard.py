@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import csv
+import hmac
 import hashlib
 import json
 import os
 import signal
+import shutil
 import socket
 import subprocess
 import sys
@@ -12,22 +14,34 @@ import threading
 import time
 from collections import deque
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+from flowmind.area_model import discover_area, load_zone_tls_ids
+from flowmind.zone_graph import load_zone_definition
+
 try:
-    from fastapi import FastAPI, Request
+    from fastapi import FastAPI, HTTPException, Request
     from fastapi.responses import FileResponse, HTMLResponse
 except ImportError:
     FastAPI = None  # type: ignore[assignment]
     FileResponse = None  # type: ignore[assignment]
     Request = None  # type: ignore[assignment]
+    HTTPException = None  # type: ignore[assignment]
     HTMLResponse = None  # type: ignore[assignment]
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 PROJECT_RESULTS_DIR = PROJECT_ROOT / "results"
 CAR_ICON_PATH = PROJECT_ROOT / "icon_car.png"
+DASHBOARD_ASSETS_DIR = PROJECT_ROOT / "dashboard" / "assets"
+ZONE_SIMULATION_CSS_PATH = DASHBOARD_ASSETS_DIR / "zone_simulation.css"
+ZONE_SIMULATION_JS_PATH = DASHBOARD_ASSETS_DIR / "zone_simulation.js"
+ZONE_EXPLORER_CSS_PATH = DASHBOARD_ASSETS_DIR / "zone_explorer.css"
+ZONE_EXPLORER_JS_PATH = DASHBOARD_ASSETS_DIR / "zone_explorer.js"
+ZONE_DEFINITION_PATH = PROJECT_ROOT / "simulation" / "rivne_area" / "central_zone.json"
+ZONE_NETWORK_PATH = PROJECT_ROOT / "simulation" / "rivne_area" / "osm.net.xml.gz"
 RESULTS_DIR = Path(os.environ.get("FLOWMIND_RESULTS_DIR", PROJECT_RESULTS_DIR))
 WEB_RESULTS_DIR = Path(
     os.environ.get("FLOWMIND_WEB_RESULTS_DIR", PROJECT_RESULTS_DIR / "web_demo")
@@ -37,7 +51,17 @@ MAX_DECISION_ROWS = 80
 MAX_TABLE_ROWS = 120
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.1-flash-lite")
 GEMINI_SUMMARY_FILE = "gemini_summary.json"
-MODE_ORDER = {"fixed": 0, "local": 1, "flowmind": 2}
+MUTATION_TOKEN = os.environ.get("FLOWMIND_MUTATION_TOKEN", "")
+REQUIRE_MUTATION_AUTH = os.environ.get(
+    "FLOWMIND_REQUIRE_MUTATION_AUTH", "0"
+).strip().lower() not in {"", "0", "false", "no", "off"}
+MODE_ORDER = {
+    "static_fixed": 0,
+    "sumo_actuated": 1,
+    "local": 2,
+    "flowmind": 3,
+    "fixed": 4,
+}
 AVERAGE_METRICS = {
     "average_travel_time": "Сер. час поїздки, с",
     "average_waiting_time": "Сер. очікування, с",
@@ -45,15 +69,36 @@ AVERAGE_METRICS = {
     "max_queue_length": "Макс. черга, авто",
     "throughput": "Пропуск, авто",
     "stops_count": "Зупинки",
-    "gridlock_risk": "Gridlock risk",
+    "blocked_outgoing_share": "Blocked outgoing share",
+    "spillback_free_time_share": "Час без spillback, частка",
+    "spillback_episode_count": "Епізоди spillback",
+    "zone_throughput_per_minute": "Пропуск зони / хв",
+    "outflow_per_control_action": "Outflow / керуючу дію",
+    "clearance_action_share": "Частка clearance-рішень",
     "controller_decisions": "Рішення контролера",
     "phase_extensions": "Продовження зеленого",
     "phase_advances": "Перемикання фаз",
+    "zone_coordination_candidates": "Зональні кандидати",
+    "zone_coordination_overrides": "Зональні overrides",
+    "zone_coordination_gain_total": "Сумарний coordination gain",
+    "zone_coordination_override_rate": "Частка зональних overrides",
+    "zone_coordination_mean_gain": "Сер. coordination gain",
+    "zone_coordination_guarded_switches": "Відхилені ранні перемикання",
+    "zone_coordination_extra_holds": "Додаткові зональні утримання",
     "priority_decisions": "Пріоритети швидкої",
     "queue_forecast_predictions": "ML-прогнози",
     "sensor_range_meters": "Радіус датчиків, м",
     "simulated_duration": "Тривалість, с",
 }
+PAIRED_BENCHMARK_MODES = (
+    "static_fixed",
+    "sumo_actuated",
+    "local",
+    "flowmind",
+)
+ZONE_COMPARISON_CACHE_TTL_SECONDS = 30.0
+_ZONE_COMPARISON_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+_ZONE_COMPARISON_CACHE_LOCK = threading.Lock()
 
 
 def _python_executable() -> Path:
@@ -87,6 +132,111 @@ def _result_id(path: Path) -> str:
     return hashlib.sha1(str(path.resolve()).encode("utf-8")).hexdigest()[:16]
 
 
+def authorize_mutation(request: Any) -> None:
+    if not REQUIRE_MUTATION_AUTH:
+        return
+    if not MUTATION_TOKEN:
+        raise HTTPException(
+            status_code=503,
+            detail="Mutation auth is required but FLOWMIND_MUTATION_TOKEN is unset",
+        )
+    supplied = str(request.headers.get("x-flowmind-token", ""))
+    authorization = str(request.headers.get("authorization", ""))
+    if not supplied and authorization.lower().startswith("bearer "):
+        supplied = authorization[7:].strip()
+    if not supplied or not hmac.compare_digest(supplied, MUTATION_TOKEN):
+        raise HTTPException(status_code=401, detail="Invalid FlowMind mutation token")
+
+
+def build_jobs_payload(
+    results_dir: Path = RESULTS_DIR,
+    models_dir: Path = PROJECT_ROOT / "models",
+) -> dict[str, Any]:
+    dataset_dir = results_dir / "dataset"
+    index_path = dataset_dir / "dataset_index.csv"
+    rows = _read_summary_rows(index_path) if index_path.is_file() else []
+    completed = sum(1 for row in rows if row.get("status") == "completed")
+    expected = int(os.environ.get("FLOWMIND_DATASET_EXPECTED_RUNS", "400"))
+    elapsed = [
+        value
+        for row in rows
+        if (value := _as_float(row.get("elapsed_seconds"))) is not None and value > 0
+    ]
+    eta_seconds = (
+        round(sum(elapsed) / len(elapsed) * max(expected - completed, 0), 1)
+        if elapsed and completed < expected
+        else 0.0 if completed >= expected else None
+    )
+    try:
+        disk = shutil.disk_usage(results_dir)
+        disk_payload = {
+            "total_gb": round(disk.total / 1024**3, 2),
+            "used_gb": round(disk.used / 1024**3, 2),
+            "free_gb": round(disk.free / 1024**3, 2),
+        }
+    except OSError:
+        disk_payload = {"total_gb": None, "used_gb": None, "free_gb": None}
+    training = newest_json(
+        tuple(models_dir.glob("**/ensemble_training.json"))
+        + tuple(results_dir.glob("**/ensemble_training.json"))
+    )
+    evaluation = newest_json(tuple(results_dir.glob("evaluation/*/evaluation_manifest.json")))
+    quality = _read_json(dataset_dir / "quality_report.json")
+    return {
+        "dataset": {
+            "status": "completed" if completed >= expected else "running" if completed else "waiting",
+            "completed_runs": completed,
+            "expected_runs": expected,
+            "eta_seconds": eta_seconds,
+            "quality_status": quality.get("status", "waiting"),
+            "accepted_runs": quality.get("accepted_run_count"),
+            "rejected_runs": quality.get("rejected_run_count"),
+        },
+        "disk": disk_payload,
+        "trainer": training,
+        "evaluation": evaluation,
+    }
+
+
+def newest_json(paths: tuple[Path, ...]) -> dict[str, Any]:
+    existing = [path for path in paths if path.is_file()]
+    if not existing:
+        return {"status": "waiting"}
+    path = max(existing, key=_safe_stat_mtime)
+    return {**_read_json(path), "manifest_path": _display_path(path)}
+
+
+def build_model_registry(
+    models_dir: Path = PROJECT_ROOT / "models",
+) -> dict[str, Any]:
+    approval = _read_json(models_dir / "queue_control_approval.json")
+    models = []
+    for path in sorted(models_dir.glob("*_metadata.json")):
+        metadata = _read_json(path)
+        models.append(
+            {
+                "name": path.name.removesuffix("_metadata.json"),
+                "metadata_path": _display_path(path),
+                "artifact_sha256": metadata.get("artifact_sha256"),
+                "dataset_fingerprint": metadata.get("dataset_fingerprint"),
+                "known_tls_count": len(metadata.get("known_tls_ids", [])),
+                "known_lane_count": len(metadata.get("known_lane_ids", [])),
+                "validation_mae": (
+                    metadata.get("metrics", {}).get("validation", {}).get("mae")
+                    if isinstance(metadata.get("metrics"), dict)
+                    else None
+                ),
+                "forecast_contract": metadata.get("forecast_contract"),
+                "approved": (
+                    approval.get("status") == "approved"
+                    and metadata.get("artifact_sha256")
+                    in approval.get("model_artifact_sha256", [])
+                ),
+            }
+        )
+    return {"models": models, "approval": approval or {"status": "waiting"}}
+
+
 def _as_float(value: Any) -> float | None:
     if value in (None, ""):
         return None
@@ -117,17 +267,109 @@ def _read_summary_rows(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
+def _spillback_metrics_from_timeseries(
+    path: Path,
+    simulated_duration: Any = None,
+) -> dict[str, Any]:
+    rows = _read_summary_rows(path)
+    observations = [
+        (
+            _as_float(row.get("time")),
+            _as_float(row.get("blocked_outgoing_share")),
+        )
+        for row in rows
+    ]
+    observations = [
+        (time_value, share)
+        for time_value, share in observations
+        if time_value is not None
+    ]
+    if not observations:
+        return {}
+    observations.sort(key=lambda item: item[0])
+    duration = _as_float(simulated_duration)
+    if duration is None:
+        duration = observations[-1][0]
+    duration = max(duration, 0.0)
+    previous_time = 0.0
+    previous_blocked: bool | None = None
+    latest_blocked: bool | None = None
+    observed_duration = 0.0
+    free_duration = 0.0
+    episodes = 0
+    for sample_time, share in observations:
+        time_value = min(max(sample_time, previous_time), duration)
+        interval = max(time_value - previous_time, 0.0)
+        if share is None:
+            previous_blocked = None
+            latest_blocked = None
+        else:
+            blocked = share > 0.0
+            observed_duration += interval
+            if not blocked:
+                free_duration += interval
+            if blocked and previous_blocked is not True:
+                episodes += 1
+            previous_blocked = blocked
+            latest_blocked = blocked
+        previous_time = time_value
+        if time_value >= duration:
+            break
+    if previous_time < duration and latest_blocked is not None:
+        interval = duration - previous_time
+        observed_duration += interval
+        if not latest_blocked:
+            free_duration += interval
+    if observed_duration <= 0:
+        return {}
+    return {
+        "spillback_free_time_share": round(
+            free_duration / observed_duration,
+            4,
+        ),
+        "spillback_episode_count": episodes,
+    }
+
+
+def _enrich_summary_from_timeseries(
+    summary: dict[str, Any],
+    result_dir: Path,
+) -> dict[str, Any]:
+    enriched = dict(summary)
+    if (
+        enriched.get("spillback_free_time_share") is not None
+        and enriched.get("spillback_episode_count") is not None
+    ):
+        return enriched
+    mode = str(enriched.get("mode") or "")
+    candidates = (
+        [result_dir / f"{mode}_timeseries.csv"] if mode else []
+    ) + sorted(result_dir.glob("*_timeseries.csv"))
+    path = next((item for item in candidates if item.is_file()), None)
+    if path is not None:
+        for key, value in _spillback_metrics_from_timeseries(
+            path,
+            enriched.get("simulated_duration"),
+        ).items():
+            if enriched.get(key) is None:
+                enriched[key] = value
+    return enriched
+
+
 def summary_rows_for_result(result_dir: Path) -> list[dict[str, Any]]:
     summary_path = result_dir / "summary.csv"
     if summary_path.exists():
-        return _read_summary_rows(summary_path)
+        return [
+            _enrich_summary_from_timeseries(row, result_dir)
+            for row in _read_summary_rows(summary_path)
+        ]
     live_path = result_dir / "live_status.json"
     if not live_path.exists():
         return []
     payload = _read_json(live_path)
     summary = payload.get("summary")
     if isinstance(summary, dict) and summary:
-        return [dict(summary)]
+        return [_enrich_summary_from_timeseries(summary, result_dir)]
     return []
 
 
@@ -136,6 +378,154 @@ def primary_summary_for_result(result_dir: Path) -> dict[str, Any]:
     if rows:
         return rows[-1]
     return {}
+
+
+def _paired_report_rank(
+    path: Path,
+    report: dict[str, Any],
+) -> tuple[int, int, int, int, float]:
+    preferred_id = os.environ.get("FLOWMIND_DASHBOARD_EVALUATION_ID", "").strip()
+    evaluation_id = str(report.get("evaluation_id") or path.parent.name)
+    final_benchmark = not bool(report.get("not_a_final_benchmark", False))
+    emergency_evaluated = bool(report.get("emergency_route_evaluated", False))
+    valid_pairs = int(report.get("valid_pair_count") or 0)
+    return (
+        int(bool(preferred_id and evaluation_id == preferred_id)),
+        int(final_benchmark),
+        int(emergency_evaluated),
+        valid_pairs,
+        _safe_stat_mtime(path),
+    )
+
+
+def _summary_matches_pair(
+    summary: dict[str, Any],
+    pair: dict[str, Any],
+    mode: str,
+    *,
+    emergency_route_evaluated: bool,
+) -> bool:
+    if str(summary.get("mode")) != mode:
+        return False
+    expected_pair_id = str(pair.get("pair_id") or "")
+    actual_pair_id = str(summary.get("evaluation_pair_id") or "")
+    if actual_pair_id and expected_pair_id and actual_pair_id != expected_pair_id:
+        return False
+    expected_seed = pair.get("seed")
+    if expected_seed is not None and summary.get("seed") is not None:
+        if int(summary["seed"]) != int(expected_seed):
+            return False
+    expected_config = str(pair.get("pair_config_sha256") or "")
+    actual_config = str(summary.get("pair_config_sha256") or "")
+    if expected_config and actual_config != expected_config:
+        return False
+    if emergency_route_evaluated:
+        expected_route = str(pair.get("emergency_route_sha256") or "")
+        actual_route = str(summary.get("emergency_route_sha256") or "")
+        if expected_route and actual_route != expected_route:
+            return False
+    return True
+
+
+def _paired_evaluation_rows(
+    base_dir: Path,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    reports: list[tuple[Path, dict[str, Any]]] = []
+    for path in base_dir.glob("evaluation/*/evaluation_report.json"):
+        report = _read_json(path)
+        required_modes = set(report.get("required_modes") or ())
+        if (
+            int(report.get("valid_pair_count") or 0) > 0
+            and "static_fixed" in required_modes
+            and "flowmind" in required_modes
+        ):
+            reports.append((path, report))
+    reports.sort(
+        key=lambda item: _paired_report_rank(item[0], item[1]),
+        reverse=True,
+    )
+
+    for report_path, report in reports:
+        evaluation_dir = report_path.parent
+        valid_pairs = report.get("valid_pairs")
+        if not isinstance(valid_pairs, list) or not valid_pairs:
+            continue
+        requested_modes = [
+            mode
+            for mode in PAIRED_BENCHMARK_MODES
+            if mode in set(report.get("required_modes") or ())
+        ]
+        summaries_by_pair: list[dict[str, dict[str, Any]]] = []
+        emergency_evaluated = bool(report.get("emergency_route_evaluated", False))
+        for pair in valid_pairs:
+            if not isinstance(pair, dict):
+                continue
+            try:
+                replicate = int(pair["replicate"])
+                seed = int(pair["seed"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            pair_dir = evaluation_dir / f"pair_{replicate:03d}_seed_{seed}"
+            pair_summaries: dict[str, dict[str, Any]] = {}
+            for mode in requested_modes:
+                mode_dir = pair_dir / mode
+                summary = _enrich_summary_from_timeseries(
+                    _read_json(mode_dir / f"{mode}_summary.json"),
+                    mode_dir,
+                )
+                if _summary_matches_pair(
+                    summary,
+                    pair,
+                    mode,
+                    emergency_route_evaluated=emergency_evaluated,
+                ):
+                    pair_summaries[mode] = summary
+            if "static_fixed" in pair_summaries and "flowmind" in pair_summaries:
+                summaries_by_pair.append(pair_summaries)
+
+        if not summaries_by_pair:
+            continue
+
+        excluded_modes: dict[str, str] = {}
+        included_modes = [
+            mode
+            for mode in requested_modes
+            if all(mode in pair for pair in summaries_by_pair)
+        ]
+        if "sumo_actuated" in included_modes:
+            coverage_complete = all(
+                pair["sumo_actuated"].get("actuated_detector_coverage_complete")
+                is True
+                for pair in summaries_by_pair
+            )
+            if not coverage_complete:
+                included_modes.remove("sumo_actuated")
+                excluded_modes["sumo_actuated"] = (
+                    "incomplete actuated detector coverage"
+                )
+
+        rows = [
+            pair[mode]
+            for pair in summaries_by_pair
+            for mode in included_modes
+        ]
+        if not rows:
+            continue
+        return rows, {
+            "scope": "paired_evaluation",
+            "evaluation_id": str(report.get("evaluation_id") or evaluation_dir.name),
+            "report_path": _display_path(report_path),
+            "pair_count": len(summaries_by_pair),
+            "reported_valid_pair_count": int(report.get("valid_pair_count") or 0),
+            "included_modes": included_modes,
+            "excluded_modes": excluded_modes,
+            "emergency_route_evaluated": emergency_evaluated,
+            "overall_status": report.get("overall_status"),
+            "validation_profile": report.get("validation_profile"),
+            "not_a_final_benchmark": bool(report.get("not_a_final_benchmark", False)),
+            "same_seed_and_scenario": True,
+        }
+    return [], {}
 
 
 def find_latest_live_status(
@@ -158,6 +548,52 @@ def find_latest_live_status(
     if not unique:
         return None
     return max(unique.values(), key=_safe_stat_mtime)
+
+
+def find_preferred_zone_live_status(
+    base_dir: Path = RESULTS_DIR,
+    current_running_dir: Path | None = None,
+) -> Path | None:
+    """Prefer an active run, then a completed real FlowMind zone snapshot."""
+
+    if current_running_dir is not None:
+        current_path = current_running_dir / "live_status.json"
+        if current_path.is_file():
+            return current_path
+
+    candidates = (
+        list(base_dir.glob("**/live_status.json"))
+        if base_dir.exists()
+        else []
+    )
+    try:
+        include_web_results = base_dir.resolve() == RESULTS_DIR.resolve()
+    except OSError:
+        include_web_results = base_dir == RESULTS_DIR
+    if include_web_results and WEB_RESULTS_DIR.exists() and WEB_RESULTS_DIR != base_dir:
+        candidates.extend(WEB_RESULTS_DIR.glob("**/live_status.json"))
+
+    completed: list[tuple[Path, str]] = []
+    for path in {candidate.resolve(): candidate for candidate in candidates}.values():
+        payload = _read_json(path)
+        system = payload.get("system")
+        simulation = system.get("simulation") if isinstance(system, dict) else {}
+        zone = payload.get("zone_simulation")
+        zone = zone if isinstance(zone, dict) else {}
+        simulation_status = (
+            simulation.get("status") if isinstance(simulation, dict) else ""
+        )
+        status = str(simulation_status or zone.get("status") or "").lower()
+        has_snapshot = bool(zone.get("intersections") or zone.get("lanes"))
+        if status == "completed" and has_snapshot:
+            completed.append((path, str(payload.get("mode") or zone.get("mode") or "")))
+
+    flowmind = [path for path, mode in completed if mode == "flowmind"]
+    if flowmind:
+        return max(flowmind, key=_safe_stat_mtime)
+    if completed:
+        return max((path for path, _mode in completed), key=_safe_stat_mtime)
+    return max(candidates, key=_safe_stat_mtime) if candidates else None
 
 
 def discover_result_sets(base_dir: Path = RESULTS_DIR) -> list[dict[str, Any]]:
@@ -232,6 +668,10 @@ def find_result_dir_by_id(
     result_id: str,
     base_dir: Path | None = None,
 ) -> Path | None:
+    if len(result_id) != 16 or any(
+        character not in "0123456789abcdef" for character in result_id
+    ):
+        return None
     search_dir = base_dir or RESULTS_DIR
     for entry in discover_result_sets(search_dir):
         if entry.get("id") == result_id:
@@ -279,24 +719,175 @@ def build_result_detail_payload(result_id: str) -> dict[str, Any]:
     return payload
 
 
+def _with_zone_comparison_metrics(row: dict[str, Any]) -> dict[str, Any]:
+    enriched = dict(row)
+    duration = _as_float(enriched.get("simulated_duration"))
+    outflow = _as_float(
+        enriched.get("zone_outflow")
+        if enriched.get("zone_outflow") is not None
+        else enriched.get("throughput")
+    )
+    decisions = _as_float(enriched.get("controller_decisions"))
+    advances = _as_float(enriched.get("phase_advances"))
+    zone_candidates = _as_float(enriched.get("zone_coordination_candidates"))
+    zone_overrides = _as_float(enriched.get("zone_coordination_overrides"))
+    zone_gain = _as_float(enriched.get("zone_coordination_gain_total"))
+    if duration is not None and duration > 0 and outflow is not None:
+        enriched["zone_throughput_per_minute"] = outflow * 60.0 / duration
+    if decisions is not None and decisions > 0 and outflow is not None:
+        enriched["outflow_per_control_action"] = outflow / decisions
+    if decisions is not None and decisions > 0 and advances is not None:
+        enriched["clearance_action_share"] = advances / decisions
+    if (
+        zone_candidates is not None
+        and zone_candidates > 0
+        and zone_overrides is not None
+    ):
+        enriched["zone_coordination_override_rate"] = (
+            zone_overrides / zone_candidates
+        )
+    if (
+        zone_overrides is not None
+        and zone_overrides > 0
+        and zone_gain is not None
+    ):
+        enriched["zone_coordination_mean_gain"] = zone_gain / zone_overrides
+    return enriched
+
+
+def _flowmind_local_comparison(
+    modes: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    by_mode = {str(item.get("mode")): item for item in modes}
+    flowmind = by_mode.get("flowmind")
+    local = by_mode.get("local")
+    if flowmind is None or local is None:
+        return []
+    specifications: tuple[tuple[str, bool | None, str], ...] = (
+        ("average_waiting_time", True, "outcome"),
+        ("throughput", False, "outcome"),
+        ("max_queue_length", True, "zone_outcome"),
+        ("blocked_outgoing_share", True, "zone_outcome"),
+        ("spillback_free_time_share", False, "zone_outcome"),
+        ("spillback_episode_count", True, "zone_outcome"),
+        ("zone_throughput_per_minute", False, "zone_outcome"),
+        ("outflow_per_control_action", None, "controller_diagnostic"),
+        ("clearance_action_share", None, "controller_diagnostic"),
+    )
+    comparisons: list[dict[str, Any]] = []
+    for key, lower_is_better, category in specifications:
+        flow_value = _as_float(
+            (flowmind.get("metrics") or {}).get(key, {}).get("average")
+        )
+        local_value = _as_float(
+            (local.get("metrics") or {}).get(key, {}).get("average")
+        )
+        if flow_value is None or local_value is None:
+            continue
+        difference = flow_value - local_value
+        difference_percent = (
+            difference / abs(local_value) * 100.0
+            if abs(local_value) > 1e-12
+            else None
+        )
+        improvement = (
+            local_value - flow_value
+            if lower_is_better is True
+            else flow_value - local_value
+            if lower_is_better is False
+            else None
+        )
+        improvement_percent = (
+            improvement / abs(local_value) * 100.0
+            if improvement is not None and abs(local_value) > 1e-12
+            else None
+        )
+        neutral = lower_is_better is None
+        comparisons.append(
+            {
+                "key": key,
+                "label": AVERAGE_METRICS.get(key, key),
+                "category": category,
+                "lower_is_better": lower_is_better,
+                "flowmind": flow_value,
+                "local": local_value,
+                "difference": difference,
+                "difference_percent": difference_percent,
+                "improvement": improvement,
+                "improvement_percent": improvement_percent,
+                "value": (
+                    difference_percent if neutral else improvement_percent
+                ),
+                "unit": "%",
+                "description": (
+                    f"FlowMind {flow_value:.4g}; Local {local_value:.4g}. "
+                    + (
+                        "Діагностична різниця; напрямок не означає перевагу."
+                        if neutral
+                        else
+                        "Вище — краще."
+                        if not lower_is_better
+                        else "Нижче — краще."
+                    )
+                ),
+                "status": (
+                    "neutral"
+                    if neutral
+                    else "better"
+                    if improvement > 1e-9
+                    else "worse"
+                    if improvement < -1e-9
+                    else "tie"
+                ),
+                "winner": (
+                    "neutral"
+                    if neutral
+                    else "flowmind"
+                    if improvement > 1e-9
+                    else "local"
+                    if improvement < -1e-9
+                    else "tie"
+                ),
+            }
+        )
+    return comparisons
+
+
 def build_averages_payload(base_dir: Path = RESULTS_DIR) -> dict[str, Any]:
+    discovered_results = discover_result_sets(base_dir)
+    paired_rows, benchmark = _paired_evaluation_rows(base_dir)
     grouped: dict[str, dict[str, list[float]]] = {}
     result_count_by_mode: dict[str, int] = {}
     total_rows = 0
-    for result in discover_result_sets(base_dir):
-        path = result.get("path")
-        if not isinstance(path, str):
-            continue
-        result_dir = PROJECT_ROOT / path
-        for row in summary_rows_for_result(result_dir):
-            mode = str(row.get("mode") or result.get("mode") or "unknown")
-            total_rows += 1
-            result_count_by_mode[mode] = result_count_by_mode.get(mode, 0) + 1
-            metrics = grouped.setdefault(mode, {})
-            for key in AVERAGE_METRICS:
-                value = _as_float(row.get(key))
-                if value is not None:
-                    metrics.setdefault(key, []).append(value)
+    if paired_rows:
+        rows_with_modes = [
+            (row, str(row.get("mode") or "unknown"))
+            for row in paired_rows
+        ]
+    else:
+        rows_with_modes = []
+        for result in discovered_results:
+            path = result.get("path")
+            if not isinstance(path, str):
+                continue
+            result_dir = PROJECT_ROOT / path
+            rows_with_modes.extend(
+                (
+                    row,
+                    str(row.get("mode") or result.get("mode") or "unknown"),
+                )
+                for row in summary_rows_for_result(result_dir)
+            )
+
+    for raw_row, mode in rows_with_modes:
+        row = _with_zone_comparison_metrics(raw_row)
+        total_rows += 1
+        result_count_by_mode[mode] = result_count_by_mode.get(mode, 0) + 1
+        metrics = grouped.setdefault(mode, {})
+        for key in AVERAGE_METRICS:
+            value = _as_float(row.get(key))
+            if value is not None:
+                metrics.setdefault(key, []).append(value)
 
     modes: list[dict[str, Any]] = []
     for mode, metric_values in grouped.items():
@@ -320,11 +911,423 @@ def build_averages_payload(base_dir: Path = RESULTS_DIR) -> dict[str, Any]:
         )
 
     modes.sort(key=lambda item: (MODE_ORDER.get(str(item["mode"]), 99), str(item["mode"])))
+    flowmind_vs_local = _flowmind_local_comparison(modes)
     return {
         "modes": modes,
         "metrics": AVERAGE_METRICS,
         "total_rows": total_rows,
-        "total_results": len(discover_result_sets(base_dir)),
+        "total_results": total_rows if paired_rows else len(discovered_results),
+        "historical_result_count": len(discovered_results),
+        "scope": "paired_evaluation" if paired_rows else "historical_all_runs",
+        "benchmark": benchmark,
+        "flowmind_vs_local": flowmind_vs_local,
+        "flowmind_zone_wins": [
+            item
+            for item in flowmind_vs_local
+            if item["winner"] == "flowmind"
+            and item["category"] in {"zone_outcome", "controller_diagnostic"}
+        ],
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _zone_comparison_context(base_dir: Path) -> dict[str, Any]:
+    try:
+        cache_key = str(base_dir.resolve())
+    except OSError:
+        cache_key = str(base_dir.absolute())
+    now = time.monotonic()
+    with _ZONE_COMPARISON_CACHE_LOCK:
+        cached = _ZONE_COMPARISON_CACHE.get(cache_key)
+        if cached is not None and now - cached[0] < ZONE_COMPARISON_CACHE_TTL_SECONDS:
+            return cached[1]
+
+    averages = build_averages_payload(base_dir)
+    benchmark = averages.get("benchmark")
+    benchmark = benchmark if isinstance(benchmark, dict) else {}
+    context = {
+        "advantages": averages.get("flowmind_vs_local", []),
+        "zone_wins": averages.get("flowmind_zone_wins", []),
+        "comparison": {
+            "scope": averages.get("scope"),
+            "snapshot_specific": False,
+            "evaluation_id": benchmark.get("evaluation_id"),
+            "pair_count": benchmark.get("pair_count"),
+            "same_seed_and_scenario": benchmark.get("same_seed_and_scenario"),
+            "not_a_final_benchmark": benchmark.get("not_a_final_benchmark"),
+        },
+    }
+    with _ZONE_COMPARISON_CACHE_LOCK:
+        if len(_ZONE_COMPARISON_CACHE) >= 8 and cache_key not in _ZONE_COMPARISON_CACHE:
+            oldest_key = min(
+                _ZONE_COMPARISON_CACHE,
+                key=lambda key: _ZONE_COMPARISON_CACHE[key][0],
+            )
+            _ZONE_COMPARISON_CACHE.pop(oldest_key, None)
+        _ZONE_COMPARISON_CACHE[cache_key] = (time.monotonic(), context)
+    return context
+
+
+@lru_cache(maxsize=1)
+def build_static_zone_catalog() -> dict[str, Any]:
+    zone = load_zone_definition(ZONE_DEFINITION_PATH)
+    area = discover_area(
+        ZONE_NETWORK_PATH,
+        requested_tls=load_zone_tls_ids(ZONE_DEFINITION_PATH),
+    )
+    zone_intersections = {
+        item.tls_id: item for item in zone.intersections
+    }
+    intersections: list[dict[str, Any]] = []
+    for intersection in area.intersections:
+        definition = zone_intersections[intersection.tls_id]
+        intersections.append(
+            {
+                "tls_id": intersection.tls_id,
+                "name": definition.name,
+                "corridors": list(definition.corridor_ids),
+                "x": round(float(intersection.position[0]), 3),
+                "y": round(float(intersection.position[1]), 3),
+                "phase": 0,
+                "state": intersection.phases[0] if intersection.phases else "",
+                "phase_duration": intersection.default_phase_duration(0),
+                "phase_min_duration": intersection.phase_min_duration(0),
+                "phase_max_duration": intersection.phase_max_duration(0),
+                "phase_elapsed": 0.0,
+                "vehicle_count": 0,
+                "queue": 0,
+                "incoming_vehicles": 0,
+                "incoming_queue": 0,
+                "outgoing_occupancy": 0.0,
+                "phases": [
+                    {
+                        "index": index,
+                        "state": state,
+                        "duration": intersection.default_phase_duration(index),
+                        "min_duration": intersection.phase_min_duration(index),
+                        "max_duration": intersection.phase_max_duration(index),
+                        "green": index in intersection.green_phase_indices,
+                    }
+                    for index, state in enumerate(intersection.phases)
+                ],
+                "movements": [
+                    {
+                        "incoming_lane": link.incoming_lane,
+                        "outgoing_lane": link.outgoing_lane,
+                        "signal_index": link.signal_index,
+                        "state": (
+                            intersection.phases[0][link.signal_index]
+                            if intersection.phases
+                            and 0 <= link.signal_index < len(intersection.phases[0])
+                            else "r"
+                        ),
+                    }
+                    for link in intersection.links
+                ],
+            }
+        )
+    lanes = [
+        {
+            **lane,
+            "vehicle_count": 0,
+            "queue": 0,
+            "occupancy": 0.0,
+            "mean_speed": 0.0,
+        }
+        for lane in area.visual_lanes
+    ]
+    points = [
+        point
+        for lane in lanes
+        for point in lane.get("shape", [])
+        if isinstance(point, list) and len(point) >= 2
+    ]
+    bounds = {
+        "min_x": min(float(point[0]) for point in points) if points else 0.0,
+        "max_x": max(float(point[0]) for point in points) if points else 1.0,
+        "min_y": min(float(point[1]) for point in points) if points else 0.0,
+        "max_y": max(float(point[1]) for point in points) if points else 1.0,
+    }
+    return {
+        "id": zone.zone_id,
+        "name": zone.name,
+        "intersection_count": len(intersections),
+        "lane_count": len(lanes),
+        "intersections": intersections,
+        "lanes": lanes,
+        "corridors": [
+            {
+                "id": corridor.corridor_id,
+                "tls_sequence": list(corridor.tls_sequence),
+            }
+            for corridor in zone.corridors
+        ],
+        "bounds": bounds,
+    }
+
+
+def _merge_zone_scene(
+    catalog: dict[str, Any],
+    live_payload: dict[str, Any],
+) -> dict[str, Any]:
+    zone_snapshot = live_payload.get("zone_simulation")
+    if not isinstance(zone_snapshot, dict):
+        zone_snapshot = {}
+    raw_intersections = zone_snapshot.get("intersections")
+    if not isinstance(raw_intersections, list):
+        raw_intersections = live_payload.get("intersections")
+    if not isinstance(raw_intersections, list):
+        raw_intersections = []
+    telemetry_by_tls = {
+        str(item.get("tls_id")): item
+        for item in raw_intersections
+        if isinstance(item, dict) and item.get("tls_id")
+    }
+    intersections = []
+    for static in catalog["intersections"]:
+        telemetry = telemetry_by_tls.get(str(static["tls_id"]), {})
+        merged = {**static, **telemetry}
+        merged["name"] = static["name"]
+        merged["corridors"] = static["corridors"]
+        merged["phases"] = static["phases"]
+        if not isinstance(telemetry.get("movements"), list):
+            merged["movements"] = static["movements"]
+        intersections.append(merged)
+
+    raw_lanes = zone_snapshot.get("lanes")
+    if not isinstance(raw_lanes, list):
+        raw_lanes = live_payload.get("lanes")
+    if not isinstance(raw_lanes, list):
+        raw_lanes = []
+    telemetry_by_lane = {
+        str(item.get("lane_id")): item
+        for item in raw_lanes
+        if isinstance(item, dict) and item.get("lane_id")
+    }
+    lanes = [
+        {
+            **static,
+            **telemetry_by_lane.get(str(static["lane_id"]), {}),
+            "shape": static["shape"],
+            "directions": static["directions"],
+            "tls_ids": static["tls_ids"],
+        }
+        for static in catalog["lanes"]
+    ]
+    vehicles = zone_snapshot.get("vehicles")
+    if not isinstance(vehicles, list):
+        vehicles = live_payload.get("vehicles")
+    if not isinstance(vehicles, list):
+        vehicles = []
+    return {
+        "intersections": intersections,
+        "lanes": lanes,
+        "vehicles": vehicles[:250],
+        "bounds": catalog["bounds"],
+    }
+
+
+def _read_zone_timeline(
+    result_dir: Path | None,
+    mode: str,
+    live_payload: dict[str, Any],
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    if result_dir is not None:
+        preferred = result_dir / f"{mode}_timeseries.csv"
+        candidates = (
+            [preferred] if preferred.is_file() else []
+        ) + sorted(result_dir.glob("*_timeseries.csv"))
+        path = next((item for item in candidates if item.is_file()), None)
+        if path is not None:
+            rows = _read_summary_rows(path)
+    if not rows:
+        history = live_payload.get("metric_history")
+        if isinstance(history, list):
+            rows = [dict(item) for item in history if isinstance(item, dict)]
+    if len(rows) <= 360:
+        return rows
+    step = max(len(rows) // 360, 1)
+    sampled = rows[::step]
+    if sampled[-1] is not rows[-1]:
+        sampled.append(rows[-1])
+    return sampled[-360:]
+
+
+def _read_zone_predictions(
+    result_dir: Path | None,
+    mode: str,
+    live_payload: dict[str, Any],
+) -> list[dict[str, Any]]:
+    if result_dir is not None:
+        preferred = result_dir / f"{mode}_queue_forecast.csv"
+        candidates = (
+            [preferred] if preferred.is_file() else []
+        ) + sorted(result_dir.glob("*_queue_forecast.csv"))
+        path = next((item for item in candidates if item.is_file()), None)
+        if path is not None:
+            return _read_summary_rows(path)[-160:]
+    system = live_payload.get("system")
+    system = system if isinstance(system, dict) else {}
+    forecast = system.get("queue_forecast")
+    return [dict(forecast)] if isinstance(forecast, dict) and forecast else []
+
+
+def build_zone_explorer_payload(
+    *,
+    result_id: str | None = None,
+    base_dir: Path = RESULTS_DIR,
+    process_manager: "DemoProcessManager | None" = None,
+) -> dict[str, Any]:
+    catalog = build_static_zone_catalog()
+    result_dir: Path | None = None
+    live_path: Path | None = None
+    if result_id:
+        result_dir = find_result_dir_by_id(result_id, base_dir)
+        if result_dir is None:
+            return {
+                "available": False,
+                "error": "unknown result_id",
+                "source": {
+                    "kind": "missing",
+                    "result_id": result_id,
+                    "status": "not_found",
+                    "scene_is_static": True,
+                    "illustrative": False,
+                },
+                "zone": {
+                    key: catalog[key]
+                    for key in (
+                        "id",
+                        "name",
+                        "intersection_count",
+                        "lane_count",
+                        "corridors",
+                        "bounds",
+                    )
+                },
+                "scene": {
+                    "intersections": [],
+                    "lanes": [],
+                    "vehicles": [],
+                    "bounds": catalog["bounds"],
+                },
+                "timeline": {
+                    "samples": [],
+                    "positions_are_static": True,
+                },
+                "actions": [],
+                "predictions": [],
+                "summary": {},
+                "system": {},
+                "advantages": [],
+                "zone_wins": [],
+                "comparison": {
+                    "scope": None,
+                    "snapshot_specific": False,
+                    "evaluation_id": None,
+                    "pair_count": None,
+                },
+            }
+        if result_dir is not None:
+            candidate = result_dir / "live_status.json"
+            live_path = candidate if candidate.is_file() else None
+    else:
+        current_running_dir = None
+        if process_manager is not None and process_manager.snapshot().get("running"):
+            current_running_dir = process_manager.current_results_dir
+        live_path = find_preferred_zone_live_status(
+            base_dir,
+            current_running_dir,
+        )
+        result_dir = live_path.parent if live_path is not None else None
+        if result_dir is not None:
+            result_id = _result_id(result_dir)
+
+    live_payload = _read_json(live_path) if live_path is not None else {}
+    mode = str(
+        live_payload.get("mode")
+        or (primary_summary_for_result(result_dir).get("mode") if result_dir else "")
+        or "flowmind"
+    )
+    system = live_payload.get("system")
+    system = system if isinstance(system, dict) else {}
+    simulation = system.get("simulation")
+    simulation = simulation if isinstance(simulation, dict) else {}
+    zone_snapshot = live_payload.get("zone_simulation")
+    zone_snapshot = zone_snapshot if isinstance(zone_snapshot, dict) else {}
+    status = str(
+        simulation.get("status")
+        or zone_snapshot.get("status")
+        or ("completed" if live_payload else "static")
+    ).lower()
+    scene = _merge_zone_scene(catalog, live_payload)
+    timeline = _read_zone_timeline(result_dir, mode, live_payload)
+    summary = (
+        _enrich_summary_from_timeseries(
+            live_payload.get("summary")
+            if isinstance(live_payload.get("summary"), dict)
+            else primary_summary_for_result(result_dir)
+            if result_dir is not None
+            else {},
+            result_dir,
+        )
+        if result_dir is not None
+        else {}
+    )
+    comparison_context = _zone_comparison_context(base_dir)
+    has_sumo_snapshot = bool(
+        zone_snapshot.get("intersections") or zone_snapshot.get("lanes")
+    )
+    return {
+        "available": bool(scene["intersections"]),
+        "source": {
+            "kind": (
+                "live"
+                if status == "running" and has_sumo_snapshot
+                else "archive"
+                if has_sumo_snapshot
+                else "static"
+            ),
+            "result_id": result_id,
+            "path": _display_path(result_dir) if result_dir is not None else None,
+            "status": status,
+            "mode": mode,
+            "snapshot_time": _as_float(
+                zone_snapshot.get("simulated_time")
+                if zone_snapshot
+                else live_payload.get("simulated_time")
+            ),
+            "scene_is_static": status != "running" or not has_sumo_snapshot,
+            "illustrative": not has_sumo_snapshot,
+        },
+        "zone": {
+            key: catalog[key]
+            for key in (
+                "id",
+                "name",
+                "intersection_count",
+                "lane_count",
+                "corridors",
+                "bounds",
+            )
+        },
+        "scene": scene,
+        "timeline": {
+            "samples": timeline,
+            "positions_are_static": status != "running" or not has_sumo_snapshot,
+        },
+        "actions": [
+            dict(item)
+            for item in live_payload.get("decision_log", [])
+            if isinstance(item, dict)
+        ][-160:],
+        "predictions": _read_zone_predictions(result_dir, mode, live_payload),
+        "summary": _with_zone_comparison_metrics(summary),
+        "system": system,
+        "advantages": comparison_context["advantages"],
+        "zone_wins": comparison_context["zone_wins"],
+        "comparison": comparison_context["comparison"],
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -416,7 +1419,10 @@ def build_summary_context(payload: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(rows, list):
         rows = []
     summary = payload.get("summary") if isinstance(payload.get("summary"), dict) else {}
-    fixed = next((row for row in rows if row.get("mode") == "fixed"), None)
+    fixed = next(
+        (row for row in rows if row.get("mode") == "static_fixed"),
+        None,
+    ) or next((row for row in rows if row.get("mode") == "fixed"), None)
     flow = next((row for row in rows if row.get("mode") == "flowmind"), None) or summary
     latest = payload.get("latest_sample") if isinstance(payload.get("latest_sample"), dict) else {}
     history = payload.get("metric_history") if isinstance(payload.get("metric_history"), list) else []
@@ -469,24 +1475,24 @@ def build_local_report(context: dict[str, Any]) -> str:
     improvements = context.get("improvements") or {}
     if fixed:
         return (
-            "FlowMind завершив порівняльну симуляцію з fixed baseline. "
+            "FlowMind завершив порівняльну симуляцію зі static fixed baseline. "
             f"Середній час очікування змінився з {_format_metric(fixed.get('average_waiting_time'), ' с')} "
             f"до {_format_metric(flow.get('average_waiting_time'), ' с')}, тобто покращення становить "
             f"{_format_metric(improvements.get('waiting_time_percent'), '%')}. "
             f"Середня черга змінилася з {_format_metric(fixed.get('average_queue_length'), ' авто')} "
             f"до {_format_metric(flow.get('average_queue_length'), ' авто')}. "
-            f"Пропускна здатність: fixed {_format_metric(fixed.get('throughput'), ' авто', 0)}, "
+            f"Пропускна здатність: static fixed {_format_metric(fixed.get('throughput'), ' авто', 0)}, "
             f"FlowMind {_format_metric(flow.get('throughput'), ' авто', 0)}. "
             f"Пікова черга в live-історії: {_format_metric(context.get('peak_queue'), ' авто', 0)}. "
             "Висновок: система краще підлаштовується під потік і дає зрозумілий ефект для демонстрації."
         )
     return (
-        "FlowMind завершив симуляцію без fixed baseline. "
+        "FlowMind завершив симуляцію без static fixed baseline. "
         f"Середній час очікування: {_format_metric(flow.get('average_waiting_time'), ' с')}, "
         f"середня черга: {_format_metric(flow.get('average_queue_length'), ' авто')}, "
         f"пропускна здатність: {_format_metric(flow.get('throughput'), ' авто', 0)}. "
         f"Пікова черга в live-історії: {_format_metric(context.get('peak_queue'), ' авто', 0)}. "
-        "Для повного порівняльного висновку запусти симуляцію з увімкненим режимом fixed + FlowMind."
+        "Для повного порівняльного висновку запусти симуляцію з увімкненим режимом static fixed + FlowMind."
     )
 
 
@@ -671,6 +1677,46 @@ def _bool_option(options: dict[str, Any], key: str, default: bool) -> bool:
     return bool(value)
 
 
+def mark_live_snapshot_inactive(
+    results_dir: Path | None,
+    status: str = "stopped",
+) -> None:
+    """Immediately disable the live-only map after this dashboard stops a run."""
+
+    if results_dir is None:
+        return
+    output_path = results_dir / "live_status.json"
+    payload = _read_json(output_path)
+    if not payload:
+        return
+    system = payload.get("system")
+    if not isinstance(system, dict):
+        system = {}
+    simulation = system.get("simulation")
+    if not isinstance(simulation, dict):
+        simulation = {}
+    simulation["status"] = status
+    system["simulation"] = simulation
+    payload["system"] = system
+    zone = payload.get("zone_simulation")
+    if isinstance(zone, dict):
+        zone["status"] = status
+        zone["active"] = False
+    payload["emitted_at"] = datetime.now(timezone.utc).isoformat()
+    temporary_path = output_path.with_suffix(".json.tmp")
+    try:
+        temporary_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        temporary_path.replace(output_path)
+    except OSError:
+        try:
+            temporary_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 class DemoProcessManager:
     def __init__(self) -> None:
         self._process: subprocess.Popen[str] | None = None
@@ -761,7 +1807,10 @@ class DemoProcessManager:
             self._exit_code = process.poll()
             self._finished_at = time.time()
             self._status = "stopped"
-            return self.snapshot_unlocked()
+            snapshot = self.snapshot_unlocked()
+            results_dir = self._results_dir
+        mark_live_snapshot_inactive(results_dir)
+        return snapshot
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
@@ -852,6 +1901,11 @@ def build_demo_command(options: dict[str, Any]) -> tuple[list[str], Path]:
         command.append("--headless")
     if not baseline:
         command.append("--no-baseline")
+    if os.getenv("FLOWMIND_ENABLE_QUEUE_CONTROL", "0").strip() == "1":
+        command.append("--enable-queue-control")
+    control_config = os.getenv("FLOWMIND_CONTROL_CONFIG", "").strip()
+    if control_config:
+        command.extend(["--control-config", control_config])
     return command, results_dir
 
 
@@ -1220,8 +2274,10 @@ HTML_PAGE = r"""<!doctype html>
         <p class="subtitle">Live-панель симуляції з камерною моделлю датчиків біля контрольованих перехресть.</p>
         <nav class="nav" aria-label="Dashboard navigation">
           <a href="/">Live</a>
+          <a href="/zone">Zone Explorer</a>
           <a href="/archive">Архів</a>
           <a href="/averages">Середні</a>
+          <a href="/jobs">Jobs</a>
         </nav>
       </div>
       <div class="status-line">
@@ -1245,7 +2301,7 @@ HTML_PAGE = r"""<!doctype html>
         <input id="emergencyDepart" type="number" min="0" value="180">
       </label>
       <label>Baseline
-        <span class="check"><input id="baseline" type="checkbox"> fixed + FlowMind</span>
+        <span class="check"><input id="baseline" type="checkbox"> static fixed + FlowMind</span>
       </label>
       <div class="buttons">
         <button id="startBtn">Запустити</button>
@@ -1374,7 +2430,15 @@ HTML_PAGE = r"""<!doctype html>
     }
 
     async function api(path, options = {}) {
+      const method = String(options.method || "GET").toUpperCase();
+      if (method !== "GET" && method !== "HEAD") {
+        let token = sessionStorage.getItem("flowmindMutationToken") || "";
+        if (!token) token = window.prompt("FlowMind admin token") || "";
+        if (token) sessionStorage.setItem("flowmindMutationToken", token);
+        options.headers = { ...(options.headers || {}), "X-FlowMind-Token": token };
+      }
       const response = await fetch(path, options);
+      if (response.status === 401) sessionStorage.removeItem("flowmindMutationToken");
       if (!response.ok) {
         const text = await response.text();
         throw new Error(text || response.statusText);
@@ -1436,10 +2500,20 @@ HTML_PAGE = r"""<!doctype html>
         if (id) {
           const payload = await api(`/api/archive/${id}`);
           payload.process = { status: "archive", running: false, logs: [] };
-          payload.system = payload.system || {
-            simulation: { status: "archive" },
-            metrics: { sensor_range_meters: payload.summary?.sensor_range_meters },
+          const system = payload.system && typeof payload.system === "object" ? payload.system : {};
+          const simulation = system.simulation && typeof system.simulation === "object" ? system.simulation : {};
+          payload.system = {
+            ...system,
+            simulation: { ...simulation, status: "archive" },
+            metrics: system.metrics || { sensor_range_meters: payload.summary?.sensor_range_meters },
           };
+          if (payload.zone_simulation && typeof payload.zone_simulation === "object") {
+            payload.zone_simulation = {
+              ...payload.zone_simulation,
+              status: "archive",
+              active: false,
+            };
+          }
           return payload;
         }
       }
@@ -1467,7 +2541,7 @@ HTML_PAGE = r"""<!doctype html>
     function renderMetrics(payload) {
       const latest = payload.latest_sample || {};
       const summary = payload.summary || {};
-      const gridlockRisk = latest.gridlock_risk ?? summary.gridlock_risk;
+      const gridlockRisk = latest.blocked_outgoing_share ?? summary.blocked_outgoing_share;
       const cards = [
         {
           label: "Активні авто",
@@ -1518,6 +2592,7 @@ HTML_PAGE = r"""<!doctype html>
       const summary = payload.summary || {};
       const simulation = system.simulation || {};
       const controller = system.controller || {};
+      const tlsPrograms = system.tls_programs || {};
       const forecast = system.queue_forecast || {};
       const corridor = system.corridor || {};
       const metrics = system.metrics || {};
@@ -1527,6 +2602,11 @@ HTML_PAGE = r"""<!doctype html>
           label: "Контролер",
           value: controller.status || "немає",
           note: `${fmt(controller.decisions)} рішень`
+        },
+        {
+          label: "TLS-програми",
+          value: tlsPrograms.status || "немає",
+          note: `${fmt(tlsPrograms.count, "", 0)} перевірено`
         },
         {
           label: "Прогноз",
@@ -1796,6 +2876,7 @@ DESIGN_PAGE = r"""<!doctype html>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>FlowMind Dashboard</title>
+  <link rel="stylesheet" href="/assets/zone-simulation.css">
   <style>
     :root {
       color-scheme: dark;
@@ -2592,7 +3673,7 @@ DESIGN_PAGE = r"""<!doctype html>
           <input id="emergencyDepart" type="number" min="0" value="180">
         </label>
         <label>Baseline
-          <span class="check"><input id="baseline" type="checkbox"> fixed + FlowMind</span>
+          <span class="check"><input id="baseline" type="checkbox"> static fixed + FlowMind</span>
         </label>
         <div class="actions">
           <button id="startBtn" title="Запустити симуляцію">▶ Запустити</button>
@@ -2610,7 +3691,7 @@ DESIGN_PAGE = r"""<!doctype html>
       <section class="side-group">
         <p class="side-label">Legend</p>
         <div class="legend">
-          <span><i class="swatch" style="background: var(--red)"></i> Fixed</span>
+          <span><i class="swatch" style="background: var(--red)"></i> Static Fixed</span>
           <span><i class="swatch" style="background: var(--amber)"></i> Local Adaptive</span>
           <span><i class="swatch" style="background: var(--cyan)"></i> FlowMind</span>
         </div>
@@ -2629,8 +3710,10 @@ DESIGN_PAGE = r"""<!doctype html>
           </div>
           <nav class="nav" aria-label="Dashboard navigation">
             <a href="/" class="active">Live</a>
+            <a href="/zone">Zone Explorer</a>
             <a href="/archive">Архів</a>
             <a href="/averages">Середні</a>
+            <a href="/jobs">Jobs</a>
           </nav>
         </div>
         <div class="status-line">
@@ -2641,6 +3724,76 @@ DESIGN_PAGE = r"""<!doctype html>
       </header>
 
       <section class="kpis" id="cards" data-panel="overview ops full"></section>
+
+      <section class="panel zone-simulation" id="zoneSimulation" data-panel="overview compare ops full" aria-labelledby="zoneSimulationTitle">
+        <div class="panel-header zone-sim-header">
+          <div class="zone-sim-heading">
+            <span class="zone-sim-eyebrow">SUMO LIVE · INTERSECTION MONITOR</span>
+            <h2 id="zoneSimulationTitle">Симуляція зони перехресть</h2>
+          </div>
+          <div class="zone-sim-header-actions">
+            <span class="tag warn" id="zoneSimulationSource">очікує SUMO snapshot</span>
+          </div>
+        </div>
+        <div class="zone-sim-body">
+          <div class="zone-sim-intro">
+            <p class="zone-sim-intro-copy">
+              Кожне контрольоване SUMO-перехрестя показане окремо зі своїми машинами, чергою, зайнятістю виходу та сигналом. Натисніть на потрібний вузол, щоб відстежувати його live. Mock-режим вимкнено.
+            </p>
+            <span class="zone-sim-readonly-mode" id="zoneSimulationMode">Режим: очікує дані</span>
+          </div>
+
+          <div class="zone-sim-layout">
+            <div class="zone-sim-map-wrap">
+              <div class="zone-sim-map" id="zoneSimulationMap" aria-live="polite" aria-label="Live-монітор окремих SUMO-перехресть"></div>
+              <div class="zone-sim-flow-status" aria-live="polite">
+                <div class="zone-sim-direction-card">
+                  <span class="zone-sim-direction-icon" id="zoneSimulationDirectionIcon" aria-hidden="true">⌁</span>
+                  <div>
+                    <span>Вибране перехрестя SUMO</span>
+                    <strong id="zoneSimulationDirection">—</strong>
+                  </div>
+                </div>
+                <p class="zone-sim-message" id="zoneSimulationMessage">Очікуємо активну SUMO-симуляцію та live snapshot.</p>
+              </div>
+            </div>
+
+            <aside class="zone-sim-sidebar" aria-label="Стан зони">
+              <div class="zone-sim-stat-grid">
+                <div class="zone-sim-stat">
+                  <span class="zone-sim-stat-label">Вузли зони</span>
+                  <strong id="zoneSimulationPressure">—</strong>
+                </div>
+                <div class="zone-sim-stat zone-sim-stat--free">
+                  <span class="zone-sim-stat-label">Авто у кадрі</span>
+                  <strong id="zoneSimulationFreeSpace">—</strong>
+                </div>
+                <div class="zone-sim-stat zone-sim-stat--queue">
+                  <span class="zone-sim-stat-label">Сумарна черга</span>
+                  <strong id="zoneSimulationQueue">—</strong>
+                </div>
+              </div>
+              <p class="zone-sim-phases-heading">Активні світлофори SUMO</p>
+              <div class="zone-sim-phases" id="zoneSimulationPhases"></div>
+              <div class="zone-sim-legend" aria-label="Легенда світлофорів">
+                <span><i class="green"></i> Зелений</span>
+                <span><i class="yellow"></i> Жовтий</span>
+                <span><i class="red"></i> Червоний</span>
+              </div>
+              <div class="zone-sim-legend zone-sim-load-legend" aria-label="Легенда завантаження автомобілів">
+                <span><i class="car-free"></i> Авто: &lt;5</span>
+                <span><i class="car-busy"></i> Авто: 5–9</span>
+                <span><i class="car-critical"></i> Авто: ≥10</span>
+              </div>
+            </aside>
+          </div>
+        </div>
+        <div class="zone-sim-footer">
+          <span><strong>Джерело:</strong> `zone_simulation` у live SUMO snapshot.</span>
+          <span>Колір авто враховує навантаження вибраного перехрестя та його смуг.</span>
+          <span>За межами активної SUMO-симуляції карта навмисно вимкнена.</span>
+        </div>
+      </section>
 
       <section class="panel" data-panel="compare full">
         <div class="panel-header">
@@ -2656,7 +3809,7 @@ DESIGN_PAGE = r"""<!doctype html>
           <div class="slice-note" id="comparisonSlice">Поточний зріз метрик</div>
           <div class="comparison-grid">
             <article class="scenario-card fixed">
-              <h3>[cite: Fixed Control]</h3>
+              <h3>[cite: Static Fixed Control]</h3>
               <p>Звичайний світлофор. Працює за жорстким таймером.</p>
               <div class="vehicle-row">
                 <div class="cars" id="fixedCars"></div>
@@ -2785,6 +3938,7 @@ DESIGN_PAGE = r"""<!doctype html>
     </main>
   </div>
 
+  <script src="/assets/zone-simulation.js"></script>
   <script>
     const $ = (id) => document.getElementById(id);
     const pollMs = 1000;
@@ -2834,7 +3988,15 @@ DESIGN_PAGE = r"""<!doctype html>
     }
 
     async function api(path, options = {}) {
+      const method = String(options.method || "GET").toUpperCase();
+      if (method !== "GET" && method !== "HEAD") {
+        let token = sessionStorage.getItem("flowmindMutationToken") || "";
+        if (!token) token = window.prompt("FlowMind admin token") || "";
+        if (token) sessionStorage.setItem("flowmindMutationToken", token);
+        options.headers = { ...(options.headers || {}), "X-FlowMind-Token": token };
+      }
       const response = await fetch(path, options);
+      if (response.status === 401) sessionStorage.removeItem("flowmindMutationToken");
       if (!response.ok) {
         const text = await response.text();
         throw new Error(text || response.statusText);
@@ -2863,7 +4025,7 @@ DESIGN_PAGE = r"""<!doctype html>
     function renderMetrics(payload) {
       const latest = payload.latest_sample || {};
       const summary = payload.summary || {};
-      const gridlockRisk = latest.gridlock_risk ?? summary.gridlock_risk;
+      const gridlockRisk = latest.blocked_outgoing_share ?? summary.blocked_outgoing_share;
       const cards = [
         {
           label: "Авто в зоні",
@@ -2894,6 +4056,7 @@ DESIGN_PAGE = r"""<!doctype html>
       const summary = payload.summary || {};
       const simulation = system.simulation || {};
       const controller = system.controller || {};
+      const tlsPrograms = system.tls_programs || {};
       const forecast = system.queue_forecast || {};
       const corridor = system.corridor || {};
       const metrics = system.metrics || {};
@@ -2903,6 +4066,11 @@ DESIGN_PAGE = r"""<!doctype html>
           label: "Controller",
           value: controller.status || "немає",
           note: `${fmt(controller.decisions ?? summary.controller_decisions, "", 0)} рішень`
+        },
+        {
+          label: "SUMO TLS Programs",
+          value: tlsPrograms.status || "немає",
+          note: `${fmt(tlsPrograms.count, "", 0)} audited`
         },
         {
           label: "ML Predictor",
@@ -3014,7 +4182,9 @@ DESIGN_PAGE = r"""<!doctype html>
       const latest = selectedMetricPoint(payload);
       const summary = payload.summary || {};
       const rows = Array.isArray(payload.summary_rows) ? payload.summary_rows : [];
-      const fixedRow = rows.find((row) => row.mode === "fixed") || null;
+      const fixedRow = rows.find((row) => row.mode === "static_fixed")
+        || rows.find((row) => row.mode === "fixed")
+        || null;
       const flowRow = rows.find((row) => row.mode === "flowmind") || summary;
       const queue = asNumber(latest.queue_length ?? flowRow.average_queue_length ?? summary.average_queue_length) || 0;
       const wait = asNumber(latest.waiting_time ?? flowRow.average_waiting_time ?? summary.average_waiting_time) || 0;
@@ -3051,7 +4221,7 @@ DESIGN_PAGE = r"""<!doctype html>
       const fixedThroughput = asNumber(fixedRow?.throughput);
       const throughputDelta = fixedThroughput == null ? null : throughput - fixedThroughput;
       $("resultInsight").textContent = fixedRow
-        ? `Зріз ${fmt(simulated, " с", 0)}: FlowMind зменшив чергу на ${fmt(queueDelta, " авто")}, час очікування на ${fmt(waitDelta, " с")}, пропуск ${throughputDelta == null ? fmt(throughput, " авто", 0) : `${fmt(throughputDelta, " авто", 0)} до fixed`}.`
+        ? `Зріз ${fmt(simulated, " с", 0)}: FlowMind зменшив чергу на ${fmt(queueDelta, " авто")}, час очікування на ${fmt(waitDelta, " с")}, пропуск ${throughputDelta == null ? fmt(throughput, " авто", 0) : `${fmt(throughputDelta, " авто", 0)} до static fixed`}.`
         : `Зріз ${fmt(simulated, " с", 0)}: FlowMind скорочує чергу приблизно на ${fmt(queueDelta, " авто")} і час очікування на ${fmt(waitDelta, " с")}. Пропуск: ${fmt(throughput, " авто", 0)}.`;
       renderAmbulance(summary, flowRow, simulated, duration);
     }
@@ -3362,10 +4532,20 @@ DESIGN_PAGE = r"""<!doctype html>
         if (id) {
           const payload = await api(`/api/archive/${id}`);
           payload.process = { status: "archive", running: false, logs: [] };
-          payload.system = payload.system || {
-            simulation: { status: "archive" },
-            metrics: { sensor_range_meters: payload.summary?.sensor_range_meters },
+          const system = payload.system && typeof payload.system === "object" ? payload.system : {};
+          const simulation = system.simulation && typeof system.simulation === "object" ? system.simulation : {};
+          payload.system = {
+            ...system,
+            simulation: { ...simulation, status: "archive" },
+            metrics: system.metrics || { sensor_range_meters: payload.summary?.sensor_range_meters },
           };
+          if (payload.zone_simulation && typeof payload.zone_simulation === "object") {
+            payload.zone_simulation = {
+              ...payload.zone_simulation,
+              status: "archive",
+              active: false,
+            };
+          }
           return payload;
         }
       }
@@ -3385,12 +4565,14 @@ DESIGN_PAGE = r"""<!doctype html>
         renderMetrics(payload);
         renderSystem(payload);
         renderComparison(payload);
+        window.FlowMindZoneSimulation?.setSnapshot(payload);
         renderIntersections(payload.intersections || []);
         renderDecisions(payload.decision_log || []);
         drawHistory(payload.metric_history || []);
         renderProcess(process);
         renderGeminiPanel(payload);
       } catch (error) {
+        window.FlowMindZoneSimulation?.setSnapshot(null);
         setTag("processTag", "процес", "api error", "bad");
         $("logs").textContent = String(error);
       }
@@ -3686,8 +4868,10 @@ ARCHIVE_PAGE = r"""<!doctype html>
         </div>
         <nav class="nav" aria-label="Archive navigation">
           <a href="/">Live</a>
+          <a href="/zone">Zone Explorer</a>
           <a href="/archive">Архів</a>
           <a href="/averages">Середні</a>
+          <a href="/jobs">Jobs</a>
         </nav>
       </div>
       <div class="status-line">
@@ -3738,6 +4922,7 @@ ARCHIVE_PAGE = r"""<!doctype html>
             <span class="tag" id="selectedTag">не обрано</span>
           </div>
           <div class="section-body">
+            <p><a id="zoneResultLink" href="/zone">Відкрити цей запуск на великій карті →</a></p>
             <div class="cards" id="detailCards"></div>
           </div>
         </section>
@@ -3834,6 +5019,7 @@ ARCHIVE_PAGE = r"""<!doctype html>
     }
     function renderDetail(payload) {
       selectedId = payload.id;
+      $("zoneResultLink").href = `/zone?result_id=${encodeURIComponent(payload.id)}`;
       $("selectedTag").textContent = short(payload.path, 32);
       const summary = payload.summary || {};
       const sample = payload.latest_sample || {};
@@ -3842,7 +5028,14 @@ ARCHIVE_PAGE = r"""<!doctype html>
         card("Очікування", fmt(summary.average_waiting_time ?? sample.waiting_time, " с"), "середнє"),
         card("Черга", fmt(summary.average_queue_length ?? sample.queue_length, " авто"), `макс: ${fmt(summary.max_queue_length ?? sample.max_queue_length, " авто")}`),
         card("Пропуск", fmt(summary.throughput ?? sample.throughput, " авто", 0), `виїхало: ${fmt(summary.departed_vehicles ?? sample.departed, " авто", 0)}`),
-        card("Gridlock", fmt((summary.gridlock_risk ?? sample.gridlock_risk) * 100, "%"), "ризик затору"),
+        card(
+          "Blocked outgoing",
+          fmt(
+            (summary.blocked_outgoing_share ?? sample.blocked_outgoing_share) * 100,
+            "%"
+          ),
+          "частка заблокованих виходів"
+        ),
         card("ML", fmt(summary.queue_forecast_predictions, "", 0), "прогнозів черги"),
       ].join("");
       renderHistory(payload.metric_history || []);
@@ -4063,7 +5256,7 @@ AVERAGES_PAGE = r"""<!doctype html>
     .metric .note { color: var(--muted); font-size: 12px; }
     .compare-grid {
       display: grid;
-      grid-template-columns: repeat(3, minmax(0, 1fr));
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
       gap: 12px;
       margin-bottom: 14px;
     }
@@ -4075,7 +5268,8 @@ AVERAGES_PAGE = r"""<!doctype html>
       display: grid;
       gap: 10px;
     }
-    .mode-card.fixed { border-color: rgba(244, 81, 64, .7); }
+    .mode-card.fixed, .mode-card.static_fixed { border-color: rgba(244, 81, 64, .7); }
+    .mode-card.sumo_actuated { border-color: rgba(139, 92, 246, .72); }
     .mode-card.local { border-color: rgba(255, 182, 49, .65); }
     .mode-card.flowmind { border-color: rgba(61, 187, 175, .72); }
     .mode-card h3 {
@@ -4084,7 +5278,8 @@ AVERAGES_PAGE = r"""<!doctype html>
       letter-spacing: 0;
       text-transform: capitalize;
     }
-    .mode-card.fixed h3 { color: #f45140; }
+    .mode-card.fixed h3, .mode-card.static_fixed h3 { color: #f45140; }
+    .mode-card.sumo_actuated h3 { color: #a78bfa; }
     .mode-card.local h3 { color: #ffb631; }
     .mode-card.flowmind h3 { color: #3dbbaf; }
     .mode-stat {
@@ -4161,6 +5356,15 @@ AVERAGES_PAGE = r"""<!doctype html>
       font-weight: 650;
     }
     .empty { color: var(--muted); padding: 18px; border: 1px dashed var(--line); border-radius: 8px; background: var(--panel-soft); }
+    .scope-note {
+      margin-bottom: 16px;
+      padding: 11px 13px;
+      border: 1px solid rgba(77, 223, 212, .35);
+      border-radius: 8px;
+      background: rgba(77, 223, 212, .08);
+      color: #c7d1df;
+    }
+    .scope-note strong { color: var(--ink); }
     @media (max-width: 900px) {
       .topbar { grid-template-columns: 1fr; }
       .cards { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -4181,29 +5385,34 @@ AVERAGES_PAGE = r"""<!doctype html>
           <div class="mark" aria-hidden="true"></div>
           <div>
             <h1>FlowMind Averages</h1>
-            <p class="subtitle">Порівняння середніх результатів fixed, local і FlowMind по збережених симуляціях.</p>
+            <p class="subtitle">Чесне порівняння режимів на однакових paired seed, сценаріях і маршрутах швидкої.</p>
           </div>
         </div>
         <nav class="nav" aria-label="Averages navigation">
           <a href="/">Live</a>
+          <a href="/zone">Zone Explorer</a>
           <a href="/archive">Архів</a>
           <a href="/averages">Середні</a>
+          <a href="/jobs">Jobs</a>
         </nav>
       </div>
       <div class="status-line">
-        <span class="tag good">Metrics</span>
+        <span class="tag good" id="scopeTag">Paired metrics</span>
         <span class="tag" id="totalTag">0 результатів</span>
       </div>
     </header>
 
+    <div class="scope-note" id="scopeNote">Завантаження scope benchmark...</div>
     <section class="cards" id="overview"></section>
     <div id="comparison"></div>
+    <div id="zoneStrengths"></div>
     <div id="modeSections"></div>
   </main>
 
   <script>
     const $ = (id) => document.getElementById(id);
     function number(value) {
+      if (value === null || value === undefined || value === "") return null;
       const parsed = Number(value);
       return Number.isFinite(parsed) ? parsed : null;
     }
@@ -4221,11 +5430,13 @@ AVERAGES_PAGE = r"""<!doctype html>
       if (!response.ok) throw new Error(await response.text());
       return await response.json();
     }
-    const modeOrder = ["fixed", "local", "flowmind"];
+    const modeOrder = ["static_fixed", "sumo_actuated", "local", "flowmind", "fixed"];
     const modeLabels = {
-      fixed: "Fixed",
+      static_fixed: "Static Fixed",
+      sumo_actuated: "SUMO Actuated",
       local: "Local adaptive",
       flowmind: "FlowMind",
+      fixed: "Fixed (legacy)",
     };
     const keyMetrics = [
       { key: "average_waiting_time", label: "Сер. очікування", suffix: " с", lower: true },
@@ -4233,10 +5444,10 @@ AVERAGES_PAGE = r"""<!doctype html>
       { key: "max_queue_length", label: "Макс. черга", suffix: " авто", lower: true },
       { key: "throughput", label: "Пропуск", suffix: " авто", lower: false, digits: 0 },
       { key: "stops_count", label: "Зупинки", suffix: "", lower: true, digits: 0 },
-      { key: "gridlock_risk", label: "Gridlock risk", suffix: "", lower: true, digits: 4 },
+      { key: "blocked_outgoing_share", label: "Blocked outgoing share", suffix: "", lower: true, digits: 4 },
     ];
     function modeClass(mode) {
-      return ["fixed", "local", "flowmind"].includes(mode) ? mode : "";
+      return modeOrder.includes(mode) ? mode : "";
     }
     function byMode(modes) {
       return Object.fromEntries((modes || []).map(item => [item.mode, item]));
@@ -4264,7 +5475,7 @@ AVERAGES_PAGE = r"""<!doctype html>
       const fixedValue = metricValue(fixedMode, metric.key);
       const value = metricValue(mode, metric.key);
       if (fixedValue === null || value === null || fixedValue === 0) return null;
-      if (mode?.mode === "fixed") return { label: "baseline", kind: "" };
+      if (mode?.mode === fixedMode?.mode) return { label: "baseline", kind: "" };
       const delta = metric.lower
         ? ((fixedValue - value) / fixedValue) * 100
         : ((value - fixedValue) / fixedValue) * 100;
@@ -4277,7 +5488,7 @@ AVERAGES_PAGE = r"""<!doctype html>
       if (!delta) return `<span class="delta">немає</span>`;
       return `<span class="delta ${delta.kind}">${delta.label}</span>`;
     }
-    function renderModeCard(mode, fixedMode, winners) {
+    function renderModeCard(mode, fixedMode, winners, paired = false) {
       const stats = keyMetrics.slice(0, 4).map(metric => {
         const value = metricValue(mode, metric.key);
         const winner = winners[metric.key] === mode.mode;
@@ -4286,35 +5497,44 @@ AVERAGES_PAGE = r"""<!doctype html>
           <strong class="${winner ? "winner" : ""}">${fmt(value, metric.suffix, metric.digits ?? 1)}</strong>
         </div>`;
       }).join("");
-      const deltas = mode.mode === "fixed"
+      const deltas = mode.mode === fixedMode?.mode
         ? `<span class="tag">baseline</span>`
         : deltaPill(deltaFromFixed(fixedMode, mode, keyMetrics[0]));
       return `<article class="mode-card ${modeClass(mode.mode)}">
         <div class="section-header" style="padding:0;border:0;background:transparent;">
           <h3>${modeLabels[mode.mode] || mode.mode}</h3>
-          <span class="tag">${mode.count || 0} запусків</span>
+          <span class="tag">${mode.count || 0} ${paired ? "пар" : "запусків"}</span>
         </div>
         ${stats}
-        <div class="mode-stat"><span>Очікування vs fixed</span><strong>${deltas}</strong></div>
+        <div class="mode-stat"><span>Очікування vs static fixed</span><strong>${deltas}</strong></div>
       </article>`;
     }
-    function renderComparison(modes) {
+    function renderComparison(modes, benchmark = {}) {
       const ordered = orderedModes(modes);
       const map = byMode(ordered);
-      const fixedMode = map.fixed || null;
-      const winners = Object.fromEntries(keyMetrics.map(metric => [metric.key, bestModeFor(ordered, metric)]));
-      const cards = ordered.length
-        ? `<div class="compare-grid">${ordered.map(mode => renderModeCard(mode, fixedMode, winners)).join("")}</div>`
+      const fixedMode = map.static_fixed || map.fixed || null;
+      const comparable = ordered.filter(mode => !(
+        mode.mode === "fixed" && map.static_fixed
+      ));
+      const comparisonModes = [
+        fixedMode?.mode || "static_fixed",
+        "sumo_actuated",
+        "local",
+        "flowmind",
+      ].filter((modeName, index, values) => map[modeName] && values.indexOf(modeName) === index);
+      const winners = Object.fromEntries(keyMetrics.map(metric => [metric.key, bestModeFor(comparable, metric)]));
+      const cards = comparable.length
+        ? `<div class="compare-grid">${comparable.map(mode => renderModeCard(mode, fixedMode, winners, benchmark.scope === "paired_evaluation")).join("")}</div>`
         : "";
       const rows = keyMetrics.map(metric => {
         const best = winners[metric.key];
-        const cells = modeOrder.map(modeName => {
+        const cells = comparisonModes.map(modeName => {
           const mode = map[modeName];
           const value = metricValue(mode, metric.key);
           const delta = deltaFromFixed(fixedMode, mode, metric);
           return `<td class="compare-cell ${best === modeName ? "winner" : ""}">
             <span class="value-cell">${fmt(value, metric.suffix, metric.digits ?? 1)}</span>
-            <span class="cell-note">${mode ? `${metricCount(mode, metric.key)} значень` : "немає режиму"} ${modeName !== "fixed" ? deltaPill(delta) : ""}</span>
+            <span class="cell-note">${mode ? `${metricCount(mode, metric.key)} значень` : "немає режиму"} ${modeName !== fixedMode?.mode ? deltaPill(delta) : ""}</span>
           </td>`;
         }).join("");
         return `<tr>
@@ -4326,13 +5546,13 @@ AVERAGES_PAGE = r"""<!doctype html>
       return `<section class="section">
         <div class="section-header">
           <h2>Порівняння режимів</h2>
-          <span class="tag good">Fixed = baseline</span>
+          <span class="tag good">${benchmark.pair_count ? `${benchmark.pair_count} paired seeds` : "Static Fixed = baseline"}</span>
         </div>
         <div class="section-body">
           ${cards}
           <table>
             <thead>
-              <tr><th>Метрика</th><th>Fixed</th><th>Local</th><th>FlowMind</th><th>Краще</th></tr>
+              <tr><th>Метрика</th>${comparisonModes.map(mode => `<th>${modeLabels[mode] || mode}</th>`).join("")}<th>Краще</th></tr>
             </thead>
             <tbody>${rows}</tbody>
           </table>
@@ -4365,12 +5585,60 @@ AVERAGES_PAGE = r"""<!doctype html>
         </div>
       </section>`;
     }
+    function renderZoneStrengths(items) {
+      if (!items?.length) return "";
+      const rows = items.map(item => {
+        const percentMetric = item.key === "spillback_free_time_share" || item.key === "clearance_action_share";
+        const digits = percentMetric ? 1 : item.key === "blocked_outgoing_share" ? 4 : 2;
+        const parsedFlow = number(item.flowmind);
+        const parsedLocal = number(item.local);
+        const flowValue = percentMetric && parsedFlow !== null ? parsedFlow * 100 : parsedFlow;
+        const localValue = percentMetric && parsedLocal !== null ? parsedLocal * 100 : parsedLocal;
+        const suffix = percentMetric ? "%" : "";
+        const neutral = item.status === "neutral";
+        const delta = number(neutral ? item.difference_percent : item.improvement_percent);
+        const winner = item.winner === "flowmind";
+        return `<tr>
+          <td>${item.label}<span class="cell-note">${item.category === "controller_diagnostic" ? "діагностика керування" : "outcome зони"}</span></td>
+          <td class="value-cell ${winner ? "winner" : ""}">${fmt(flowValue, suffix, digits)}</td>
+          <td class="value-cell ${item.winner === "local" ? "winner" : ""}">${fmt(localValue, suffix, digits)}</td>
+          <td>${deltaPill(delta === null ? null : {label:`${delta >= 0 ? "+" : ""}${fmt(delta, "%", 1)}`,kind:neutral||Math.abs(delta)<.05?"":delta>0?"good":"bad"})}</td>
+          <td>${neutral ? "нейтральна діагностика" : item.winner === "tie" ? "нічия" : modeLabels[item.winner] || item.winner}</td>
+        </tr>`;
+      }).join("");
+      return `<section class="section">
+        <div class="section-header">
+          <h2>FlowMind vs Local: зональне керування</h2>
+          <span class="tag good">без прихованого composite score</span>
+        </div>
+        <div class="section-body">
+          <p class="subtitle" style="margin-bottom:12px">Для outcomes показані переваги й регресії на paired seeds. Controller diagnostics наведені нейтрально: сама різниця не доводить кращий результат.</p>
+          <table><thead><tr><th>Метрика</th><th>FlowMind</th><th>Local</th><th>Δ до Local</th><th>Краще</th></tr></thead><tbody>${rows}</tbody></table>
+        </div>
+      </section>`;
+    }
     async function loadAverages() {
       const payload = await api("/api/averages");
-      $("totalTag").textContent = `${payload.total_results || 0} результатів`;
+      const benchmark = payload.benchmark || {};
+      const paired = payload.scope === "paired_evaluation";
+      $("scopeTag").textContent = paired ? "Paired benchmark" : "Historical aggregate";
+      $("totalTag").textContent = paired
+        ? `${benchmark.pair_count || 0} paired seeds`
+        : `${payload.total_results || 0} результатів`;
+      const excluded = Object.entries(benchmark.excluded_modes || {})
+        .map(([mode, reason]) => `${mode}: ${reason}`)
+        .join("; ");
+      const pairedScope = benchmark.emergency_route_evaluated
+        ? "з однаковими seed, scenario та emergency route"
+        : "з однаковими seed і scenario; emergency route у цьому benchmark вимкнено";
+      $("scopeNote").innerHTML = paired
+        ? `<strong>${benchmark.evaluation_id || "paired evaluation"}</strong>: показано ${benchmark.pair_count || 0} повних пар ${pairedScope}. Старі та непарні прогони не впливають на середні.${excluded ? ` Виключено ${excluded}.` : ""}${benchmark.not_a_final_benchmark ? " Це preflight, а не фінальний benchmark." : ""}`
+        : `<strong>Historical aggregate:</strong> paired evaluation не знайдено, тому показано всі сумісні summary rows.`;
       const modes = orderedModes(payload.modes || []);
       const flowmind = modes.find(item => item.mode === "flowmind") || { metrics: {} };
-      const fixed = modes.find(item => item.mode === "fixed") || { metrics: {} };
+      const fixed = modes.find(item => item.mode === "static_fixed")
+        || modes.find(item => item.mode === "fixed")
+        || { metrics: {} };
       const local = modes.find(item => item.mode === "local") || { metrics: {} };
       const wait = flowmind.metrics?.average_waiting_time?.average;
       const fixedWait = fixed.metrics?.average_waiting_time?.average;
@@ -4378,12 +5646,13 @@ AVERAGES_PAGE = r"""<!doctype html>
       const improvement = fixedWait && wait ? ((fixedWait - wait) / fixedWait) * 100 : null;
       const localImprovement = fixedWait && localWait ? ((fixedWait - localWait) / fixedWait) * 100 : null;
       $("overview").innerHTML = [
-        card("Усього результатів", fmt(payload.total_results, "", 0), `${payload.total_rows || 0} summary rows`),
+        card(paired ? "Paired seeds" : "Усього результатів", fmt(paired ? benchmark.pair_count : payload.total_results, "", 0), paired ? `${payload.total_rows || 0} mode summaries` : `${payload.total_rows || 0} summary rows`),
         card("Режимів", fmt(modes.length, "", 0), modes.map(item => item.mode).join(", ")),
-        card("FlowMind vs fixed", improvement == null ? "немає" : fmt(improvement, "%"), `очікування: ${fmt(wait, " с")}`),
-        card("Local vs fixed", localImprovement == null ? "немає" : fmt(localImprovement, "%"), `очікування: ${fmt(localWait, " с")}`),
+        card("FlowMind vs static fixed", improvement == null ? "немає" : fmt(improvement, "%"), `очікування: ${fmt(wait, " с")}`),
+        card("Local vs static fixed", localImprovement == null ? "немає" : fmt(localImprovement, "%"), `очікування: ${fmt(localWait, " с")}`),
       ].join("");
-      $("comparison").innerHTML = modes.length ? renderComparison(modes) : `<div class="empty">Немає summary.csv для агрегації.</div>`;
+      $("comparison").innerHTML = modes.length ? renderComparison(modes, benchmark) : `<div class="empty">Немає paired summaries для агрегації.</div>`;
+      $("zoneStrengths").innerHTML = renderZoneStrengths(payload.flowmind_vs_local || []);
       $("modeSections").innerHTML = modes.length ? `<section class="section">
         <div class="section-header">
           <h2>Деталізація середніх</h2>
@@ -4396,6 +5665,134 @@ AVERAGES_PAGE = r"""<!doctype html>
 </body>
 </html>
 """
+
+
+ZONE_EXPLORER_PAGE = r"""<!doctype html>
+<html lang="uk">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>FlowMind Zone Explorer</title>
+  <link rel="stylesheet" href="/assets/zone-explorer.css">
+  <style>
+    :root{color-scheme:dark;--bg:#0d111b;--panel:#1b2331;--panel-soft:#151c28;--ink:#f5f8fc;--muted:#98a5b8;--line:#313d50;--cyan:#4ddfd4;--green:#62d48b;--amber:#f2bf5e;--red:#ff6f61}
+    *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.45 Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+    .page{width:min(1680px,100%);margin:0 auto;padding:16px}.site-nav{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:12px}
+    .site-nav a{color:var(--muted);text-decoration:none;border:1px solid var(--line);background:var(--panel-soft);padding:7px 10px;border-radius:7px;font-weight:760}
+    .site-nav a[aria-current="page"]{color:var(--ink);border-color:rgba(77,223,212,.55);background:rgba(77,223,212,.12)}
+  </style>
+</head>
+<body>
+  <main class="page">
+    <nav class="site-nav" aria-label="Головна навігація">
+      <a href="/">Live</a>
+      <a href="/zone" aria-current="page">Zone Explorer</a>
+      <a href="/archive">Архів</a>
+      <a href="/averages">Середні</a>
+      <a href="/jobs">Jobs</a>
+    </nav>
+    <section class="zone-explorer" id="zoneExplorerRoot" data-illustrative="false">
+      <div class="zx-shell">
+        <header class="zx-toolbar">
+          <div class="zx-heading">
+            <span class="zx-eyebrow">20 TLS · zonal control</span>
+            <h1>FlowMind Zone Explorer</h1>
+            <p>Велика SUMO-карта з фазами, діями, прогнозами та пропускною здатністю всієї зони або окремого перехрестя.</p>
+          </div>
+          <div class="zx-toolbar-actions">
+            <select class="zx-select" id="zoneSelector" aria-label="Оберіть всю зону або перехрестя">
+              <option value="zone">Уся зона</option>
+            </select>
+            <button class="zx-button" id="fitMapButton" type="button">Показати всю зону</button>
+            <div class="zx-source-badges">
+              <span class="zx-tag zx-tag--info" id="sourceBadge">Завантаження</span>
+              <span class="zx-tag" id="modeBadge">FlowMind</span>
+            </div>
+          </div>
+        </header>
+
+        <div class="zx-illustrative" id="illustrativeNotice">
+          <strong>Статичні черги на смугах</strong>
+          <span>Автомобілі розкладені один за одним у фіксованих слотах уздовж реальної SUMO-геометрії; спрайти не рухаються й не перекриваються, а колір відповідає lane load.</span>
+        </div>
+
+        <div class="zx-layout">
+          <section class="zx-map-panel" aria-label="Карта центральної зони">
+            <div class="zx-map-overlay">
+              <span class="zx-tag" id="mapTimeBadge">t = —</span>
+              <span class="zx-tag" id="selectionBadge">Уся зона</span>
+            </div>
+            <svg class="zx-map-svg" id="zoneMapSvg" role="img" aria-label="SUMO-карта доріг, перехресть і автомобілів" tabindex="0">
+              <g id="zoneViewport"></g>
+            </svg>
+            <div class="zx-map-legend" aria-label="Легенда">
+              <span><i class="free"></i>вільно</span>
+              <span><i class="busy"></i>завантажено</span>
+              <span><i class="critical"></i>критично</span>
+              <span><i class="priority"></i>швидка</span>
+              <span><i class="corridor"></i>коридор</span>
+            </div>
+          </section>
+
+          <aside class="zx-inspector" aria-live="polite">
+            <header class="zx-inspector-header">
+              <div class="zx-inspector-title">
+                <h2 id="inspectorTitle">Уся зона</h2>
+                <span class="zx-tag zx-tag--good" id="signalBadge">zonal view</span>
+              </div>
+              <p class="zx-inspector-subtitle" id="inspectorSubtitle">Зональна пропускна здатність, накопичення, coordination actions і прогнози.</p>
+            </header>
+            <div class="zx-inspector-body">
+              <div class="zx-kpis" id="zoneKpis"></div>
+              <section class="zx-section" id="zoneInspector"></section>
+              <section class="zx-section">
+                <div class="zx-section-heading"><h3>FlowMind проти Local</h3><span>paired metrics</span></div>
+                <div class="zx-list" id="advantageList"></div>
+              </section>
+              <section class="zx-section">
+                <div class="zx-section-heading"><h3>Дії контролера</h3><span id="actionCount">0</span></div>
+                <div class="zx-list" id="actionList"></div>
+              </section>
+              <section class="zx-section">
+                <div class="zx-section-heading"><h3>Прогнози</h3><span id="predictionCount">0</span></div>
+                <div class="zx-list" id="predictionList"></div>
+              </section>
+            </div>
+          </aside>
+        </div>
+
+        <section class="zx-timeline">
+          <div class="zx-timeline-actions">
+            <button class="zx-button zx-button--icon" id="playButton" type="button" aria-label="Відтворити">▶</button>
+          </div>
+          <div class="zx-timeline-main">
+            <input class="zx-range" id="timelineRange" type="range" min="0" max="0" value="0">
+            <div class="zx-timeline-labels"><span>Початок</span><strong id="timelineLabel">Останній snapshot</strong><span>Кінець</span></div>
+          </div>
+          <div class="zx-timeline-note" id="mapNotice">Позиції схематичні й статичні; колір авто відповідає завантаженості lane.</div>
+        </section>
+      </div>
+    </section>
+  </main>
+  <script src="/assets/zone-explorer.js"></script>
+</body>
+</html>
+"""
+
+
+JOBS_PAGE = """<!doctype html>
+<html lang="uk"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
+<title>FlowMind Jobs</title><style>
+body{font-family:system-ui;background:#07121d;color:#e8f2f8;margin:0;padding:28px}a{color:#57e3d2}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:16px}.card{background:#102230;border:1px solid #244557;border-radius:14px;padding:18px}
+.value{font-size:30px;font-weight:750;margin:8px 0}.muted{color:#9ab2c1}table{width:100%;border-collapse:collapse}td,th{text-align:left;padding:9px;border-bottom:1px solid #244557}
+</style></head><body><p><a href="/">← Dashboard</a> · <a href="/zone">Zone Explorer</a></p><h1>Jobs & Model Registry</h1>
+<div class="grid" id="jobs"></div><h2>Models</h2><div class="card"><table><thead><tr><th>Model</th><th>Contract</th><th>Coverage</th><th>MAE</th><th>Approval</th></tr></thead><tbody id="models"></tbody></table></div>
+<script>
+const fmt=(v,s='')=>v==null?'—':`${v}${s}`;async function refresh(){const [j,r]=await Promise.all([fetch('/api/jobs').then(x=>x.json()),fetch('/api/model-registry').then(x=>x.json())]);
+const d=j.dataset||{},disk=j.disk||{};document.getElementById('jobs').innerHTML=[['Dataset',`${fmt(d.completed_runs)}/${fmt(d.expected_runs)}`,`${d.status} · ETA ${fmt(d.eta_seconds,' s')}`],['Quality',fmt(d.quality_status),`accepted ${fmt(d.accepted_runs)} · rejected ${fmt(d.rejected_runs)}`],['Disk',fmt(disk.free_gb,' GB free'),`${fmt(disk.used_gb)} / ${fmt(disk.total_gb)} GB`],['Trainer',fmt(j.trainer?.status),j.trainer?.manifest_path||'waiting'],['Evaluation',fmt(j.evaluation?.status),j.evaluation?.overall_status||j.evaluation?.manifest_path||'waiting']].map(x=>`<div class="card"><div class="muted">${x[0]}</div><div class="value">${x[1]}</div><div class="muted">${x[2]}</div></div>`).join('');
+document.getElementById('models').innerHTML=(r.models||[]).map(m=>`<tr><td>${m.name}</td><td>${m.forecast_contract||'—'}</td><td>${m.known_tls_count}/${m.known_lane_count}</td><td>${fmt(m.validation_mae)}</td><td>${m.approved?'approved':'not approved'}</td></tr>`).join('')||'<tr><td colspan="5">No models</td></tr>';}refresh();setInterval(refresh,5000);
+</script></body></html>"""
 
 
 class MissingFastAPIApp:
@@ -4436,9 +5833,39 @@ else:
     def averages_page() -> Any:
         return AVERAGES_PAGE
 
+    @app.get("/zone", response_class=HTMLResponse)
+    def zone_explorer_page() -> Any:
+        return ZONE_EXPLORER_PAGE
+
+    @app.get("/jobs", response_class=HTMLResponse)
+    def jobs_page() -> Any:
+        return JOBS_PAGE
+
     @app.get("/assets/icon_car.png")
     def car_icon() -> Any:
         return FileResponse(CAR_ICON_PATH, media_type="image/png")
+
+    @app.get("/assets/zone-simulation.css")
+    def zone_simulation_css() -> Any:
+        return FileResponse(ZONE_SIMULATION_CSS_PATH, media_type="text/css")
+
+    @app.get("/assets/zone-simulation.js")
+    def zone_simulation_js() -> Any:
+        return FileResponse(
+            ZONE_SIMULATION_JS_PATH,
+            media_type="application/javascript",
+        )
+
+    @app.get("/assets/zone-explorer.css")
+    def zone_explorer_css() -> Any:
+        return FileResponse(ZONE_EXPLORER_CSS_PATH, media_type="text/css")
+
+    @app.get("/assets/zone-explorer.js")
+    def zone_explorer_js() -> Any:
+        return FileResponse(
+            ZONE_EXPLORER_JS_PATH,
+            media_type="application/javascript",
+        )
 
     @app.get("/api/health")
     def health() -> dict[str, Any]:
@@ -4472,8 +5899,25 @@ else:
     def averages() -> dict[str, Any]:
         return build_averages_payload(RESULTS_DIR)
 
+    @app.get("/api/zone-explorer")
+    def zone_explorer(result_id: str | None = None) -> dict[str, Any]:
+        return build_zone_explorer_payload(
+            result_id=result_id,
+            base_dir=RESULTS_DIR,
+            process_manager=manager,
+        )
+
+    @app.get("/api/jobs")
+    def jobs() -> dict[str, Any]:
+        return build_jobs_payload()
+
+    @app.get("/api/model-registry")
+    def model_registry() -> dict[str, Any]:
+        return build_model_registry()
+
     @app.post("/api/gemini-summary")
     async def gemini_summary(request: Request) -> dict[str, Any]:
+        authorize_mutation(request)
         try:
             payload = await request.json()
         except Exception:
@@ -4488,6 +5932,7 @@ else:
 
     @app.post("/api/start-demo")
     async def start_demo(request: Request) -> dict[str, Any]:
+        authorize_mutation(request)
         try:
             payload = await request.json()
         except Exception:
@@ -4497,5 +5942,6 @@ else:
         return manager.start(payload)
 
     @app.post("/api/stop")
-    def stop_demo() -> dict[str, Any]:
+    def stop_demo(request: Request) -> dict[str, Any]:
+        authorize_mutation(request)
         return manager.stop()

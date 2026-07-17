@@ -11,6 +11,12 @@ import project_manager
 
 
 class ProjectManagerTests(unittest.TestCase):
+    def test_all_runtime_modes_have_launcher_entries(self) -> None:
+        self.assertEqual(
+            tuple(project_manager.MODE_SCRIPTS),
+            ("Static Fixed", "SUMO Actuated", "Local Adaptive", "FlowMind"),
+        )
+
     def test_project_python_prefers_posix_virtual_environment(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

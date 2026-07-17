@@ -1,0 +1,661 @@
+{
+  "artifact_format_version": 2,
+  "created_at": "2026-07-12T16:03:44",
+  "model_type": "lightgbm",
+  "forecast_contract": "current_policy",
+  "target": "target_incoming_queue_30s",
+  "dataset_dir": "/home/tbyte/Документи/github/FlowMind/results/dataset",
+  "dataset_sha256": "602e3c85cb741deec1a3b7c2d77048e71f4e24d8d5e9c83ac644365b31a3b059",
+  "dataset_files": [
+    "rivne_focused_fixed_r0001_seed_1932892812.csv",
+    "rivne_focused_fixed_r0009_seed_1433749742.csv",
+    "rivne_focused_fixed_r0018_seed_1275653140.csv",
+    "rivne_focused_fixed_r0021_seed_0412572629.csv",
+    "rivne_focused_fixed_r0035_seed_1226171392.csv",
+    "rivne_focused_fixed_r0051_seed_1568616633.csv",
+    "rivne_focused_fixed_r0057_seed_1344056879.csv",
+    "rivne_focused_fixed_r0074_seed_0726888201.csv",
+    "rivne_focused_fixed_r0086_seed_0056517412.csv",
+    "rivne_focused_fixed_r0092_seed_1988730602.csv",
+    "rivne_focused_flowmind_r0006_seed_0945058088.csv",
+    "rivne_focused_flowmind_r0013_seed_0149303092.csv",
+    "rivne_focused_flowmind_r0037_seed_1873036829.csv",
+    "rivne_focused_flowmind_r0047_seed_0106635990.csv",
+    "rivne_focused_flowmind_r0050_seed_1409308706.csv",
+    "rivne_focused_flowmind_r0057_seed_1344056879.csv",
+    "rivne_focused_flowmind_r0070_seed_0663671550.csv",
+    "rivne_focused_flowmind_r0074_seed_0726888201.csv",
+    "rivne_focused_flowmind_r0078_seed_0613015167.csv",
+    "rivne_focused_flowmind_r0083_seed_0714640917.csv",
+    "rivne_focused_flowmind_r0097_seed_0242282036.csv",
+    "rivne_focused_local_r0010_seed_1365929122.csv",
+    "rivne_focused_local_r0031_seed_1870853144.csv",
+    "rivne_focused_local_r0038_seed_0932979931.csv",
+    "rivne_focused_local_r0049_seed_1563429853.csv",
+    "rivne_focused_local_r0056_seed_0624783874.csv",
+    "rivne_focused_local_r0071_seed_0728359928.csv",
+    "rivne_focused_local_r0078_seed_0613015167.csv",
+    "rivne_focused_local_r0084_seed_1957980532.csv",
+    "rivne_focused_local_r0094_seed_0845018529.csv"
+  ],
+  "network_path": "/home/tbyte/Документи/github/FlowMind/simulation/rivne_area/osm.net.xml.gz",
+  "network_sha256": "145087e01dc5baacfe803fc1ffe983738d2ee89dfa19b5921b48ede63e6064be",
+  "sample_file_count": 30,
+  "row_count": 30000,
+  "rows_per_file": 1000,
+  "max_rows": null,
+  "feature_columns": [
+    "sample_interval",
+    "decision_interval",
+    "sensor_range_meters",
+    "min_green",
+    "max_green",
+    "use_default_phase_timing",
+    "default_green_extension",
+    "blocked_occupancy",
+    "downstream_weight",
+    "area_pressure_weight",
+    "queue_forecast_weight",
+    "empty_approach_penalty",
+    "empty_phase_penalty",
+    "congested_queue_threshold",
+    "congested_occupancy_threshold",
+    "congested_approach_bonus",
+    "demand_timer_seconds",
+    "demand_wait_weight",
+    "max_demand_wait_bonus",
+    "hysteresis",
+    "priority_distance",
+    "max_priority_override",
+    "clearance_seconds",
+    "time",
+    "signal_index",
+    "is_green",
+    "current_phase",
+    "phase_elapsed",
+    "phase_count",
+    "incoming_queue",
+    "incoming_vehicle_count",
+    "incoming_occupancy",
+    "incoming_mean_speed",
+    "incoming_free_slots",
+    "outgoing_queue",
+    "outgoing_vehicle_count",
+    "outgoing_occupancy",
+    "outgoing_mean_speed",
+    "outgoing_free_slots",
+    "downstream_blocked",
+    "mode",
+    "tls_id",
+    "movement_id",
+    "incoming_lane",
+    "outgoing_lane",
+    "signal_state",
+    "phase_state"
+  ],
+  "numeric_features": [
+    "sample_interval",
+    "decision_interval",
+    "sensor_range_meters",
+    "min_green",
+    "max_green",
+    "use_default_phase_timing",
+    "default_green_extension",
+    "blocked_occupancy",
+    "downstream_weight",
+    "area_pressure_weight",
+    "queue_forecast_weight",
+    "empty_approach_penalty",
+    "empty_phase_penalty",
+    "congested_queue_threshold",
+    "congested_occupancy_threshold",
+    "congested_approach_bonus",
+    "demand_timer_seconds",
+    "demand_wait_weight",
+    "max_demand_wait_bonus",
+    "hysteresis",
+    "priority_distance",
+    "max_priority_override",
+    "clearance_seconds",
+    "time",
+    "signal_index",
+    "is_green",
+    "current_phase",
+    "phase_elapsed",
+    "phase_count",
+    "incoming_queue",
+    "incoming_vehicle_count",
+    "incoming_occupancy",
+    "incoming_mean_speed",
+    "incoming_free_slots",
+    "outgoing_queue",
+    "outgoing_vehicle_count",
+    "outgoing_occupancy",
+    "outgoing_mean_speed",
+    "outgoing_free_slots",
+    "downstream_blocked"
+  ],
+  "categorical_features": [
+    "mode",
+    "tls_id",
+    "movement_id",
+    "incoming_lane",
+    "outgoing_lane",
+    "signal_state",
+    "phase_state"
+  ],
+  "feature_schema_sha256": "eb4517fc0870ea733bb94e633b24ef439f2c966652c5904e2ed7e0976e1cf584",
+  "feature_ranges": {
+    "sample_interval": [
+      3.0,
+      10.0
+    ],
+    "decision_interval": [
+      2.0,
+      5.0
+    ],
+    "sensor_range_meters": [
+      80.2,
+      173.655
+    ],
+    "min_green": [
+      8.0,
+      16.0
+    ],
+    "max_green": [
+      32.0,
+      65.0
+    ],
+    "use_default_phase_timing": [
+      1.0,
+      1.0
+    ],
+    "default_green_extension": [
+      5.667,
+      11.813
+    ],
+    "blocked_occupancy": [
+      0.72,
+      0.888
+    ],
+    "downstream_weight": [
+      6.167,
+      14.59
+    ],
+    "area_pressure_weight": [
+      0.169,
+      0.607
+    ],
+    "queue_forecast_weight": [
+      0.379,
+      1.232
+    ],
+    "empty_approach_penalty": [
+      5.198,
+      11.937
+    ],
+    "empty_phase_penalty": [
+      23.43,
+      44.55
+    ],
+    "congested_queue_threshold": [
+      6.0,
+      12.0
+    ],
+    "congested_occupancy_threshold": [
+      0.563,
+      0.727
+    ],
+    "congested_approach_bonus": [
+      8.499,
+      17.869
+    ],
+    "demand_timer_seconds": [
+      4.0,
+      10.0
+    ],
+    "demand_wait_weight": [
+      0.28,
+      0.744
+    ],
+    "max_demand_wait_bonus": [
+      12.538,
+      23.813
+    ],
+    "hysteresis": [
+      0.452,
+      2.49
+    ],
+    "priority_distance": [
+      359.643,
+      673.738
+    ],
+    "max_priority_override": [
+      27.0,
+      50.0
+    ],
+    "clearance_seconds": [
+      3.0,
+      8.0
+    ],
+    "time": [
+      3.0,
+      1750.0
+    ],
+    "signal_index": [
+      0.0,
+      19.0
+    ],
+    "is_green": [
+      0.0,
+      1.0
+    ],
+    "current_phase": [
+      0.0,
+      8.0
+    ],
+    "phase_elapsed": [
+      0.0,
+      53.0
+    ],
+    "phase_count": [
+      4.0,
+      9.0
+    ],
+    "incoming_queue": [
+      0.0,
+      11.0
+    ],
+    "incoming_vehicle_count": [
+      0.0,
+      11.0
+    ],
+    "incoming_occupancy": [
+      0.0,
+      1.0
+    ],
+    "incoming_mean_speed": [
+      0.0,
+      17.77295
+    ],
+    "incoming_free_slots": [
+      0.0,
+      23.154
+    ],
+    "outgoing_queue": [
+      0.0,
+      10.0
+    ],
+    "outgoing_vehicle_count": [
+      0.0,
+      10.0
+    ],
+    "outgoing_occupancy": [
+      0.0,
+      0.94103
+    ],
+    "outgoing_mean_speed": [
+      0.0,
+      17.29135
+    ],
+    "outgoing_free_slots": [
+      0.06267,
+      23.154
+    ],
+    "downstream_blocked": [
+      0.0,
+      1.0
+    ]
+  },
+  "known_tls_ids": [
+    "cluster_1154563126_3129314972_6480803835_6480803841",
+    "cluster_1156343725_6662294749_6662294751_7661606382",
+    "cluster_13437168454_4315795790_583213300_6642884072",
+    "cluster_1481227697_1481227699_2124947615_2124947617_#1more",
+    "cluster_1481375398_415606384_6662292688_6662292689_#1more",
+    "cluster_580698747_6327278548_6327278549"
+  ],
+  "known_lane_ids": [
+    "-1062971920#1_0",
+    "-1062971920#1_1",
+    "-1079605506#0_0",
+    "-1079605506#0_1",
+    "-110281348#0_0",
+    "-110281352#1_0",
+    "-110281353#2_0",
+    "-110281354_0",
+    "-110281354_1",
+    "-110368575#1_0",
+    "-110368575#1_1",
+    "-110370583#2_0",
+    "-110370583#2_1",
+    "-1133472125#1_0",
+    "-1133472125#1_1",
+    "-1179683759#6_0",
+    "-1196402684#0_0",
+    "-1196402684#0_1",
+    "-1196403198_0",
+    "-1196403198_1",
+    "-1315655656#1_0",
+    "-1409987933#0_0",
+    "-1409987933#0_1",
+    "-1410006752#0_0",
+    "-1414617422#0_0",
+    "-144533175#1_0",
+    "-35431259#1_0",
+    "-35431259#1_1",
+    "-36415826#1_0",
+    "-36415826#1_1",
+    "-45818104#1_0",
+    "-45818104#1_1",
+    "-750028499#1_0",
+    "-99839877_0",
+    "-99839877_1",
+    "-99839877_2",
+    "1062971920#1_0",
+    "1062971920#1_1",
+    "1079605502_0",
+    "1079605506#0_0",
+    "1079605506#0_1",
+    "110281348#0_0",
+    "110281352#1_0",
+    "110281353#2_0",
+    "110281354_0",
+    "110281354_1",
+    "110368575#1_0",
+    "110368575#1_1",
+    "110370583#2_0",
+    "110370583#2_1",
+    "1133472125#1_0",
+    "1133472125#1_1",
+    "1179683759#6_0",
+    "1196402684#0_0",
+    "1196402684#0_1",
+    "1315655656#1_0",
+    "1409987933#0_0",
+    "1409987933#0_1",
+    "1410006752#0_0",
+    "1410006752#0_1",
+    "1414617422#0_0",
+    "1414617422#0_1",
+    "144533175#1_0",
+    "256949925#3_0",
+    "256949925#3_1",
+    "35431259#1_0",
+    "35431259#1_1",
+    "36415826#1_0",
+    "36415826#1_1",
+    "45818104#1_0",
+    "45818104#1_1",
+    "750028499#1_0",
+    "99839877_0",
+    "99839877_1"
+  ],
+  "training_modes": [
+    "fixed",
+    "flowmind",
+    "local"
+  ],
+  "dropped_columns": [
+    "run_id",
+    "scenario",
+    "seed",
+    "duration"
+  ],
+  "train_seeds": [
+    56517412,
+    106635990,
+    149303092,
+    242282036,
+    412572629,
+    613015167,
+    624783874,
+    663671550,
+    714640917,
+    726888201,
+    728359928,
+    845018529,
+    932979931,
+    945058088,
+    1226171392,
+    1275653140,
+    1344056879,
+    1365929122
+  ],
+  "validation_seeds": [
+    1409308706,
+    1433749742,
+    1563429853,
+    1568616633
+  ],
+  "test_seeds": [
+    1870853144,
+    1873036829,
+    1932892812,
+    1957980532,
+    1988730602
+  ],
+  "metrics": {
+    "train": {
+      "mae": 0.19573,
+      "rmse": 0.38968,
+      "r2": 0.86484,
+      "rows": 21000
+    },
+    "validation": {
+      "mae": 0.40491,
+      "rmse": 0.82602,
+      "r2": 0.33354,
+      "rows": 4000
+    },
+    "test": {
+      "mae": 0.39042,
+      "rmse": 0.93064,
+      "r2": 0.32123,
+      "rows": 5000
+    }
+  },
+  "top_feature_importances": [
+    {
+      "feature": "num__time",
+      "importance": 4477.0
+    },
+    {
+      "feature": "num__incoming_mean_speed",
+      "importance": 2987.0
+    },
+    {
+      "feature": "num__phase_elapsed",
+      "importance": 2163.0
+    },
+    {
+      "feature": "num__incoming_occupancy",
+      "importance": 1688.0
+    },
+    {
+      "feature": "num__incoming_free_slots",
+      "importance": 1308.0
+    },
+    {
+      "feature": "num__outgoing_free_slots",
+      "importance": 1172.0
+    },
+    {
+      "feature": "num__outgoing_mean_speed",
+      "importance": 1058.0
+    },
+    {
+      "feature": "num__signal_index",
+      "importance": 990.0
+    },
+    {
+      "feature": "num__current_phase",
+      "importance": 916.0
+    },
+    {
+      "feature": "num__incoming_vehicle_count",
+      "importance": 750.0
+    },
+    {
+      "feature": "num__incoming_queue",
+      "importance": 731.0
+    },
+    {
+      "feature": "num__phase_count",
+      "importance": 489.0
+    },
+    {
+      "feature": "num__downstream_weight",
+      "importance": 468.0
+    },
+    {
+      "feature": "num__outgoing_occupancy",
+      "importance": 460.0
+    },
+    {
+      "feature": "num__max_green",
+      "importance": 449.0
+    },
+    {
+      "feature": "num__sensor_range_meters",
+      "importance": 442.0
+    },
+    {
+      "feature": "num__hysteresis",
+      "importance": 405.0
+    },
+    {
+      "feature": "num__priority_distance",
+      "importance": 389.0
+    },
+    {
+      "feature": "num__queue_forecast_weight",
+      "importance": 383.0
+    },
+    {
+      "feature": "num__congested_occupancy_threshold",
+      "importance": 371.0
+    },
+    {
+      "feature": "num__default_green_extension",
+      "importance": 369.0
+    },
+    {
+      "feature": "num__empty_phase_penalty",
+      "importance": 341.0
+    },
+    {
+      "feature": "num__max_demand_wait_bonus",
+      "importance": 336.0
+    },
+    {
+      "feature": "num__area_pressure_weight",
+      "importance": 326.0
+    },
+    {
+      "feature": "num__demand_wait_weight",
+      "importance": 326.0
+    },
+    {
+      "feature": "num__congested_approach_bonus",
+      "importance": 321.0
+    },
+    {
+      "feature": "num__blocked_occupancy",
+      "importance": 307.0
+    },
+    {
+      "feature": "num__is_green",
+      "importance": 300.0
+    },
+    {
+      "feature": "num__empty_approach_penalty",
+      "importance": 297.0
+    },
+    {
+      "feature": "cat__mode_fixed",
+      "importance": 236.0
+    },
+    {
+      "feature": "num__max_priority_override",
+      "importance": 234.0
+    },
+    {
+      "feature": "num__clearance_seconds",
+      "importance": 226.0
+    },
+    {
+      "feature": "num__min_green",
+      "importance": 214.0
+    },
+    {
+      "feature": "num__congested_queue_threshold",
+      "importance": 207.0
+    },
+    {
+      "feature": "cat__mode_flowmind",
+      "importance": 201.0
+    },
+    {
+      "feature": "cat__incoming_lane_-144533175#1_0",
+      "importance": 198.0
+    },
+    {
+      "feature": "num__sample_interval",
+      "importance": 197.0
+    },
+    {
+      "feature": "num__demand_timer_seconds",
+      "importance": 189.0
+    },
+    {
+      "feature": "num__decision_interval",
+      "importance": 177.0
+    },
+    {
+      "feature": "cat__signal_state_r",
+      "importance": 168.0
+    },
+    {
+      "feature": "num__outgoing_vehicle_count",
+      "importance": 144.0
+    },
+    {
+      "feature": "cat__tls_id_cluster_13437168454_4315795790_583213300_6642884072",
+      "importance": 144.0
+    },
+    {
+      "feature": "cat__signal_state_G",
+      "importance": 134.0
+    },
+    {
+      "feature": "cat__incoming_lane_-45818104#1_1",
+      "importance": 130.0
+    },
+    {
+      "feature": "cat__movement_id_cluster_1481227697_1481227699_2124947615_2124947617_#1more|-144533175#1_0|-1414617422#0_0|12",
+      "importance": 117.0
+    },
+    {
+      "feature": "cat__movement_id_cluster_580698747_6327278548_6327278549|1196402684#0_1|1079605502_0|4",
+      "importance": 104.0
+    },
+    {
+      "feature": "cat__movement_id_cluster_1481227697_1481227699_2124947615_2124947617_#1more|-144533175#1_0|-1409987933#0_1|14",
+      "importance": 98.0
+    },
+    {
+      "feature": "cat__incoming_lane_1414617422#0_1",
+      "importance": 98.0
+    },
+    {
+      "feature": "cat__movement_id_cluster_1481227697_1481227699_2124947615_2124947617_#1more|1414617422#0_1|144533175#1_0|10",
+      "importance": 91.0
+    },
+    {
+      "feature": "cat__phase_state_rrrrrGGGggrrrrrGGGgg",
+      "importance": 88.0
+    }
+  ],
+  "artifact_sha256": "b5ec8cd15e73b22535c3599d2e52b58838badf14a00e394c0a56ffb9474ceae9"
+}

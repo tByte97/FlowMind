@@ -34,6 +34,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rows-per-file", type=int, default=5000)
     parser.add_argument("--jobs", type=int, default=4)
     parser.add_argument("--n-estimators", type=int, default=700)
+    parser.add_argument(
+        "--quality-report",
+        type=Path,
+        help="Completed dataset quality report used to exclude unsafe runs.",
+    )
+    parser.add_argument(
+        "--forecast-contract",
+        choices=("observational_action_conditioned", "counterfactual"),
+        default="observational_action_conditioned",
+    )
     return parser
 
 
@@ -45,24 +55,31 @@ def training_command(
     rows_per_file: int,
     jobs: int,
     n_estimators: int,
+    quality_report: Path | None = None,
+    forecast_contract: str = "observational_action_conditioned",
 ) -> list[str]:
-    return [
+    command = [
         sys.executable,
         "-u",
         str(PROJECT_ROOT / "experiments" / "train_queue_model.py"),
         "--dataset-dir",
         str(dataset_dir),
         "--target",
-        f"target_incoming_queue_{horizon}s",
+        f"target_queue_reduction_{horizon}s",
         "--output",
-        str(output_dir / f"queue_lgbm_{horizon}s_current.joblib"),
+        str(output_dir / f"queue_lgbm_{horizon}s_decision.joblib"),
         "--rows-per-file",
         str(rows_per_file),
         "--jobs",
         str(jobs),
         "--n-estimators",
         str(n_estimators),
+        "--forecast-contract",
+        forecast_contract,
     ]
+    if quality_report is not None:
+        command.extend(("--quality-report", str(quality_report)))
+    return command
 
 
 def main() -> None:
@@ -86,6 +103,8 @@ def main() -> None:
                 rows_per_file=args.rows_per_file,
                 jobs=args.jobs,
                 n_estimators=args.n_estimators,
+                quality_report=args.quality_report,
+                forecast_contract=args.forecast_contract,
             ),
             cwd=PROJECT_ROOT,
             check=True,
@@ -100,6 +119,8 @@ def main() -> None:
         "jobs": args.jobs,
         "n_estimators": args.n_estimators,
         "horizons": completed,
+        "quality_report": str(args.quality_report) if args.quality_report else "",
+        "forecast_contract": args.forecast_contract,
     }
     manifest_path = args.output_dir / "ensemble_training.json"
     manifest_path.write_text(

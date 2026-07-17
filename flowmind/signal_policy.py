@@ -11,6 +11,7 @@ from .traffic_state import LaneState, TrafficState
 class PhaseScore:
     phase_index: int
     score: float
+    blocked_signal_indices: tuple[int, ...] = ()
 
 
 def movement_pressure(
@@ -58,7 +59,28 @@ def movement_pressure(
     return pressure
 
 
+def movement_has_blocked_downstream(
+    outgoing: LaneState,
+    config: ControlConfig,
+    *,
+    required_storage_slots: float | None = None,
+) -> bool:
+    """Hard gate a movement that cannot fit another vehicle downstream."""
+
+    required_slots = (
+        float(config.min_downstream_storage_slots)
+        if required_storage_slots is None
+        else float(required_storage_slots)
+    )
+    return (
+        outgoing.occupancy >= config.blocked_occupancy
+        or outgoing.free_slots < max(required_slots, 0.0)
+    )
+
+
 def lane_has_demand(lane: LaneState, config: ControlConfig) -> bool:
+    if not lane.valid:
+        return False
     return (
         lane.queue > 0
         or lane.vehicle_count > 0
@@ -81,12 +103,17 @@ def effective_min_green(
     intersection: Intersection,
     phase_index: int,
 ) -> float:
-    if not config.use_default_phase_timing:
-        return float(config.min_green)
-    default_duration = intersection.default_phase_duration(phase_index)
-    if default_duration is None:
-        return float(config.min_green)
-    return max(1.0, min(float(config.min_green), default_duration))
+    configured_minimum = float(config.min_green)
+    if config.use_default_phase_timing:
+        default_duration = intersection.default_phase_duration(phase_index)
+        if default_duration is not None:
+            configured_minimum = min(configured_minimum, default_duration)
+    sumo_minimum = intersection.phase_min_duration(phase_index)
+    return max(
+        1.0,
+        configured_minimum,
+        sumo_minimum if sumo_minimum is not None else 0.0,
+    )
 
 
 def effective_max_green(
@@ -153,66 +180,235 @@ def score_phases(
     area_pressure: dict[str, float] | None = None,
     queue_forecast: dict[tuple[int, int], float] | None = None,
     demand_wait_by_lane: dict[str, float] | None = None,
+    downstream_risk_by_outgoing_lane: dict[str, float] | None = None,
+    preparation_link: int | None = None,
+    queue_growth_by_lane: dict[str, float] | None = None,
+    platoon_arrival_by_incoming_lane: dict[str, float] | None = None,
+    downstream_storage_by_outgoing_lane: dict[str, float] | None = None,
+    blocked_signals_by_phase: dict[int, tuple[int, ...]] | None = None,
 ) -> tuple[PhaseScore, ...]:
     area_pressure = area_pressure or {}
     queue_forecast = queue_forecast or {}
     demand_wait_by_lane = demand_wait_by_lane or {}
+    downstream_risk_by_outgoing_lane = downstream_risk_by_outgoing_lane or {}
+    queue_growth_by_lane = queue_growth_by_lane or {}
+    platoon_arrival_by_incoming_lane = (
+        platoon_arrival_by_incoming_lane or {}
+    )
+    downstream_storage_by_outgoing_lane = (
+        downstream_storage_by_outgoing_lane or {}
+    )
+    blocked_signals_by_phase = blocked_signals_by_phase or phase_signal_masks(
+        intersection,
+        state,
+        config,
+        priority_link=priority_link,
+        preparation_link=preparation_link,
+        downstream_risk_by_outgoing_lane=downstream_risk_by_outgoing_lane,
+    )
     scores: list[PhaseScore] = []
     for phase_index in intersection.green_phase_indices:
         phase_state = intersection.phases[phase_index]
+        blocked_signal_indices = blocked_signals_by_phase.get(phase_index, ())
+        blocked_signal_set = set(blocked_signal_indices)
+        green_links = tuple(
+            (link_index, link)
+            for link_index, link in enumerate(intersection.links)
+            if link.signal_index < len(phase_state)
+            and phase_state[link.signal_index] in "Gg"
+            and link.signal_index not in blocked_signal_set
+        )
+        if not green_links:
+            continue
+        turns_per_incoming: dict[str, int] = {}
+        for _link_index, link in green_links:
+            turns_per_incoming[link.incoming_lane] = (
+                turns_per_incoming.get(link.incoming_lane, 0) + 1
+            )
         score = 0.0
-        movements = 0
+        served_incoming_lanes: set[str] = set()
         demand_movements = 0
         for link_index, link in enumerate(intersection.links):
             if link.signal_index >= len(phase_state):
                 continue
             if phase_state[link.signal_index] not in "Gg":
                 continue
+            if link.signal_index in blocked_signal_set:
+                continue
             incoming = state.lane(link.incoming_lane)
             outgoing = state.lane(link.outgoing_lane)
             has_demand = lane_has_demand(incoming, config)
+            is_priority_movement = (
+                priority_link is not None
+                and link.signal_index == priority_link
+            )
+            is_preparation_movement = (
+                preparation_link is not None
+                and link.signal_index == preparation_link
+            )
+            graph_spillback_risk = downstream_risk_by_outgoing_lane.get(
+                link.outgoing_lane,
+                0.0,
+            )
             if has_demand:
                 demand_movements += 1
+            turning_ratio = 1.0 / max(
+                turns_per_incoming.get(link.incoming_lane, 1),
+                1,
+            )
+            local_movement_score = (
+                float(incoming.queue)
+                if has_demand
+                else -float(config.empty_approach_penalty)
+            ) * turning_ratio
             if mode == "local":
-                movement_score = (
-                    float(incoming.queue)
-                    if has_demand
-                    else -float(config.empty_approach_penalty)
-                )
+                movement_score = local_movement_score
             else:
-                movement_score = movement_pressure(
-                    incoming.queue,
-                    incoming.vehicle_count,
-                    incoming.occupancy,
-                    outgoing.queue,
-                    outgoing.occupancy,
-                    outgoing.free_slots,
-                    config,
+                horizon = float(config.coordination_horizon_seconds)
+                saturation_capacity = (
+                    float(config.saturation_flow_vph_per_lane)
+                    / 3600.0
+                    * horizon
+                    * turning_ratio
                 )
-                movement_score += (
+                area_adjustment = (
                     area_pressure.get(link.incoming_lane, 0.0)
                     * config.area_pressure_weight
+                    * turning_ratio
                 )
-                movement_score += (
+                area_adjustment += (
                     queue_forecast.get((phase_index, link_index), 0.0)
                     * config.queue_forecast_weight
+                    * turning_ratio
                 )
+                area_adjustment -= (
+                    graph_spillback_risk
+                    * (
+                        config.downstream_graph_weight
+                        + config.objective_spillback_weight
+                    )
+                    * turning_ratio
+                )
+                area_adjustment += max(
+                    queue_growth_by_lane.get(link.incoming_lane, 0.0),
+                    0.0,
+                ) * config.objective_queue_growth_weight * turning_ratio
+                area_adjustment += (
+                    platoon_arrival_by_incoming_lane.get(
+                        link.incoming_lane,
+                        0.0,
+                    )
+                    * config.platoon_arrival_weight
+                    * turning_ratio
+                )
+                if downstream_storage_by_outgoing_lane:
+                    area_adjustment += min(
+                        downstream_storage_by_outgoing_lane.get(
+                            link.outgoing_lane,
+                            0.0,
+                        ),
+                        saturation_capacity,
+                    ) * 0.05
+                adjustment_limit = float(
+                    config.flowmind_zone_adjustment_limit
+                )
+                area_adjustment = max(
+                    min(
+                        area_adjustment,
+                        adjustment_limit,
+                    ),
+                    -adjustment_limit,
+                )
+                movement_score = local_movement_score + area_adjustment
+            if is_preparation_movement:
+                movement_score += float(config.corridor_prepare_bonus)
             if has_demand:
                 movement_score += demand_wait_bonus(
                     demand_wait_by_lane.get(link.incoming_lane, 0.0),
                     config,
                 )
             score += movement_score
-            movements += 1
+            served_incoming_lanes.add(link.incoming_lane)
+        movements = len(served_incoming_lanes)
         if movements:
             score /= movements
         if movements and not demand_movements:
             score -= float(config.empty_phase_penalty)
-        if priority_link is not None and priority_link < len(phase_state):
-            if phase_state[priority_link] in "Gg":
+        if priority_link is not None and 0 <= priority_link < len(phase_state):
+            if (
+                phase_state[priority_link] in "Gg"
+                and priority_link not in blocked_signal_set
+            ):
                 score += 1_000.0
-        scores.append(PhaseScore(phase_index, score))
+        scores.append(
+            PhaseScore(
+                phase_index,
+                score,
+                blocked_signal_indices,
+            )
+        )
     return tuple(scores)
+
+
+def phase_signal_masks(
+    intersection: Intersection,
+    state: TrafficState,
+    config: ControlConfig,
+    *,
+    priority_link: int | None = None,
+    preparation_link: int | None = None,
+    downstream_risk_by_outgoing_lane: dict[str, float] | None = None,
+) -> dict[int, tuple[int, ...]]:
+    """Return green signal indices that must be red-masked per phase.
+
+    A signal index is the smallest independently controllable SUMO movement
+    group. If any demanded turn behind that signal has no safe downstream
+    storage, the whole signal index is masked while other green groups in the
+    same validated phase may continue.
+    """
+
+    downstream_risk = downstream_risk_by_outgoing_lane or {}
+    result: dict[int, tuple[int, ...]] = {}
+    for phase_index in intersection.green_phase_indices:
+        phase_state = intersection.phases[phase_index]
+        blocked: set[int] = set()
+        for link in intersection.links:
+            signal_index = link.signal_index
+            if signal_index >= len(phase_state):
+                continue
+            if phase_state[signal_index] not in "Gg":
+                continue
+            incoming = state.lane(link.incoming_lane)
+            outgoing = state.lane(link.outgoing_lane)
+            has_demand = lane_has_demand(incoming, config)
+            is_priority = priority_link is not None and signal_index == priority_link
+            is_preparation = (
+                preparation_link is not None and signal_index == preparation_link
+            )
+            if not (has_demand or is_priority or is_preparation):
+                continue
+            graph_blocked = (
+                config.graph_hard_mask_enabled
+                and downstream_risk.get(link.outgoing_lane, 0.0)
+                >= config.spillback_hard_gate_probability
+            )
+            required_slots = (
+                config.priority_min_storage_slots
+                if is_priority
+                else config.min_downstream_storage_slots
+            )
+            physically_blocked = (
+                config.physical_hard_mask_enabled
+                and movement_has_blocked_downstream(
+                    outgoing,
+                    config,
+                    required_storage_slots=required_slots,
+                )
+            )
+            if graph_blocked or physically_blocked:
+                blocked.add(signal_index)
+        result[phase_index] = tuple(sorted(blocked))
+    return result
 
 
 def choose_phase(scores: tuple[PhaseScore, ...]) -> PhaseScore | None:

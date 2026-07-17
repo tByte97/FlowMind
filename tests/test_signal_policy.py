@@ -9,6 +9,7 @@ from flowmind.signal_policy import (
     choose_phase,
     effective_max_green,
     effective_min_green,
+    phase_signal_masks,
     score_phases,
 )
 from flowmind.traffic_state import LaneState, TrafficState
@@ -57,8 +58,184 @@ class SignalPolicyTest(unittest.TestCase):
         self.assertIsNotNone(best)
         self.assertEqual(best.phase_index, 2)
 
+    def test_probabilistic_graph_risk_is_penalty_only_by_default(self) -> None:
+        state = TrafficState(
+            {
+                "north": LaneState(5, 5, 0.4, 0.0, 5.0),
+                "south": LaneState(0, 0, 0.2, 8.0, 10.0),
+                "east": LaneState(0, 0, 0.0, 0.0, 10.0),
+                "west": LaneState(0, 0, 0.0, 8.0, 10.0),
+            }
+        )
+
+        masks = phase_signal_masks(
+            self.intersection,
+            state,
+            self.config,
+            downstream_risk_by_outgoing_lane={"south": 0.99},
+        )
+
+        self.assertEqual(masks[0], ())
+
+    def test_graph_hard_mask_requires_explicit_opt_in(self) -> None:
+        state = TrafficState(
+            {
+                "north": LaneState(5, 5, 0.4, 0.0, 5.0),
+                "south": LaneState(0, 0, 0.2, 8.0, 10.0),
+                "east": LaneState(0, 0, 0.0, 0.0, 10.0),
+                "west": LaneState(0, 0, 0.0, 8.0, 10.0),
+            }
+        )
+
+        masks = phase_signal_masks(
+            self.intersection,
+            state,
+            ControlConfig(graph_hard_mask_enabled=True),
+            downstream_risk_by_outgoing_lane={"south": 0.99},
+        )
+
+        self.assertEqual(masks[0], (0,))
+
+    def test_blocked_downstream_phase_is_removed_from_candidates(self) -> None:
+        state = TrafficState(
+            {
+                "north": LaneState(30, 30, 0.3, 0.0, 8.0),
+                "south": LaneState(30, 30, 0.95, 0.0, 0.0),
+                "east": LaneState(5, 5, 0.2, 0.0, 8.0),
+                "west": LaneState(0, 0, 0.0, 10.0, 15.0),
+            }
+        )
+
+        scores = score_phases(self.intersection, state, "flowmind", self.config)
+        best = choose_phase(scores)
+
+        self.assertIsNotNone(best)
+        self.assertEqual(best.phase_index, 2)
+        self.assertNotIn(0, [item.phase_index for item in scores])
+
+    def test_full_moving_downstream_is_blocked_even_without_a_queue(self) -> None:
+        state = TrafficState(
+            {
+                "north": LaneState(8, 8, 0.4, 0.0, 5.0),
+                "south": LaneState(0, 16, 0.75, 8.0, 0.0),
+                "east": LaneState(4, 4, 0.2, 0.0, 8.0),
+                "west": LaneState(0, 0, 0.0, 10.0, 15.0),
+            }
+        )
+
+        scores = score_phases(self.intersection, state, "flowmind", self.config)
+
+        self.assertNotIn(0, [item.phase_index for item in scores])
+
+    def test_idle_blocked_movement_does_not_disable_useful_shared_phase(self) -> None:
+        intersection = Intersection(
+            tls_id="shared",
+            position=(0.0, 0.0),
+            phases=("GG", "yy", "rr"),
+            links=(
+                ControlledLink("idle", "blocked", 0),
+                ControlledLink("busy", "open", 1),
+            ),
+        )
+        state = TrafficState(
+            {
+                "idle": LaneState(0, 0, 0.0, 0.0, 10.0),
+                "blocked": LaneState(12, 12, 0.95, 0.0, 0.0),
+                "busy": LaneState(8, 8, 0.5, 0.0, 4.0),
+                "open": LaneState(0, 0, 0.0, 10.0, 15.0),
+            }
+        )
+
+        scores = score_phases(intersection, state, "flowmind", self.config)
+
+        self.assertEqual([item.phase_index for item in scores], [0])
+
+    def test_demanded_blocked_group_is_masked_without_dropping_shared_phase(
+        self,
+    ) -> None:
+        intersection = Intersection(
+            tls_id="shared",
+            position=(0.0, 0.0),
+            phases=("GG", "yy", "rr"),
+            links=(
+                ControlledLink("blocked_demand", "blocked", 0),
+                ControlledLink("busy", "open", 1),
+            ),
+        )
+        state = TrafficState(
+            {
+                "blocked_demand": LaneState(8, 8, 0.5, 0.0, 4.0),
+                "blocked": LaneState(12, 16, 0.95, 0.0, 0.0),
+                "busy": LaneState(8, 8, 0.5, 0.0, 4.0),
+                "open": LaneState(0, 0, 0.0, 10.0, 15.0),
+            }
+        )
+
+        scores = score_phases(intersection, state, "flowmind", self.config)
+
+        self.assertEqual(len(scores), 1)
+        self.assertEqual(scores[0].phase_index, 0)
+        self.assertEqual(scores[0].blocked_signal_indices, (0,))
+
+    def test_priority_cannot_force_blocked_downstream_phase(self) -> None:
+        state = TrafficState(
+            {
+                "north": LaneState(30, 30, 0.3, 0.0, 8.0),
+                "south": LaneState(30, 30, 0.95, 0.0, 0.0),
+                "east": LaneState(5, 5, 0.2, 0.0, 8.0),
+                "west": LaneState(0, 0, 0.0, 10.0, 15.0),
+            }
+        )
+
+        best = choose_phase(
+            score_phases(
+                self.intersection,
+                state,
+                "flowmind",
+                self.config,
+                priority_link=0,
+            )
+        )
+
+        self.assertIsNotNone(best)
+        self.assertEqual(best.phase_index, 2)
+
+    def test_priority_requires_storage_even_before_vehicle_reaches_sensor(self) -> None:
+        state = TrafficState(
+            {
+                "north": LaneState(0, 0, 0.0, 0.0, 15.0),
+                "south": LaneState(0, 12, 0.70, 8.0, 1.5),
+                "east": LaneState(3, 3, 0.2, 0.0, 8.0),
+                "west": LaneState(0, 0, 0.0, 10.0, 15.0),
+            }
+        )
+
+        regular_scores = score_phases(
+            self.intersection,
+            state,
+            "flowmind",
+            self.config,
+        )
+        priority_scores = score_phases(
+            self.intersection,
+            state,
+            "flowmind",
+            self.config,
+            priority_link=0,
+        )
+
+        self.assertIn(0, [item.phase_index for item in regular_scores])
+        self.assertNotIn(0, [item.phase_index for item in priority_scores])
+
     def test_priority_link_overrides_regular_score(self) -> None:
-        state = TrafficState({})
+        state = TrafficState(
+            {
+                "north": LaneState(0, 0, 0.0, 0.0, 15.0),
+                "south": LaneState(0, 0, 0.0, 10.0, 15.0),
+                "east": LaneState(0, 0, 0.0, 0.0, 15.0),
+                "west": LaneState(0, 0, 0.0, 10.0, 15.0),
+            }
+        )
         best = choose_phase(
             score_phases(
                 self.intersection,
@@ -70,6 +247,61 @@ class SignalPolicyTest(unittest.TestCase):
         )
         self.assertIsNotNone(best)
         self.assertEqual(best.phase_index, 2)
+
+    def test_prepare_target_is_a_soft_bonus_not_hard_priority(self) -> None:
+        state = TrafficState(
+            {
+                "north": LaneState(3, 3, 0.2, 0.0, 8.0),
+                "south": LaneState(0, 0, 0.0, 10.0, 15.0),
+                "east": LaneState(3, 3, 0.2, 0.0, 8.0),
+                "west": LaneState(0, 0, 0.0, 10.0, 15.0),
+            }
+        )
+        regular = {
+            item.phase_index: item.score
+            for item in score_phases(
+                self.intersection,
+                state,
+                "flowmind",
+                self.config,
+            )
+        }
+        prepared = {
+            item.phase_index: item.score
+            for item in score_phases(
+                self.intersection,
+                state,
+                "flowmind",
+                self.config,
+                preparation_link=1,
+            )
+        }
+
+        self.assertEqual(
+            prepared[2] - regular[2],
+            self.config.corridor_prepare_bonus,
+        )
+        self.assertLess(prepared[2] - regular[2], 1_000.0)
+
+    def test_prepare_target_cannot_open_a_blocked_downstream(self) -> None:
+        state = TrafficState(
+            {
+                "north": LaneState(1, 1, 0.1, 0.0, 8.0),
+                "south": LaneState(0, 0, 0.0, 10.0, 15.0),
+                "east": LaneState(0, 0, 0.0, 0.0, 8.0),
+                "west": LaneState(8, 16, 0.95, 0.0, 0.0),
+            }
+        )
+
+        scores = score_phases(
+            self.intersection,
+            state,
+            "flowmind",
+            self.config,
+            preparation_link=1,
+        )
+
+        self.assertNotIn(2, [item.phase_index for item in scores])
 
     def test_flowmind_can_use_area_pressure_bias(self) -> None:
         state = TrafficState(
@@ -177,6 +409,28 @@ class SignalPolicyTest(unittest.TestCase):
         )
 
         self.assertEqual(effective_min_green(self.config, intersection, 0), 6.0)
+        self.assertEqual(effective_max_green(self.config, intersection, 0), 14.0)
+
+    def test_sumo_min_dur_is_a_hard_floor_for_every_timing_mode(self) -> None:
+        intersection = Intersection(
+            tls_id="timed",
+            position=(0.0, 0.0),
+            phases=("G", "y"),
+            links=(ControlledLink("north", "south", 0),),
+            phase_durations=(6.0, 3.0),
+            phase_min_durations=(13.0, None),
+            phase_max_durations=(50.0, None),
+        )
+
+        self.assertEqual(effective_min_green(self.config, intersection, 0), 13.0)
+        self.assertEqual(
+            effective_min_green(
+                ControlConfig(use_default_phase_timing=False, min_green=4),
+                intersection,
+                0,
+            ),
+            13.0,
+        )
         self.assertEqual(effective_max_green(self.config, intersection, 0), 14.0)
 
 
